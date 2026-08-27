@@ -1,14 +1,14 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Workspace,
-    Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, Task, TaskTarget, TerminalTab,
+    Workspace, Worktree,
 };
-use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TaskId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -257,6 +257,39 @@ pub enum ClientRequest {
         req_id: u64,
         id: LinkId,
     },
+    /// Define an unattended task on a project. The daemon validates the
+    /// cron expression and refuses the whole request if it can't parse it,
+    /// so a typo comes back as an `Error` rather than a task that silently
+    /// never fires.
+    CreateTask {
+        req_id: u64,
+        spec: TaskSpec,
+    },
+    /// Overwrite every editable field of a task (same validation as create).
+    /// Run state is daemon-owned and untouched.
+    UpdateTask {
+        req_id: u64,
+        id: TaskId,
+        spec: TaskSpec,
+    },
+    DeleteTask {
+        req_id: u64,
+        id: TaskId,
+    },
+    /// Enable or disable a task without editing it. Disabling clears its
+    /// next-due stamp; enabling recomputes it from the cron.
+    SetTaskEnabled {
+        req_id: u64,
+        id: TaskId,
+        enabled: bool,
+    },
+    /// Start a task now, ignoring its cron and its enabled flag. Answered
+    /// with an Ack once the session is spawned, so a failure to launch
+    /// (missing CLI, deleted worktree) reaches the user as an Error.
+    RunTaskNow {
+        req_id: u64,
+        id: TaskId,
+    },
     RenameTerminal {
         req_id: u64,
         id: TerminalId,
@@ -333,6 +366,30 @@ pub struct MetricsSnapshot {
     pub sessions: Vec<SessionMetrics>,
 }
 
+/// Every editable field of a task. Create and update take the same shape so
+/// the TUI's form has one payload to build, and so an update can never
+/// half-apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSpec {
+    pub project: ProjectId,
+    pub name: String,
+    pub prompt: String,
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// None or empty = manual runs only.
+    pub cron: Option<String>,
+    pub iterations: u32,
+    pub unattended: bool,
+    pub target: TaskTarget,
+    pub enabled: bool,
+}
+
+/// Upper bound on a task's iteration count. A loop's only stop condition is
+/// running out of iterations, so the count is the safety rail — an
+/// accidental 100000 would re-prompt an agent for days.
+pub const MAX_TASK_ITERATIONS: u32 = 100;
+
 /// What `EnterWorktree` did to the agent's live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnterOutcome {
@@ -365,6 +422,7 @@ pub enum ServerEvent {
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
         links: Vec<Link>,
+        tasks: Vec<Task>,
         /// How far the user has read into each pull request they've opened.
         pr_seen: Vec<PrSeen>,
         ui_state: Option<String>,

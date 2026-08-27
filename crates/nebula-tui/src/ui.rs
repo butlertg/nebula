@@ -1,12 +1,14 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow};
+use crate::app::{
+    App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, PaneMode, SessionRow, TaskField,
+};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
 use crate::text_input::TextInput;
 use crate::theme::Theme;
-use nebula_core::{AgentStatus, SessionRef};
+use nebula_core::{AgentStatus, SessionRef, Task, TaskTarget};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -3190,20 +3192,10 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 /// Borderless terminal frame: a header row (`TERMINAL · session` plus a
 /// right-aligned state tag), a thin rule, then the content area. The
 /// header carries the focus signal like the sidebar columns do.
-fn terminal_frame(
-    f: &mut Frame,
-    area: Rect,
-    left: Vec<Span<'static>>,
-    right: Option<Span<'static>>,
-    focused: bool,
-    th: Theme,
-) -> Rect {
-    titled_frame(f, area, "TERMINAL", left, right, focused, th)
-}
-
-/// The same frame under another name, for the pane's other tenants — the
-/// pull-request reader borrows the whole right-hand column, and calling it
-/// TERMINAL while it shows prose would be a lie.
+/// The pane's frame under a single title, for the tenants that aren't one of
+/// its tabs — the pull-request reader borrows the whole right-hand column,
+/// and calling it TERMINAL while it shows prose would be a lie. The tabbed
+/// form is `pane_tabs_frame`.
 fn titled_frame(
     f: &mut Frame,
     area: Rect,
@@ -3250,6 +3242,422 @@ fn titled_frame(
     }
 }
 
+/// "in 4m" / "in 2h" — the mirror of `ago_label`, for a stamp in the future.
+fn in_label(delta_ms: i64) -> String {
+    if delta_ms <= 0 {
+        return "due".into();
+    }
+    match delta_ms / 1000 {
+        s if s < 60 => "in <1m".into(),
+        s if s < 3600 => format!("in {}m", s / 60),
+        s if s < 86_400 => format!("in {}h", s / 3600),
+        s => format!("in {}d", s / 86_400),
+    }
+}
+
+/// The pane header as a two-tab strip — the live session, or the selected
+/// project's automation.
+///
+/// Same three rows `titled_frame` lays out (blank spacer, header, rule) so
+/// the tabs land on the sidebars' title row, and the rule is broken under
+/// the open tab with `━` in the accent: the grammar `draw_workspaces_bar`
+/// already uses to read a tab as joined to what it opens.
+fn pane_tabs_frame(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    left: Vec<Span<'static>>,
+    right: Option<Span<'static>>,
+    focused: bool,
+) -> Rect {
+    let th = app.theme;
+    let mode = app.pane_mode;
+    // Row 0 stays blank, as everywhere else. The two-space gutter is a real
+    // span, not an offset: the Paragraph starts at `area.x`, so the tab bands
+    // registered below have to be measured from the same origin or the rule
+    // break (and every click) lands two cells off.
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let mut bands: Vec<(u16, u16, PaneMode)> = Vec::new();
+    let mut x = area.x + 2;
+    for (tab, label) in [
+        (PaneMode::Terminal, "TERMINAL"),
+        (PaneMode::Automation, "AUTOMATION"),
+    ] {
+        let open = tab == mode;
+        let text = format!(" {label} ");
+        let width = text.chars().count() as u16;
+        let style = match (open, focused) {
+            // The open tab is the pane's title, so it keeps the same
+            // accent-bold weight a single-title frame has.
+            (true, true) => Style::default()
+                .fg(th.accent)
+                .bg(th.sel_bg)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default()
+                .fg(th.muted)
+                .bg(th.sel_bg_dim)
+                .add_modifier(Modifier::BOLD),
+            (false, _) => Style::default().fg(th.dim),
+        };
+        spans.push(Span::styled(text, style));
+        bands.push((x, width, tab));
+        x += width + 1;
+        spans.push(Span::raw(" "));
+    }
+    spans.extend(left);
+    if let Some(r) = row_rect(area, 1) {
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        if let Some(tag) = right {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![tag, Span::raw(" ")]))
+                    .alignment(ratatui::layout::Alignment::Right),
+                r,
+            );
+        }
+    }
+    if let Some(r) = row_rect(area, 2) {
+        let rule_style = if focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.edge)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled("─".repeat(area.width as usize), rule_style)),
+            r,
+        );
+        // Break the rule under the open tab so it reads as joined to the
+        // body below rather than sitting on a line that runs past it.
+        if let Some((tx, tw, _)) = bands.iter().find(|(_, _, tab)| *tab == mode) {
+            let joined = Style::default().fg(th.accent);
+            for i in 0..*tw {
+                let cell = Rect::new(tx + i, r.y, 1, 1).intersection(r);
+                if cell.width > 0 {
+                    f.buffer_mut().set_style(cell, joined);
+                    if let Some(c) = f.buffer_mut().cell_mut((cell.x, cell.y)) {
+                        c.set_symbol("━");
+                    }
+                }
+            }
+        }
+    }
+    // Registered before the body's own targets (and so before
+    // `HitTarget::TerminalPane`), since `hit_at` is first-match. Each tab
+    // claims its header row and the rule under it — a 1-row target is hard
+    // to hit, the same reason the workspace tabs take their whole band.
+    for (tx, tw, tab) in bands {
+        let band = Rect::new(tx, area.y + 1, tw, 2).intersection(area);
+        if band.width > 0 {
+            app.hits.push((band, HitTarget::PaneTab(tab)));
+        }
+    }
+    Rect {
+        y: area.y + 3,
+        height: area.height.saturating_sub(3),
+        ..area
+    }
+}
+
+/// The Automation pane: the selected project's tasks on the left, the fields
+/// of the one under the cursor on the right.
+///
+/// The detail column is deliberately the Settings overlay's grammar — a
+/// label, a `[value]`, most of them cycled rather than typed — so nothing
+/// here needed a new form widget.
+fn draw_automation(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let th = app.theme;
+    let project_name = app.selected_project().map(|p| p.name.clone());
+    let left = match &project_name {
+        Some(name) => vec![
+            Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
+            Span::styled(name.clone(), Style::default().fg(th.muted)),
+        ],
+        None => Vec::new(),
+    };
+    let tasks: Vec<Task> = app.project_tasks().into_iter().cloned().collect();
+    let scheduled = tasks
+        .iter()
+        .filter(|t| t.enabled && t.cron.is_some())
+        .count();
+    let right = (scheduled > 0).then(|| {
+        Span::styled(
+            format!("{scheduled} scheduled"),
+            Style::default().fg(th.muted),
+        )
+    });
+    let inner = pane_tabs_frame(f, app, area, left, right, focused);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+
+    if project_name.is_none() {
+        if let Some(r) = row_rect(inner, 1) {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "  select a project to give it tasks",
+                    Style::default().fg(th.dim),
+                )),
+                r,
+            );
+        }
+        app.automation.list_area = Rect::default();
+        app.automation.detail_area = Rect::default();
+        return;
+    }
+
+    if tasks.is_empty() {
+        let lines = [
+            "  no tasks yet",
+            "",
+            "  A task is a prompt plus when to run it: on a cron",
+            "  schedule, looped for a number of turns, or both —",
+            "  with nobody watching.",
+            "",
+            "  n  adds one",
+        ];
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(r) = row_rect(inner, i + 1) {
+                let style = if i == 0 {
+                    Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
+                } else if line.trim() == "n  adds one" {
+                    Style::default().fg(th.accent)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                f.render_widget(Paragraph::new(Span::styled(*line, style)), r);
+            }
+        }
+        app.automation.list_area = Rect::default();
+        app.automation.detail_area = Rect::default();
+        return;
+    }
+
+    // Split list / detail. The list gets a third, floored so a narrow pane
+    // still shows a usable name and the detail column keeps its labels.
+    let list_w = (inner.width / 3).clamp(18, 34).min(inner.width);
+    let list_area = Rect {
+        width: list_w,
+        ..inner
+    };
+    let detail_area = Rect {
+        x: inner.x + list_w + 1,
+        width: inner.width.saturating_sub(list_w + 1),
+        ..inner
+    };
+    app.automation.list_area = list_area;
+    app.automation.detail_area = detail_area;
+
+    // ---- list ----
+    let height = list_area.height.max(1) as usize;
+    let selected = app.automation.selected.min(tasks.len() - 1);
+    let first = (selected + 1).saturating_sub(height);
+    app.automation.first_row = first;
+    let list_focused = focused && !app.automation.on_detail;
+    for (row, task) in tasks.iter().enumerate().skip(first).take(height) {
+        let Some(r) = row_rect(list_area, row - first) else {
+            break;
+        };
+        let is_sel = row == selected;
+        if is_sel {
+            f.render_widget(
+                Block::default().style(Style::default().bg(if list_focused {
+                    th.sel_bg
+                } else {
+                    th.sel_bg_dim
+                })),
+                r,
+            );
+        }
+        // ● enabled-and-scheduled, ◐ enabled-but-manual, ○ off. The dot
+        // answers "will this happen on its own?" — the only question the
+        // list has room for.
+        let (glyph, dot) = match (task.enabled, task.cron.is_some()) {
+            (true, true) => ("● ", th.ok),
+            (true, false) => ("◐ ", th.muted),
+            (false, _) => ("○ ", th.dim),
+        };
+        let name_w = (r.width as usize).saturating_sub(3);
+        let spans = vec![
+            Span::styled(glyph, Style::default().fg(dot)),
+            Span::styled(
+                truncate(&task.name, name_w),
+                Style::default().fg(if is_sel { th.text } else { th.muted }),
+            ),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        app.hits.push((r, HitTarget::TaskRow(row)));
+    }
+
+    // ---- detail ----
+    let Some(task) = tasks.get(selected) else {
+        return;
+    };
+    let detail_focused = focused && app.automation.on_detail;
+    let label_w = 12usize;
+    for (i, field) in TaskField::ALL.iter().enumerate() {
+        let Some(r) = row_rect(detail_area, i) else {
+            break;
+        };
+        let is_sel = detail_focused && i == app.automation.field;
+        if is_sel {
+            f.render_widget(Block::default().style(Style::default().bg(th.sel_bg)), r);
+        }
+        let value_w = (r.width as usize).saturating_sub(label_w + 5);
+        let (value, value_style) = task_field_value(task, *field, th, value_w);
+        let spans = vec![
+            Span::styled(
+                format!(" {:<label_w$}", field.label()),
+                Style::default().fg(if is_sel { th.text } else { th.dim }),
+            ),
+            Span::styled(value, value_style),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        app.hits.push((r, HitTarget::TaskField(i)));
+    }
+
+    // Run state, under a rule, so "did it work?" is answerable without
+    // opening anything.
+    let status_row = TaskField::ALL.len() + 1;
+    if let Some(r) = row_rect(detail_area, status_row) {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(r.width as usize),
+                Style::default().fg(th.edge),
+            )),
+            r,
+        );
+    }
+    let now = crate::app::now_ms();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // `next_run_at` is the daemon's stamp, so "0" alone doesn't mean manual:
+    // a task with a cron whose stamp hasn't come back yet is scheduled, and
+    // saying "manual" there would be a lie about what happens next.
+    let next = if !task.enabled {
+        Span::styled("disabled".to_string(), Style::default().fg(th.dim))
+    } else if task.cron.is_none() {
+        Span::styled(
+            "manual — r runs it now".to_string(),
+            Style::default().fg(th.dim),
+        )
+    } else if task.next_run_at == 0 {
+        Span::styled("scheduled".to_string(), Style::default().fg(th.muted))
+    } else {
+        Span::styled(
+            in_label(task.next_run_at - now),
+            Style::default().fg(th.warn),
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {:<label_w$}", "next run"),
+            Style::default().fg(th.dim),
+        ),
+        next,
+    ]));
+    let last = match (task.last_run_at, task.last_outcome.as_deref()) {
+        (0, _) => Span::styled("never".to_string(), Style::default().fg(th.dim)),
+        (at, outcome) => {
+            let outcome = outcome.unwrap_or("ran");
+            let color = if outcome.starts_with("failed") {
+                th.err
+            } else if outcome == "running" {
+                th.warn
+            } else {
+                th.ok
+            };
+            Span::styled(
+                format!("{} · {}", crate::hosts::ago_label(now - at), outcome),
+                Style::default().fg(color),
+            )
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {:<label_w$}", "last run"),
+            Style::default().fg(th.dim),
+        ),
+        last,
+    ]));
+    for (i, line) in lines.into_iter().enumerate() {
+        if let Some(r) = row_rect(detail_area, status_row + 1 + i) {
+            f.render_widget(Paragraph::new(line), r);
+        }
+    }
+}
+
+/// The `[value]` half of one detail row, plus the color it earns.
+fn task_field_value(task: &Task, field: TaskField, th: Theme, width: usize) -> (String, Style) {
+    let plain = Style::default().fg(th.text);
+    let dim = Style::default().fg(th.dim);
+    match field {
+        TaskField::Name => (format!("[{}]", truncate(&task.name, width)), plain),
+        TaskField::Prompt => {
+            // One line of it: the prompt can be paragraphs, and the row is
+            // an entry point to the editor rather than a viewer.
+            let first = task.prompt.lines().next().unwrap_or("");
+            let more = task.prompt.lines().count() > 1;
+            let shown = truncate(first, width.saturating_sub(if more { 2 } else { 0 }));
+            (
+                format!("[{}{}]", shown, if more { " …" } else { "" }),
+                plain,
+            )
+        }
+        TaskField::Agent => (format!("[{}]", task.kind.as_str()), plain),
+        TaskField::Model => (
+            format!("[{}]", task.model.as_deref().unwrap_or("default")),
+            if task.model.is_some() { plain } else { dim },
+        ),
+        TaskField::Effort => (
+            format!("[{}]", task.effort.as_deref().unwrap_or("default")),
+            if task.effort.is_some() { plain } else { dim },
+        ),
+        TaskField::Schedule => match task.cron.as_deref() {
+            Some(cron) => (format!("[{}]", truncate(cron, width)), plain),
+            None => ("[manual only]".to_string(), dim),
+        },
+        TaskField::Iterations => (
+            match task.iterations {
+                1 => "[1 turn]".to_string(),
+                n => format!("[{n} turns]"),
+            },
+            if task.iterations > 1 { plain } else { dim },
+        ),
+        TaskField::Unattended => (
+            if task.unattended {
+                "[yes — skips permission prompts]".to_string()
+            } else {
+                "[no]".to_string()
+            },
+            if task.unattended {
+                Style::default().fg(th.warn)
+            } else {
+                dim
+            },
+        ),
+        TaskField::Target => (
+            match &task.target {
+                TaskTarget::Root => "[main checkout]".to_string(),
+                TaskTarget::NewWorktree => "[its own worktree]".to_string(),
+                TaskTarget::Worktree(_) => "[a worktree]".to_string(),
+            },
+            plain,
+        ),
+        TaskField::Enabled => (
+            if task.enabled {
+                "[on]".to_string()
+            } else {
+                "[off]".to_string()
+            },
+            if task.enabled {
+                Style::default().fg(th.ok)
+            } else {
+                dim
+            },
+        ),
+    }
+}
+
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
@@ -3258,6 +3666,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // the OPEN PRS group and back must not churn detach/attach.
     if app.selected_worktree_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
+        return;
+    }
+    // The AUTOMATION tab is open: the pane belongs to the project's tasks.
+    // Checked after the PR reader, which is driven by the selection rather
+    // than by a mode and so has the stronger claim on the column.
+    if app.pane_mode == PaneMode::Automation {
+        draw_automation(f, app, area, focused);
         return;
     }
 
@@ -3283,7 +3698,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         )),
         _ => None,
     };
-    let inner = terminal_frame(f, area, left, right, focused, th);
+    let inner = pane_tabs_frame(f, app, area, left, right, focused);
     // One cell of inset so PTY content doesn't hug the sessions rule.
     let inner = Rect {
         x: inner.x + 1,
@@ -3575,6 +3990,17 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         // lying.
         let k = |a| key_hint(app, a);
         let text = match app.focus {
+            // Before the terminal arms: in Automation mode the pane's keys
+            // are the ones that work, whatever the attached session is doing.
+            Focus::Terminal if app.pane_mode == PaneMode::Automation => {
+                if app.project_tasks().is_empty() {
+                    "n: new task".to_string()
+                } else if app.automation.on_detail {
+                    "←/→: change  ↑↓: field  Esc: list".to_string()
+                } else {
+                    "n: new  space: on/off  r: run now  d: delete  →: edit".to_string()
+                }
+            }
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
                 "session exited — Esc: back to sessions".to_string()
             }

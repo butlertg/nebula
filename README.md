@@ -38,6 +38,9 @@ nebula replaces that with a tree and a color:
 - **A daemon that owns the PTYs.** Quit the UI, close the laptop lid, come back tomorrow — the agents
   never stopped, and your scrollback is replayed.
 - **Real git worktrees, one keystroke.** Two agents in two directories don't collide.
+- **Work that runs itself.** Give a project a task — a prompt, a cron schedule, and how many turns to
+  keep going for — and the daemon starts the session at 02:00 and re-prompts it turn after turn with
+  nobody watching. `e` opens the tab.
 - **Every open pull request under them, readable in place.** Open a project and nebula asks `gh` what's
   still open on the repo. Hover one to read its description and comments in the pane, `g` for its diff,
   `Enter` for the browser.
@@ -211,8 +214,19 @@ The panels aren't the only view. With a worktree selected, from any panel:
   sessions can run the same command; they resume silent and wait for your next prompt. The restart is
   the only way there: an agent CLI can't `cd` out of the directory it was started in.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
-  projects, worktrees, agents (with kind + CLI session ids), links, workspaces, pins, and your
+  projects, worktrees, agents (with kind + CLI session ids), links, tasks, workspaces, pins, and your
   last selection.
+- **Tasks run without you.** A task is a project-scoped prompt with a cron expression, an iteration
+  count, and a target checkout (the root, one worktree, or a fresh one per task). A scheduler tick in the
+  daemon starts the run — so it happens whether or not a TUI is open — and its prompt is *typed at the
+  session*, as a bracketed paste followed by the submit key, which is why a slash command like
+  `/code-review` runs exactly as it would for you and why codex and cursor work too. Each turn end
+  (the `Stop` hook) feeds the next iteration until the count runs out; a run's session is pinned, so the
+  idle reaper leaves it alone between turns. A missed window — the daemon was down at 02:00 — is skipped
+  rather than fired late, so coming back online never launches a backlog at once. A task marked
+  **unattended** launches Claude with `--dangerously-skip-permissions` (codex and cursor already run with
+  `--yolo` / `--force`), because a permission prompt with nobody there is a run that never finishes; it is
+  off by default and per task.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI while you're still naming
   the session, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
@@ -271,6 +285,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
+| Any panel | `e` | flip the pane to **AUTOMATION**: the selected project's tasks — a prompt plus when to run it. `n` adds one (name, then the prompt), `space` turns one on or off, `r` runs it now, `d` deletes it (asks first), `→` steps into its fields where `←/→` cycle each value |
+| Automation | fields | `name`, `prompt`, `agent`, `model`, `effort`, `schedule` (cron), `iterations`, `unattended`, `run in`, `enabled` — the three text fields open an editor, the rest cycle in place. Below them: when it next runs, and what the last run did |
 | Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation) |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `Shift+N` | replay the startup splash (any key returns) |

@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TaskId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -196,6 +196,81 @@ pub struct Link {
     pub sort_order: i64,
 }
 
+/// A unit of unattended work defined on a project: a prompt, the agent kind
+/// to run it, where to run it, and optionally when. The daemon owns every
+/// field below `enabled` — the TUI renders them and never computes them, so
+/// it needs no cron parser of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: TaskId,
+    pub project_id: ProjectId,
+    pub name: String,
+    /// Delivered to the agent verbatim each iteration — a sentence, or a
+    /// slash command / skill invocation like `/code-review`. Typed at the
+    /// CLI's input box rather than passed as argv, so a slash command runs
+    /// the same way it would for a human.
+    pub prompt: String,
+    pub kind: AgentKind,
+    /// Model and effort the run launches with; None = the CLI's own default,
+    /// matching `Agent`.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Cron expression, seconds-first as the `cron` crate parses it.
+    /// None = the task only ever runs when asked by hand.
+    #[serde(default)]
+    pub cron: Option<String>,
+    /// How many times the prompt is delivered per run, each one waiting for
+    /// the previous turn to end. 1 = no loop. The only stop condition there
+    /// is: a run always ends after this many turns.
+    pub iterations: u32,
+    /// Launch the agent with its CLI's skip-permissions flag, because
+    /// nothing is watching to answer a prompt. Off by default.
+    #[serde(default)]
+    pub unattended: bool,
+    pub target: TaskTarget,
+    pub enabled: bool,
+    /// Epoch ms of the last run's start; 0 = never run.
+    #[serde(default)]
+    pub last_run_at: i64,
+    /// Epoch ms this task is next due, computed from `cron` by the daemon.
+    /// 0 = not scheduled (no cron, or disabled).
+    #[serde(default)]
+    pub next_run_at: i64,
+    /// What the last run did, for the pane's status line: "ok", or the
+    /// reason it could not start.
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+    /// The session the last run spawned, so the pane can point at it.
+    #[serde(default)]
+    pub last_agent_id: Option<AgentId>,
+    pub created_at: i64,
+    pub sort_order: i64,
+}
+
+/// Which checkout a task's run happens in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskTarget {
+    /// The project's main checkout.
+    Root,
+    /// One specific worktree. A run whose worktree has been deleted since
+    /// fails with that as its outcome rather than falling back to root.
+    Worktree(WorktreeId),
+    /// A fresh worktree per run, named after the task.
+    NewWorktree,
+}
+
+impl TaskTarget {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskTarget::Root => "root",
+            TaskTarget::Worktree(_) => "worktree",
+            TaskTarget::NewWorktree => "new worktree",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
     Workspace(Workspace),
@@ -204,6 +279,7 @@ pub enum Entity {
     Agent(Agent),
     Terminal(TerminalTab),
     Link(Link),
+    Task(Task),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -214,4 +290,5 @@ pub enum EntityId {
     Agent(AgentId),
     Terminal(TerminalId),
     Link(LinkId),
+    Task(TaskId),
 }

@@ -4,7 +4,8 @@
 
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
+    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, TaskSpec, TaskTarget,
+    PROTOCOL_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -3878,4 +3879,409 @@ esac
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
     assert_eq!(runs(), "3");
+}
+
+/// An agent loop, end to end: one run delivers its prompt once per turn for
+/// exactly as many turns as the task asks for, and then stops. The delivery
+/// mechanism is keystrokes into the real PTY, so the assertion is on what the
+/// stand-in CLI actually read from its stdin.
+#[tokio::test]
+async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    // Stand-in CLI: dump the hook env, then log every line typed at it. The
+    // PTY's line discipline turns the submit CR into a newline, exactly as a
+    // real CLI sees it.
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{d}'/$NEBULA_AGENT_ID.typed; done\n",
+            d = env_dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with(
+        script.to_str().unwrap(),
+        &[("NEBULA_TASK_PROMPT_DELAY_MS", "50")],
+    );
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let project = main_worktree.project_id.clone();
+
+    // A three-turn loop, manual: the scheduler is not what's under test here.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTask {
+            req_id: 2,
+            spec: TaskSpec {
+                project,
+                name: "nightly review".into(),
+                prompt: "/code-review".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                cron: None,
+                iterations: 3,
+                unattended: false,
+                target: TaskTarget::Root,
+                enabled: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Task(task_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTask failed: {events:#?}");
+    };
+    let task_id = task_id.clone();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::RunTaskNow {
+            req_id: 3,
+            id: task_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })),
+        "RunTaskNow failed: {events:#?}"
+    );
+    // The run's session is named after the task and pinned, so the idle
+    // reaper can't take it between turns.
+    //
+    // The broadcast upsert races the Ack — it can arrive in the batch above
+    // or the one after — and `read_events_until` consumes what it reads, so
+    // the batch already in hand is checked before waiting for another.
+    let find_agent = |evs: &[ServerEvent]| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.name == "nightly review" => Some(a.clone()),
+            _ => None,
+        })
+    };
+    let agent = match find_agent(&events) {
+        Some(a) => a,
+        None => {
+            let more = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+                find_agent(evs).is_some()
+            })
+            .await;
+            find_agent(&more).expect("the run's agent upsert")
+        }
+    };
+    assert!(agent.pinned, "a task's session is pinned: {agent:?}");
+    assert_eq!(agent.worktree_id, main_worktree.id, "ran in the root");
+
+    let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent.id.0))).await;
+    let port: u16 = agent_env["NEBULA_API_URL"]
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let typed = env_dir.join(format!("{}.typed", agent.id.0));
+    // One "iteration k of 3" marker per delivery. Counting the marker rather
+    // than lines is deliberate: the prompt itself spans two lines (the nebula
+    // header, then the user's text), which is the whole reason it goes as a
+    // bracketed paste.
+    let deliveries = |path: &Path| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("iteration"))
+            .map(str::to_string)
+            .collect()
+    };
+    // A delivery is only *finished* once its submit key lands, which is what
+    // flushes the paste-end marker. The daemon deliberately ignores a turn
+    // end that arrives before then (it would belong to the previous turn), so
+    // the test has to wait for the submit, not just for the paste.
+    let submitted = |path: &Path| -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .matches("[201~")
+            .count()
+    };
+    let wait_for_deliveries = |path: PathBuf, n: usize| async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = deliveries(&path);
+            if got.len() >= n && submitted(&path) >= n {
+                return got;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {n} finished deliveries, saw {} pasted / {} submitted: {got:?}",
+                got.len(),
+                submitted(&path)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    // Iteration 1 arrives on its own — no turn has ended yet.
+    let got = wait_for_deliveries(typed.clone(), 1).await;
+    assert!(
+        got[0].contains("iteration 1 of 3") && got[0].contains("nightly review"),
+        "first delivery: {got:?}"
+    );
+    // The prompt's own text is the paste's second line, flushed by the same
+    // submit `wait_for_deliveries` already waited for.
+    let body = std::fs::read_to_string(&typed).unwrap();
+    assert!(body.contains("/code-review"), "the prompt itself: {body}");
+
+    // Each turn end feeds the next one. A non-turn-end hook must not.
+    let stop = format!("/api/hooks/claude?agentId={}&hookEvent=Stop", agent.id.0);
+    let prompt_submit = format!(
+        "/api/hooks/claude?agentId={}&hookEvent=UserPromptSubmit",
+        agent.id.0
+    );
+    let payload = r#"{"session_id":"s1"}"#;
+    let (status, _) = hook_post_json(port, &prompt_submit, &token, payload).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        deliveries(&typed).len(),
+        1,
+        "a prompt-submit is not a turn end"
+    );
+
+    for expected in 2..=3 {
+        let (status, _) = hook_post_json(port, &stop, &token, payload).await;
+        assert_eq!(status, 200);
+        let got = wait_for_deliveries(typed.clone(), expected).await;
+        assert!(
+            got[expected - 1].contains(&format!("iteration {expected} of 3")),
+            "delivery {expected}: {got:?}"
+        );
+    }
+
+    // The fourth turn end retires the run: no delivery, and the task records
+    // what it did.
+    let (status, _) = hook_post_json(port, &stop, &token, payload).await;
+    assert_eq!(status, 200);
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Task(t) }
+                if t.id == task_id && t.last_outcome.as_deref() == Some("ran 3 of 3"))
+        })
+    })
+    .await;
+    assert!(
+        !events.is_empty(),
+        "the finished run is recorded on the task"
+    );
+    assert_eq!(
+        deliveries(&typed).len(),
+        3,
+        "exactly three turns, then it stops"
+    );
+
+    // And it stays stopped — a later turn end doesn't restart the loop.
+    let (status, _) = hook_post_json(port, &stop, &token, payload).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(deliveries(&typed).len(), 3, "still three");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The scheduler starts a task with nobody asking. Proving that needs a real
+/// clock, so the cron fires every second and the tick runs at 100ms.
+#[tokio::test]
+async fn a_cron_task_starts_its_own_session() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon_with(
+        "/bin/sh",
+        &[
+            ("NEBULA_SCHEDULER_MS", "100"),
+            ("NEBULA_TASK_PROMPT_DELAY_MS", "50"),
+        ],
+    );
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    // Six fields, seconds first: every second. A `0 2 * * *` would be a
+    // correct schedule and an untestable one.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTask {
+            req_id: 2,
+            spec: TaskSpec {
+                project: main_worktree.project_id.clone(),
+                name: "ticker".into(),
+                prompt: "go".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                cron: Some("* * * * * *".into()),
+                iterations: 1,
+                unattended: false,
+                target: TaskTarget::Root,
+                enabled: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Task(task_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTask failed: {events:#?}");
+    };
+    let task_id = task_id.clone();
+    // The daemon stamped a next-due time as it stored the task. Same
+    // Ack-versus-upsert race as above: check the batch in hand first.
+    let find_task = |evs: &[ServerEvent]| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Task(t),
+            } if t.id == task_id => Some(t.clone()),
+            _ => None,
+        })
+    };
+    let scheduled = match find_task(&events) {
+        Some(t) => t,
+        None => {
+            let more = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+                find_task(evs).is_some()
+            })
+            .await;
+            find_task(&more).expect("task upsert")
+        }
+    };
+    assert!(
+        scheduled.next_run_at > 0,
+        "a cron task is scheduled on create: {scheduled:?}"
+    );
+
+    // Nobody asks for anything: the session appears because the clock said so.
+    let events = read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.name == "ticker")
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.name == "ticker" && a.pinned)
+        }),
+        "the scheduler spawned the run: {events:#?}"
+    );
+
+    // Disabling it stops the schedule dead — and clears the due stamp, so a
+    // re-enable can't fire instantly on a stale one.
+    write_frame(
+        &mut c,
+        &ClientRequest::SetTaskEnabled {
+            req_id: 3,
+            id: task_id.clone(),
+            enabled: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Task(t) }
+                if t.id == task_id && !t.enabled)
+        })
+    })
+    .await;
+    let disabled = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Task(t),
+            } if t.id == task_id => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(disabled.next_run_at, 0, "disabled means unscheduled");
+
+    // A bad cron is refused rather than stored as a task that never fires.
+    write_frame(
+        &mut c,
+        &ClientRequest::UpdateTask {
+            req_id: 4,
+            id: task_id.clone(),
+            spec: TaskSpec {
+                project: main_worktree.project_id.clone(),
+                name: "ticker".into(),
+                prompt: "go".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                cron: Some("every tuesday-ish".into()),
+                iterations: 1,
+                unattended: false,
+                target: TaskTarget::Root,
+                enabled: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::Error {
+                    req_id: Some(4),
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ServerEvent::Error { req_id: Some(4), message } if message.contains("cron")
+        )),
+        "a bad cron comes back as an error: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
 }
