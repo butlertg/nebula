@@ -14,6 +14,83 @@ about what is worth recording.
 
 ## Entries
 
+### Tasks: Cron Schedules And Agent Loops, In An Automation Pane Tab — 2026-08-27
+
+**Asked:** "Need to add in ability to add agent looping for a given task as well as scheduling
+tasks/skills to run at a given time ensuring they run without HITL. Love the session interface, but need
+to add in these features which might be configured via seperate tab for a project" — then four design
+answers: the terminal pane swaps to the tab (not a Settings tab or an overlay), **full cron expressions**,
+per-task opt-in permission bypass, and **max-iterations as the only loop exit**. When told there was no
+Rust toolchain on the machine, "Install a toolchain now".
+
+**Did:** New project-scoped `Task` entity end to end. `nebula-core`: `Task`/`TaskTarget` +
+`Entity::Task`/`EntityId::Task` (`entities.rs`), `id_newtype!(TaskId)`, `TaskSpec` +
+`MAX_TASK_ITERATIONS = 100`, five `ClientRequest::{Create,Update,Delete}Task`/`SetTaskEnabled`/`RunTaskNow`,
+`Snapshot.tasks`, `PROTOCOL_VERSION` 27 → 28. `nebula-daemon`: **migration 22** `CREATE TABLE tasks` plus
+CRUD in `store.rs` (`target` stored as a `target_kind`/`target_worktree` pair, `row_to_task`); new
+`schedule.rs` (`parse`/`next_due_ms`/`is_due`, injected-clock like `status.rs`); in `registry.rs` the task
+CRUD + `tick_scheduler` + `run_task`/`start_task_run` + `continue_task_loop` + `deliver_task_prompt`, and
+`task_loops: Mutex<HashMap<AgentId, LoopState>>` beside `pending_moves`; a 4th interval loop in `lib.rs`
+(`NEBULA_SCHEDULER_MS`, default 30s) and one `continue_task_loop` call after `complete_pending_move` in the
+hook drain loop. `spawn_agent_session_with`'s three transient args became `SpawnOpts`, and
+`agent_spawn_command_with`'s `guidance: bool` became `LaunchFlags { guidance, unattended }` — Claude gets
+`--dangerously-skip-permissions` only when unattended, in the arm where codex's `--yolo` already lives.
+`nebula-tui`: `PaneMode::{Terminal, Automation}` + `AutomationView` + `TaskField` (`app.rs`),
+`pane_tabs_frame` and `draw_automation` (`ui.rs`, a second early return in `draw_terminal` beside the PR
+one), `Action::ToggleAutomation` on **`e`**, `handle_automation_key` before the input-lock forward, three
+new `PromptKind`s (`TaskPrompt` joins `ClaudeCloudTask` in `is_multiline`), `PendingAction::DeleteTask`,
+`HitTarget::{PaneTab, TaskRow, TaskField}`. Deps: `cron` 0.15 + `chrono` 0.4 (`clock`), daemon-only.
+**678 tests green** (was 647), fmt clean, clippy byte-identical to a stashed baseline. Rejected: a
+`nebula task done` sentinel CLI and PTY output-scraping for the loop exit (user chose max-iterations);
+delivering iteration 1 as Claude's positional `initial_prompt` (a slash command as argv is unverified and
+codex/cursor take no initial prompt, so *every* iteration goes through the same paste-and-submit path).
+
+**Gotchas:**
+- **This machine has no Rust toolchain** — no `cargo`, no `~/.cargo`, no `target/` in any checkout; the
+  `nebula` on PATH is the prebuilt release asset. Installed via `brew install rust` → `/opt/homebrew/bin`,
+  which is **not** on the non-interactive PATH (`.zshrc` only prepends `~/.local/bin` and bun), so every
+  cargo invocation needs `export PATH="/opt/homebrew/bin:$PATH"` first.
+- **A turn-end hook arriving inside the 250ms paste→submit gap re-delivered the same iteration.** The
+  count was only advanced after the write landed, so a fast (or duplicate) `Stop` saw the old value. Fixed
+  by claiming the iteration synchronously under the `task_loops` lock and adding `LoopState.in_flight`,
+  which makes a turn-end during a delivery a no-op. The e2e caught it; the unit test
+  `a_turn_end_during_a_delivery_is_ignored` pins it. Consequence for tests: you must wait for the *submit*
+  (the `[201~` marker flushing), not just the paste, before posting the next `Stop`.
+- **`read_events_until` consumes what it reads, and the Ack races the broadcast upsert** — so an upsert can
+  be in the Ack's batch *or* the next one. Waiting for it unconditionally hangs half the time; reading it
+  out of the Ack batch unconditionally misses it the other half. Check the batch in hand, then wait. Same
+  race as `workspace_scope_is_per_connection` (which still fails under full-suite CPU load and passes
+  alone — unchanged by this work).
+- **The sweep needs all three conditions, not just the due stamp.** `tick_scheduler` first checked
+  `enabled` + `is_due`, so a manual task with a stale nonzero stamp launched an agent every tick.
+  `the_sweep_skips_disabled_and_manual_tasks` caught it; the guard now also requires `cron.is_some()`.
+- **The `cron` crate wants 6 fields (seconds first) and numbers days-of-week 1 = Sunday, not crontab's
+  0 = Sunday.** `schedule::normalize` prepends `0 ` to a 5-field expression so ordinary crontab lines work,
+  and the UI hint suggests names (`Mon-Fri`) because those mean the same in both dialects —
+  `dow_names_are_stable` pins that.
+- **A pane header built from spans starts at `area.x`, not at the two-space gutter.** The tab bands were
+  registered from `area.x + 2` while the Paragraph rendered from `area.x`, so the `━` rule break (and every
+  click target) sat two cells right of its tab. The gutter has to be a real `Span::raw("  ")`.
+- **The empty-multiline-prompt guard in `submit_prompt` was hardcoded to Claude Cloud wording** and now
+  fires for task prompts too — a task with an empty prompt flashed "Claude Cloud needs a task". The noun
+  now comes from the `PromptKind`.
+- **Deleting a worktree does not clear a task pointed at it**: the FK is on `project_id`, and
+  `target_worktree` is a bare string, so the target survives verbatim and the *run* fails with "the task's
+  worktree no longer exists". That is deliberate — a silently root-retargeted nightly job is worse — and
+  `a_task_outlives_the_worktree_it_targets` documents it. Only a NULL id degrades to `Root`.
+- **A task's session must be `pinned: true`** or `reap_idle_sessions` kills it between turns after
+  `session_idle_timeout`. That function's own comment already anticipated this ("schedules, loops, long
+  jobs the status can't see"), as does `status.rs`'s "a scheduled wake-up".
+- **The paste-then-submit delivery was never exercised against a real agent CLI.** The e2e proves the bytes
+  arrive (a stub shell logs its stdin) but not that Claude Code's TUI treats them as a *submitted* prompt.
+  The attempt to drive a real `claude` was blocked by the harness classifier (it launches an agent with
+  `--dangerously-skip-permissions`). What is verified offline: the paste bytes are byte-identical to the
+  TUI's own ⌘V path (`event_loop.rs`), and the submit is `b"\r"` — byte-identical to `keys.rs:102`'s
+  encoding of a plain Enter. First thing to confirm when running it for real.
+- **README's "one ~4 MB Rust binary" was already stale before this work**: the shipped v0.10.0 asset in
+  `~/.local/bin` is 10.3 MB, a clean-tree release build is 10.27 MB, and this change takes it to 10.84 MB
+  (+0.58 MB for `cron` + `chrono`). Left alone as a pre-existing claim, not one this work broke.
+
 ### Released v0.12.0 From A Checkout That Was Behind Its Own Work — 2026-08-27
 
 **Asked:** "commit push release"
