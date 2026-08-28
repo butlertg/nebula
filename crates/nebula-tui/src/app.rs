@@ -374,6 +374,11 @@ pub enum PromptKind {
     TaskSchedule {
         id: TaskId,
     },
+    /// The prompt a loop's final turn gets instead of the usual one
+    /// (multiline); empty clears it back to "same prompt every turn".
+    TaskFinalPrompt {
+        id: TaskId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +429,7 @@ impl PromptDialog {
             PromptKind::ClaudeCloudTask { .. }
                 | PromptKind::NewTaskPrompt { .. }
                 | PromptKind::TaskPrompt { .. }
+                | PromptKind::TaskFinalPrompt { .. }
         )
     }
 
@@ -1667,13 +1673,16 @@ pub enum TaskField {
     Effort,
     Schedule,
     Iterations,
+    FinalPrompt,
     Unattended,
+    StallTimeout,
+    CommitOnFinish,
     Target,
     Enabled,
 }
 
 impl TaskField {
-    pub const ALL: [TaskField; 10] = [
+    pub const ALL: [TaskField; 13] = [
         TaskField::Name,
         TaskField::Prompt,
         TaskField::Agent,
@@ -1681,7 +1690,12 @@ impl TaskField {
         TaskField::Effort,
         TaskField::Schedule,
         TaskField::Iterations,
+        // Directly under `iterations`: it is the last one of them, and the
+        // pair only makes sense read together.
+        TaskField::FinalPrompt,
         TaskField::Unattended,
+        TaskField::StallTimeout,
+        TaskField::CommitOnFinish,
         TaskField::Target,
         TaskField::Enabled,
     ];
@@ -1695,7 +1709,10 @@ impl TaskField {
             TaskField::Effort => "effort",
             TaskField::Schedule => "schedule",
             TaskField::Iterations => "iterations",
+            TaskField::FinalPrompt => "wrap-up",
             TaskField::Unattended => "unattended",
+            TaskField::StallTimeout => "stall limit",
+            TaskField::CommitOnFinish => "commit",
             TaskField::Target => "run in",
             TaskField::Enabled => "enabled",
         }
@@ -1705,15 +1722,25 @@ impl TaskField {
     pub fn is_text(&self) -> bool {
         matches!(
             self,
-            TaskField::Name | TaskField::Prompt | TaskField::Schedule
+            TaskField::Name | TaskField::Prompt | TaskField::Schedule | TaskField::FinalPrompt
         )
     }
 }
+
+/// Width of the label column in the automation detail pane. A label longer
+/// than this runs straight into its own `[value]` — see
+/// `every_task_field_label_fits_the_detail_column`.
+pub const TASK_LABEL_W: usize = 12;
 
 /// Iteration counts the pane cycles through. A loop's only stop condition is
 /// running out of iterations, so the list stops well short of
 /// `MAX_TASK_ITERATIONS` — the cap is a guard rail, not a suggestion.
 pub const TASK_ITERATION_CHOICES: [u32; 7] = [1, 2, 3, 5, 8, 13, 20];
+
+/// Watchdog windows the pane cycles through, in seconds. 0 is "wait
+/// forever", kept last so it takes a deliberate step past every real value
+/// to reach — it is the setting that lets an overnight run hang.
+pub const TASK_STALL_CHOICES: [u32; 6] = [300, 900, 1_800, 3_600, 7_200, 0];
 
 /// Client-side mirror of the entity tree. `projects` holds EVERY workspace's
 /// projects; the panels scope to `active_workspace` (see
@@ -2902,6 +2929,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detail pane pads each label to `TASK_LABEL_W` and then writes the
+    /// value straight after it, so a longer label does not wrap or truncate
+    /// — it shunts its own value one cell right and collides with it. Caught
+    /// exactly that way with a 13-character "give up after".
+    #[test]
+    fn every_task_field_label_fits_the_detail_column() {
+        for field in TaskField::ALL {
+            let label = field.label();
+            assert!(
+                label.len() <= TASK_LABEL_W,
+                "`{label}` is {} chars, and the column is {TASK_LABEL_W}",
+                label.len()
+            );
+        }
+    }
+
+    /// Every field is reachable: the pane walks `ALL` by index, so one left
+    /// out of the array is a field the user can never see or edit.
+    #[test]
+    fn every_task_field_is_listed_once() {
+        let mut seen = TaskField::ALL.to_vec();
+        let before = seen.len();
+        seen.sort_by_key(|f| f.label());
+        seen.dedup();
+        assert_eq!(seen.len(), before, "a TaskField is listed twice in ALL");
+    }
 
     // ---- worktree links ----
 

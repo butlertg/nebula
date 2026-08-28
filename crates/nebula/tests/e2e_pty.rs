@@ -3934,6 +3934,11 @@ async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
                 cron: None,
                 iterations: 3,
                 unattended: false,
+                // The last turn gets this instead, so the loop lands its
+                // work rather than being cut off at iteration 3.
+                final_prompt: Some("/commit-and-summarise".into()),
+                stall_timeout_secs: 0,
+                commit_on_finish: false,
                 target: TaskTarget::Root,
                 enabled: true,
             },
@@ -4082,6 +4087,23 @@ async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
             "delivery {expected}: {got:?}"
         );
     }
+    // The final turn is the wrap-up: marked as such in the header, and
+    // carrying the wrap-up text rather than the ordinary prompt.
+    let got = deliveries(&typed);
+    assert!(
+        got[2].contains("iteration 3 of 3 (wrap-up)"),
+        "the last delivery is marked: {got:?}"
+    );
+    let body = std::fs::read_to_string(&typed).unwrap();
+    assert!(
+        body.contains("/commit-and-summarise"),
+        "the wrap-up prompt was typed: {body}"
+    );
+    assert_eq!(
+        body.matches("/code-review").count(),
+        2,
+        "the ordinary prompt went on the first two turns only: {body}"
+    );
 
     // The fourth turn end retires the run: no delivery, and the task records
     // what it did.
@@ -4148,6 +4170,9 @@ async fn a_cron_task_starts_its_own_session() {
                 cron: Some("* * * * * *".into()),
                 iterations: 1,
                 unattended: false,
+                final_prompt: None,
+                stall_timeout_secs: 0,
+                commit_on_finish: false,
                 target: TaskTarget::Root,
                 enabled: true,
             },
@@ -4255,6 +4280,9 @@ async fn a_cron_task_starts_its_own_session() {
                 cron: Some("every tuesday-ish".into()),
                 iterations: 1,
                 unattended: false,
+                final_prompt: None,
+                stall_timeout_secs: 0,
+                commit_on_finish: false,
                 target: TaskTarget::Root,
                 enabled: true,
             },

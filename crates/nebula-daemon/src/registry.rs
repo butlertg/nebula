@@ -41,6 +41,14 @@ const TASK_PROMPT_DELAY_MS: u64 = 2_500;
 /// bracketed paste asynchronously, and a submit that arrives in the same
 /// read as the paste lands as a newline inside the text instead.
 const SUBMIT_GAP: Duration = Duration::from_millis(250);
+/// Ceiling on how long a run may sit before its *first* turn even starts.
+/// Much shorter than the task's own watchdog, because this is a different
+/// failure: a turn that is running can legitimately take half an hour, but a
+/// turn that has not started means the CLI never accepted the prompt at all.
+/// The common cause is Claude Code's "is this a project you trust?" dialog,
+/// which a checkout it has not seen before opens with — it swallows the
+/// paste, answers no hook, and would otherwise burn the whole window.
+const FIRST_TURN_TIMEOUT_SECS: u32 = 120;
 
 fn first_prompt_delay() -> Duration {
     let ms = std::env::var("NEBULA_TASK_PROMPT_DELAY_MS")
@@ -65,6 +73,10 @@ struct LoopState {
     /// it cannot be the end of a turn the prompt in flight hasn't started
     /// yet, so it is ignored rather than consuming the next iteration.
     in_flight: bool,
+    /// Epoch ms of the last thing this run did — a prompt delivered or a
+    /// turn ended. The watchdog measures from here, so a long but healthy
+    /// turn is never mistaken for a wedged one.
+    last_progress_at: i64,
 }
 
 /// The transient, per-launch half of a spawn — everything that is not a
@@ -1968,6 +1980,9 @@ impl Daemon {
             cron: spec.cron,
             iterations: spec.iterations,
             unattended: spec.unattended,
+            final_prompt: spec.final_prompt,
+            stall_timeout_secs: spec.stall_timeout_secs,
+            commit_on_finish: spec.commit_on_finish,
             target: spec.target,
             enabled: spec.enabled,
             last_run_at: 0,
@@ -2000,6 +2015,9 @@ impl Daemon {
             cron: spec.cron,
             iterations: spec.iterations,
             unattended: spec.unattended,
+            final_prompt: spec.final_prompt,
+            stall_timeout_secs: spec.stall_timeout_secs,
+            commit_on_finish: spec.commit_on_finish,
             target: spec.target,
             enabled: spec.enabled,
             ..existing
@@ -2073,6 +2091,22 @@ impl Daemon {
             }
             None => None,
         };
+        // Same treatment as `prompt`: an all-whitespace wrap-up is no
+        // wrap-up, and it must fit down the same pipe.
+        spec.final_prompt = match spec.final_prompt {
+            Some(p) if p.trim().is_empty() => None,
+            Some(p) => {
+                let p = p.trim().to_string();
+                if p.len() > MAX_CLOUD_PROMPT_BYTES {
+                    bail!(
+                        "task wrap-up prompt is too long (max {} KiB)",
+                        MAX_CLOUD_PROMPT_BYTES / 1024
+                    );
+                }
+                Some(p)
+            }
+            None => None,
+        };
         if spec.iterations == 0 {
             bail!("a task runs at least one iteration");
         }
@@ -2113,6 +2147,10 @@ impl Daemon {
     /// Called from its own interval loop in `lib.rs`.
     pub async fn tick_scheduler(self: &Arc<Self>) {
         let now = epoch_ms();
+        // Before launching anything new, retire anything that has quietly
+        // died. A run only advances on a turn-end signal, so a wedged CLI is
+        // invisible until something goes looking — this is that something.
+        self.sweep_stalled_runs();
         let Ok(tasks) = self.store.load_tasks() else {
             return;
         };
@@ -2135,10 +2173,102 @@ impl Daemon {
                 tracing::warn!(task = %task.id, error = %e, "could not stamp next run");
                 continue;
             }
+            // A run still in flight owns the checkout. Starting a second
+            // one would put two agents in the same files — worse than a
+            // missed window, so the window is what gets dropped. The stamp
+            // above already moved, so this fires once and then waits.
+            if self.run_in_flight(&task.id) {
+                tracing::info!(task = %task.id, name = %task.name, "skipping: previous run still going");
+                let _ = self.store.set_task_run_state(
+                    &task.id,
+                    task.last_run_at,
+                    "skipped: previous run still going",
+                    task.last_agent_id.as_ref(),
+                );
+                self.rebroadcast_task(&task.id);
+                continue;
+            }
             tracing::info!(task = %task.id, name = %task.name, "scheduled task is due");
             if let Err(e) = self.run_task(&task.id).await {
                 tracing::warn!(task = %task.id, error = %e, "scheduled task failed to start");
             }
+        }
+    }
+
+    /// Does this task already have a run going? The loop table is the only
+    /// record of that — `last_outcome` says "running" for a run whose
+    /// session died three hours ago.
+    fn run_in_flight(&self, id: &TaskId) -> bool {
+        self.task_loops
+            .lock()
+            .unwrap()
+            .values()
+            .any(|s| &s.task_id == id)
+    }
+
+    /// End every run whose turn has not ended inside its task's watchdog.
+    /// The session is left alone deliberately: it is the evidence, and
+    /// killing it would throw away whatever the turn did manage to do.
+    fn sweep_stalled_runs(self: &Arc<Self>) {
+        let now = epoch_ms();
+        let in_flight: Vec<(AgentId, TaskId, u32, i64)> = self
+            .task_loops
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(a, s)| {
+                (
+                    a.clone(),
+                    s.task_id.clone(),
+                    s.delivered,
+                    s.last_progress_at,
+                )
+            })
+            .collect();
+        for (agent, task_id, delivered, since) in in_flight {
+            let Ok(Some(task)) = self.store.get_task(&task_id) else {
+                // Task deleted out from under a live run: `delete_task`
+                // already dropped the loop, so there is nothing to end.
+                continue;
+            };
+            // 0 means wait forever, and it has to mean that for both
+            // windows below — it is the setting that says "do not touch it".
+            if task.stall_timeout_secs == 0 {
+                continue;
+            }
+            // `Fresh` means no hook has ever arrived for this session: the
+            // prompt was typed, but the CLI never took it as one.
+            let never_started = matches!(
+                self.store.get_agent(&agent),
+                Ok(Some(a)) if a.status == AgentStatus::Fresh
+            );
+            let window = if never_started {
+                task.stall_timeout_secs.min(FIRST_TURN_TIMEOUT_SECS)
+            } else {
+                task.stall_timeout_secs
+            };
+            if now.saturating_sub(since) < window as i64 * 1_000 {
+                continue;
+            }
+            tracing::warn!(
+                task = %task.id, agent = %agent, delivered, never_started,
+                "run stalled past its watchdog"
+            );
+            let summary = if never_started {
+                format!(
+                    "stalled: no turn started in {} — a checkout the CLI has not seen \
+                     before opens with a trust prompt that swallows the task's first prompt",
+                    mins_label(window)
+                )
+            } else {
+                format!(
+                    "stalled: no turn ended in {} at iteration {} of {}",
+                    mins_label(window),
+                    delivered,
+                    task.iterations
+                )
+            };
+            self.end_task_run(&agent, &task, summary);
         }
     }
 
@@ -2218,6 +2348,7 @@ impl Daemon {
                 delivered: 1,
                 total: task.iterations,
                 in_flight: true,
+                last_progress_at: epoch_ms(),
             },
         );
         let mut broadcast_agent = agent.clone();
@@ -2273,6 +2404,12 @@ impl Daemon {
     /// a session sitting on a permission prompt never reaches either, so a
     /// blocked run stalls instead of being hammered.
     pub fn continue_task_loop(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
+        // Checked first: a run that has just parked on a question will never
+        // reach any of the turn-end signals below, so the loop has to be
+        // retired here or not at all.
+        if self.abandon_unattended_run_on_question(id, event) {
+            return;
+        }
         let turn_over = match event {
             HookEvent::Stop => true,
             HookEvent::Notification { notification_type } => {
@@ -2293,6 +2430,9 @@ impl Daemon {
             if state.in_flight {
                 return;
             }
+            // A turn ended, so the run is demonstrably alive — restart the
+            // watchdog's clock whichever branch we take below.
+            state.last_progress_at = epoch_ms();
             if state.delivered >= state.total {
                 let task_id = state.task_id.clone();
                 loops.remove(id);
@@ -2316,15 +2456,152 @@ impl Daemon {
             }
             None => {
                 tracing::info!(agent = %id, task = %task_id, "task run finished its iterations");
-                let _ = self.store.set_task_run_state(
-                    &task_id,
-                    task.last_run_at,
-                    &format!("ran {} of {}", task.iterations, task.iterations),
-                    Some(id),
-                );
-                self.rebroadcast_task(&task_id);
+                let summary = format!("ran {} of {}", task.iterations, task.iterations);
+                self.end_task_run(id, &task, summary);
             }
         }
+    }
+
+    /// An unattended run that stops to ask something is finished: nobody is
+    /// there to answer, and a CLI sitting on a dialog emits no turn-end, so
+    /// the loop would otherwise wait for the watchdog to notice half an hour
+    /// later. Returns true when it ended the run.
+    fn abandon_unattended_run_on_question(
+        self: &Arc<Self>,
+        id: &AgentId,
+        event: &HookEvent,
+    ) -> bool {
+        let asked = match event {
+            // Survives `--dangerously-skip-permissions` only when the CLI
+            // decided the call was too dangerous to auto-approve.
+            HookEvent::Notification { notification_type } => {
+                notification_type.as_deref() == Some("permission_prompt")
+            }
+            // The flag does not cover this one at all: asking the user a
+            // question is a tool, not a permission.
+            HookEvent::PreToolUse { tool_name } => tool_name.as_deref() == Some("AskUserQuestion"),
+            _ => false,
+        };
+        if !asked {
+            return false;
+        }
+        let Some((task_id, delivered)) = self
+            .task_loops
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| (s.task_id.clone(), s.delivered))
+        else {
+            return false;
+        };
+        let Ok(Some(task)) = self.store.get_task(&task_id) else {
+            return false;
+        };
+        // An attended task asking a question is the system working: the user
+        // is watching the pane and can answer it.
+        if !task.unattended {
+            return false;
+        }
+        tracing::info!(agent = %id, task = %task_id, "unattended run asked for input; ending it");
+        let summary = format!(
+            "stopped: asked for input at iteration {} of {}",
+            delivered, task.iterations
+        );
+        self.end_task_run(id, &task, summary);
+        true
+    }
+
+    /// The session behind a run is gone. Whatever the run was going to do
+    /// next, it is not going to do it — retire the loop so the task stops
+    /// reading "running" forever.
+    fn abandon_task_run_on_exit(self: &Arc<Self>, id: &AgentId, exit_code: Option<i32>) {
+        let Some((task_id, delivered)) = self
+            .task_loops
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| (s.task_id.clone(), s.delivered))
+        else {
+            return;
+        };
+        let Ok(Some(task)) = self.store.get_task(&task_id) else {
+            self.task_loops.lock().unwrap().remove(id);
+            return;
+        };
+        tracing::info!(agent = %id, task = %task_id, exit_code, "run's session exited");
+        // No code at all means the PTY went away without one (killed, or
+        // the daemon reaped it) — "exited" without a number is the honest
+        // way to say that.
+        let how = match exit_code {
+            Some(c) => format!("session exited ({c})"),
+            None => "session exited".to_string(),
+        };
+        let summary = format!(
+            "stopped: {} at iteration {} of {}",
+            how, delivered, task.iterations
+        );
+        self.end_task_run(id, &task, summary);
+    }
+
+    /// The one way a run stops — completion, stall, question, or a dead
+    /// session all come through here. Drops the loop first (so a late
+    /// turn-end cannot revive it), records the outcome, and then, if the
+    /// task asked for it, captures the checkout on a branch of its own.
+    fn end_task_run(self: &Arc<Self>, agent: &AgentId, task: &Task, summary: String) {
+        self.task_loops.lock().unwrap().remove(agent);
+        let _ = self
+            .store
+            .set_task_run_state(&task.id, task.last_run_at, &summary, Some(agent));
+        self.rebroadcast_task(&task.id);
+        if !task.commit_on_finish {
+            return;
+        }
+        // Off the hot path: this shells out to git four times, and the hook
+        // drain that usually calls us is holding up the next turn.
+        let daemon = self.clone();
+        let agent = agent.clone();
+        let task = task.clone();
+        tokio::spawn(async move {
+            let extra = match daemon.snapshot_task_run(&agent, &task).await {
+                Ok(Some(where_)) => format!(" · {where_}"),
+                Ok(None) => " · nothing to commit".to_string(),
+                Err(e) => {
+                    tracing::warn!(task = %task.id, error = %e, "run snapshot failed");
+                    format!(" · commit failed: {e:#}")
+                }
+            };
+            let _ = daemon.store.set_task_run_state(
+                &task.id,
+                task.last_run_at,
+                &format!("{summary}{extra}"),
+                Some(&agent),
+            );
+            daemon.rebroadcast_task(&task.id);
+        });
+    }
+
+    /// Capture the run's checkout on `task/<slug>/<stamp>`. Returns the
+    /// branch and short hash, or None when the run changed nothing.
+    async fn snapshot_task_run(
+        self: &Arc<Self>,
+        agent: &AgentId,
+        task: &Task,
+    ) -> Result<Option<String>> {
+        let row = self
+            .store
+            .get_agent(agent)?
+            .context("the run's session row is gone")?;
+        let worktree = self
+            .store
+            .get_worktree(&row.worktree_id)?
+            .context("the run's checkout is gone")?;
+        let branch = task_snapshot_branch(task);
+        let message = format!(
+            "[nebula] task `{}`\n\nWorking tree as the run left it.",
+            task.name
+        );
+        let hash = crate::git::snapshot_branch(&worktree.path, &branch, &message).await?;
+        Ok(hash.map(|h| format!("{branch} {h}")))
     }
 
     /// Type one iteration's prompt at the agent's input box and submit it.
@@ -2343,14 +2620,7 @@ impl Daemon {
         delay: Duration,
     ) {
         let sref = SessionRef::Agent(id.clone());
-        let text = if task.iterations > 1 {
-            format!(
-                "[nebula] Task `{}` — iteration {} of {}.\n{}",
-                task.name, iteration, task.iterations, task.prompt
-            )
-        } else {
-            format!("[nebula] Task `{}`.\n{}", task.name, task.prompt)
-        };
+        let text = task_prompt_text(task, iteration);
         let daemon = self.clone();
         let agent_id = id.clone();
         let task_id = task.id.clone();
@@ -2382,6 +2652,9 @@ impl Daemon {
             // on the next turn end.
             if let Some(state) = daemon.task_loops.lock().unwrap().get_mut(&agent_id) {
                 state.in_flight = false;
+                // Delivering counts as progress: the watchdog is measuring
+                // the turn that starts now, not the one that just ended.
+                state.last_progress_at = epoch_ms();
             }
         });
     }
@@ -2734,6 +3007,10 @@ impl Daemon {
                                 HookEvent::SessionEnded { exit_code },
                                 None,
                             );
+                            // A task run whose session died is over. Without
+                            // this the loop entry outlives the PTY and the
+                            // task reads "running" until somebody looks.
+                            daemon.abandon_task_run_on_exit(id, exit_code);
                         }
                         let upsert = match &sref {
                             SessionRef::Agent(id) => daemon.agent_entity(id).map(Entity::Agent),
@@ -2868,6 +3145,46 @@ fn relocation_prompt(worktree: &Worktree) -> String {
 /// worktree per run behind, and prefixed so it is obvious in `git branch`
 /// where it came from.
 fn task_run_branch(task: &Task) -> String {
+    format!("task-{}", task_slug(task))
+}
+
+/// What one iteration actually types at the agent.
+///
+/// The last turn of a loop can carry a different prompt: max iterations is
+/// still the only exit, but the run gets to spend its final turn landing the
+/// work rather than being cut off mid-thought. A single-turn task has no turn
+/// to spare, so it never wraps up.
+fn task_prompt_text(task: &Task, iteration: u32) -> String {
+    let wrap_up =
+        task.iterations > 1 && iteration == task.iterations && task.final_prompt.is_some();
+    let body = match (wrap_up, task.final_prompt.as_deref()) {
+        (true, Some(f)) => f,
+        _ => task.prompt.as_str(),
+    };
+    if task.iterations > 1 {
+        format!(
+            "[nebula] Task `{}` — iteration {} of {}{}.\n{}",
+            task.name,
+            iteration,
+            task.iterations,
+            if wrap_up { " (wrap-up)" } else { "" },
+            body
+        )
+    } else {
+        format!("[nebula] Task `{}`.\n{}", task.name, body)
+    }
+}
+
+/// Branch a finished run is captured on. Stamped rather than reused: each
+/// night is its own reviewable commit, and nothing a previous run recorded
+/// can be overwritten by a later one.
+fn task_snapshot_branch(task: &Task) -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    format!("task/{}/{}", task_slug(task), stamp)
+}
+
+/// A task name reduced to something git will take as a branch component.
+fn task_slug(task: &Task) -> String {
     let slug: String = task
         .name
         .chars()
@@ -2880,14 +3197,22 @@ fn task_run_branch(task: &Task) -> String {
         })
         .collect();
     let slug = slug.trim_matches('-').replace("--", "-");
-    let slug = if slug.is_empty() {
+    if slug.is_empty() {
         // Names can be entirely punctuation; the id keeps the branch unique
         // and still traceable back to the row.
         task.id.as_str().to_ascii_lowercase()
     } else {
         slug
-    };
-    format!("task-{slug}")
+    }
+}
+
+/// "30m" / "2h" — a watchdog window, for an outcome line the user reads.
+fn mins_label(secs: u32) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3_600),
+    }
 }
 
 fn agent_spawn_command_with(
@@ -3444,6 +3769,9 @@ mod tests {
             cron: None,
             iterations: 1,
             unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
             target: TaskTarget::Root,
             enabled: true,
         }
@@ -3699,6 +4027,7 @@ mod tests {
                 delivered: 2,
                 total: 2,
                 in_flight: false,
+                last_progress_at: epoch_ms(),
             },
         );
 
@@ -3728,6 +4057,364 @@ mod tests {
         daemon.continue_task_loop(&AgentId("nobody".into()), &HookEvent::Stop);
     }
 
+    /// The failure this whole feature exists to avoid: a run whose session
+    /// dies leaves the loop entry behind, and the task reads "running"
+    /// forever while nothing at all is happening.
+    #[test]
+    fn a_dead_session_ends_the_run() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 5,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                task_id,
+                delivered: 2,
+                total: 5,
+                in_flight: false,
+                last_progress_at: epoch_ms(),
+            },
+        );
+
+        daemon.abandon_task_run_on_exit(&agent, Some(1));
+        assert_eq!(daemon.task_loop_progress(&agent), None, "loop is retired");
+        let task = only_task(&daemon);
+        assert_eq!(
+            task.last_outcome.as_deref(),
+            Some("stopped: session exited (1) at iteration 2 of 5")
+        );
+
+        // A PTY that went away without a code says so without inventing one,
+        // and an agent with no run at all is a no-op rather than a panic.
+        daemon.abandon_task_run_on_exit(&AgentId("nobody".into()), None);
+    }
+
+    /// `--dangerously-skip-permissions` does not cover `AskUserQuestion`: the
+    /// CLI parks on the dialog, fires no turn end, and an unattended loop
+    /// would wait for a person who is asleep.
+    #[test]
+    fn an_unattended_run_that_asks_a_question_ends() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 5,
+            unattended: true,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                task_id,
+                delivered: 3,
+                total: 5,
+                in_flight: false,
+                last_progress_at: epoch_ms(),
+            },
+        );
+
+        daemon.continue_task_loop(
+            &agent,
+            &HookEvent::PreToolUse {
+                tool_name: Some("AskUserQuestion".into()),
+            },
+        );
+        assert_eq!(daemon.task_loop_progress(&agent), None);
+        assert_eq!(
+            only_task(&daemon).last_outcome.as_deref(),
+            Some("stopped: asked for input at iteration 3 of 5")
+        );
+    }
+
+    /// The same question from an *attended* task is the system working: the
+    /// user is watching the pane and can answer it, so the run stays alive.
+    #[test]
+    fn an_attended_run_may_ask_a_question_and_live() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 5,
+            unattended: false,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                task_id,
+                delivered: 3,
+                total: 5,
+                in_flight: false,
+                last_progress_at: epoch_ms(),
+            },
+        );
+        daemon.continue_task_loop(
+            &agent,
+            &HookEvent::PreToolUse {
+                tool_name: Some("AskUserQuestion".into()),
+            },
+        );
+        assert_eq!(daemon.task_loop_progress(&agent), Some((3, 5)));
+    }
+
+    /// A turn that never ends is the other silent stall: nothing crashed, so
+    /// there is no exit to react to. Only the clock can tell.
+    #[test]
+    fn a_stalled_run_is_written_off() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 5,
+            stall_timeout_secs: 300,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        let insert = |since: i64| {
+            daemon.task_loops.lock().unwrap().insert(
+                agent.clone(),
+                LoopState {
+                    task_id: task_id.clone(),
+                    delivered: 2,
+                    total: 5,
+                    in_flight: false,
+                    last_progress_at: since,
+                },
+            );
+        };
+
+        // Four minutes into a five-minute window: still working.
+        insert(epoch_ms() - 4 * 60 * 1_000);
+        daemon.sweep_stalled_runs();
+        assert_eq!(daemon.task_loop_progress(&agent), Some((2, 5)));
+
+        // Past it, and the run is written off with the window in the reason.
+        insert(epoch_ms() - 6 * 60 * 1_000);
+        daemon.sweep_stalled_runs();
+        assert_eq!(daemon.task_loop_progress(&agent), None);
+        assert_eq!(
+            only_task(&daemon).last_outcome.as_deref(),
+            Some("stalled: no turn ended in 5m at iteration 2 of 5")
+        );
+    }
+
+    /// The overnight failure that actually happened when this was first run
+    /// for real: a checkout Claude Code had not seen before opened with its
+    /// trust dialog, which swallowed the pasted prompt. No hook ever fired,
+    /// so the session stayed `Fresh` and the run sat there. A first turn that
+    /// has not started is a different failure from a turn taking a long time,
+    /// and it is caught on a much shorter fuse — and named.
+    #[test]
+    fn a_run_whose_first_turn_never_starts_is_caught_early_and_explained() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp/p", true);
+        seed_agent(&daemon, "a1", "w", None);
+        let spec = TaskSpec {
+            iterations: 3,
+            stall_timeout_secs: 1_800,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        let park = |since: i64| {
+            daemon.task_loops.lock().unwrap().insert(
+                agent.clone(),
+                LoopState {
+                    task_id: task_id.clone(),
+                    delivered: 1,
+                    total: 3,
+                    in_flight: false,
+                    last_progress_at: since,
+                },
+            );
+        };
+
+        // `seed_agent` makes a Running one: a turn genuinely in progress gets
+        // the task's own generous window, not the short one.
+        park(epoch_ms() - 5 * 60 * 1_000);
+        daemon.sweep_stalled_runs();
+        assert_eq!(
+            daemon.task_loop_progress(&agent),
+            Some((1, 3)),
+            "five minutes into a running turn is not a stall"
+        );
+
+        // Same five minutes, but the session never left Fresh.
+        daemon
+            .store
+            .set_agent_status(&agent, AgentStatus::Fresh)
+            .unwrap();
+        park(epoch_ms() - 5 * 60 * 1_000);
+        daemon.sweep_stalled_runs();
+        assert_eq!(daemon.task_loop_progress(&agent), None);
+        let outcome = only_task(&daemon).last_outcome.unwrap();
+        assert!(
+            outcome.starts_with("stalled: no turn started in 2m"),
+            "caught on the short fuse: {outcome}"
+        );
+        assert!(
+            outcome.contains("trust prompt"),
+            "and it names the likely cause: {outcome}"
+        );
+    }
+
+    /// 0 means "wait forever" — the one setting that lets an overnight run
+    /// hang, so it has to be exactly what it says.
+    #[test]
+    fn a_zero_watchdog_never_gives_up() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 5,
+            stall_timeout_secs: 0,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                task_id,
+                delivered: 1,
+                total: 5,
+                in_flight: false,
+                // A week without a turn.
+                last_progress_at: epoch_ms() - 7 * 24 * 3_600 * 1_000,
+            },
+        );
+        daemon.sweep_stalled_runs();
+        assert_eq!(daemon.task_loop_progress(&agent), Some((1, 5)));
+    }
+
+    /// Two agents in one checkout is worse than a missed window, so the
+    /// window is what gets dropped — and the stamp still moves, or the task
+    /// would re-fire on every tick forever.
+    #[tokio::test]
+    async fn the_sweep_skips_a_task_whose_run_is_still_going() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            cron: Some("* * * * * *".into()),
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        // Make it due, then park a run on it.
+        daemon.store.set_task_next_run(&task_id, 1).unwrap();
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                task_id: task_id.clone(),
+                delivered: 1,
+                total: 5,
+                in_flight: false,
+                last_progress_at: epoch_ms(),
+            },
+        );
+
+        daemon.tick_scheduler().await;
+
+        let task = only_task(&daemon);
+        assert_eq!(
+            task.last_outcome.as_deref(),
+            Some("skipped: previous run still going")
+        );
+        assert!(task.next_run_at > 1, "the due stamp still moved forward");
+        assert_eq!(
+            daemon.task_loop_progress(&agent),
+            Some((1, 5)),
+            "the run in flight is untouched"
+        );
+        assert!(
+            daemon.store.load_tree().unwrap().2.is_empty(),
+            "no second session was spawned"
+        );
+    }
+
+    /// The wrap-up replaces the prompt on the final turn only, and only when
+    /// there is a turn to spare.
+    #[test]
+    fn the_last_iteration_of_a_loop_gets_the_wrap_up_prompt() {
+        let mut task = Task {
+            id: TaskId("t".into()),
+            project_id: ProjectId("p".into()),
+            name: "nightly".into(),
+            prompt: "keep going".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cron: None,
+            iterations: 3,
+            unattended: false,
+            final_prompt: Some("stop and summarise".into()),
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
+            target: TaskTarget::Root,
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: 0,
+        };
+        assert_eq!(
+            task_prompt_text(&task, 1),
+            "[nebula] Task `nightly` — iteration 1 of 3.\nkeep going"
+        );
+        assert_eq!(
+            task_prompt_text(&task, 3),
+            "[nebula] Task `nightly` — iteration 3 of 3 (wrap-up).\nstop and summarise"
+        );
+
+        // No wrap-up set: the last turn is an ordinary turn.
+        task.final_prompt = None;
+        assert_eq!(
+            task_prompt_text(&task, 3),
+            "[nebula] Task `nightly` — iteration 3 of 3.\nkeep going"
+        );
+
+        // One turn total is all work and no wrap-up — spending the only turn
+        // summarising would mean the task never does anything.
+        task.final_prompt = Some("stop and summarise".into());
+        task.iterations = 1;
+        assert_eq!(
+            task_prompt_text(&task, 1),
+            "[nebula] Task `nightly`.\nkeep going"
+        );
+    }
+
+    #[test]
+    fn a_watchdog_window_reads_as_a_duration() {
+        assert_eq!(mins_label(30), "30s");
+        assert_eq!(mins_label(300), "5m");
+        assert_eq!(mins_label(1_800), "30m");
+        assert_eq!(mins_label(3_600), "1h");
+        assert_eq!(mins_label(7_200), "2h");
+    }
+
     /// A turn end that lands while a prompt is still being typed belongs to
     /// the previous turn — or is a duplicate Stop. Acting on it would consume
     /// an iteration for work that never happened, and in practice re-typed
@@ -3753,6 +4440,7 @@ mod tests {
                 delivered: 1,
                 total: 5,
                 in_flight: true,
+                last_progress_at: epoch_ms(),
             },
         );
 
@@ -3796,6 +4484,7 @@ mod tests {
                 delivered: 1,
                 total: 5,
                 in_flight: false,
+                last_progress_at: epoch_ms(),
             },
         );
         daemon.delete_task(&task_id).unwrap();
@@ -3875,6 +4564,9 @@ mod tests {
             cron: None,
             iterations: 1,
             unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
             target: TaskTarget::NewWorktree,
             enabled: true,
             last_run_at: 0,

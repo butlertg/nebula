@@ -3494,7 +3494,7 @@ fn draw_automation(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         return;
     };
     let detail_focused = focused && app.automation.on_detail;
-    let label_w = 12usize;
+    let label_w = crate::app::TASK_LABEL_W;
     for (i, field) in TaskField::ALL.iter().enumerate() {
         let Some(r) = row_rect(detail_area, i) else {
             break;
@@ -3622,6 +3622,43 @@ fn task_field_value(task: &Task, field: TaskField, th: Theme, width: usize) -> (
                 n => format!("[{n} turns]"),
             },
             if task.iterations > 1 { plain } else { dim },
+        ),
+        TaskField::FinalPrompt => match task.final_prompt.as_deref() {
+            // Only meaningful with a turn to spare, and saying so here beats
+            // letting the user set it and wonder why it never arrives.
+            _ if task.iterations < 2 => ("[needs 2+ turns]".to_string(), dim),
+            Some(p) => {
+                let first = p.lines().next().unwrap_or("");
+                let more = p.lines().count() > 1;
+                let shown = truncate(first, width.saturating_sub(if more { 2 } else { 0 }));
+                (
+                    format!("[{}{}]", shown, if more { " …" } else { "" }),
+                    plain,
+                )
+            }
+            None => ("[same prompt every turn]".to_string(), dim),
+        },
+        TaskField::StallTimeout => (
+            match task.stall_timeout_secs {
+                0 => "[never give up]".to_string(),
+                s if s < 3_600 => format!("[{} min without a turn]", s / 60),
+                s => format!("[{} h without a turn]", s / 3_600),
+            },
+            // Waiting forever is the one setting that can leave an overnight
+            // run hanging with nobody to notice, so it reads as a warning.
+            if task.stall_timeout_secs == 0 {
+                Style::default().fg(th.warn)
+            } else {
+                plain
+            },
+        ),
+        TaskField::CommitOnFinish => (
+            if task.commit_on_finish {
+                "[on a branch of its own]".to_string()
+            } else {
+                "[no]".to_string()
+            },
+            if task.commit_on_finish { plain } else { dim },
         ),
         TaskField::Unattended => (
             if task.unattended {

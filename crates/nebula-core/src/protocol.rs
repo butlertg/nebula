@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -381,6 +381,11 @@ pub struct TaskSpec {
     pub cron: Option<String>,
     pub iterations: u32,
     pub unattended: bool,
+    /// None or empty = the last iteration gets the ordinary prompt.
+    pub final_prompt: Option<String>,
+    /// 0 = no watchdog.
+    pub stall_timeout_secs: u32,
+    pub commit_on_finish: bool,
     pub target: TaskTarget,
     pub enabled: bool,
 }
@@ -389,6 +394,12 @@ pub struct TaskSpec {
 /// running out of iterations, so the count is the safety rail — an
 /// accidental 100000 would re-prompt an agent for days.
 pub const MAX_TASK_ITERATIONS: u32 = 100;
+
+/// What a new task's stall watchdog is set to. A turn that has not produced
+/// a turn-end signal in half an hour is not going to: the CLI has crashed,
+/// is waiting on a dialog nobody will answer, or is blocked on the network.
+/// Long enough that a genuinely slow turn is never cut off.
+pub const DEFAULT_STALL_TIMEOUT_SECS: u32 = 1_800;
 
 /// What `EnterWorktree` did to the agent's live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -229,6 +229,23 @@ pub struct Task {
     /// nothing is watching to answer a prompt. Off by default.
     #[serde(default)]
     pub unattended: bool,
+    /// Delivered *instead of* `prompt` on the final iteration, so a loop
+    /// lands its work rather than being cut off mid-thought — "stop here,
+    /// summarise what you changed". Ignored when `iterations` is 1: there is
+    /// no turn to spend on wrapping up when there is only one turn.
+    #[serde(default)]
+    pub final_prompt: Option<String>,
+    /// Give up on a run whose turn has not ended in this many seconds.
+    /// 0 = wait forever. A loop only advances on a turn-end signal, so
+    /// without this a wedged CLI leaves the run reading "running" until
+    /// somebody looks.
+    #[serde(default)]
+    pub stall_timeout_secs: u32,
+    /// When a run ends, capture the checkout on a branch of its own. The
+    /// snapshot never touches HEAD, the index, or the files — see
+    /// `git::snapshot_branch`.
+    #[serde(default)]
+    pub commit_on_finish: bool,
     pub target: TaskTarget,
     pub enabled: bool,
     /// Epoch ms of the last run's start; 0 = never run.

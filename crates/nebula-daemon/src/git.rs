@@ -31,13 +31,19 @@ fn spawn_err(e: std::io::Error) -> anyhow::Error {
 }
 
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .await
-        .map_err(spawn_err)?;
+    git_with_index(repo, args, None).await
+}
+
+/// `git`, optionally against a scratch index file instead of the repo's own.
+/// Staging into a throwaway index is what lets `snapshot_branch` read the
+/// working tree without touching what the user has staged.
+async fn git_with_index(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let output = cmd.output().await.map_err(spawn_err)?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -198,6 +204,83 @@ pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> 
     }
 }
 
+/// Record the working tree as a commit on `branch`, changing nothing about
+/// the checkout itself.
+///
+/// This is deliberately not `checkout -b && add && commit`: an unattended
+/// run finishes at 3am in a checkout the user may come back to, and leaving
+/// them on a different branch — or with a swept-up index — is not something
+/// they asked for. Instead the tree is staged into a scratch index and
+/// written with plumbing, so HEAD, the real index, and every file on disk
+/// are exactly as the run left them. The commit is reachable only from the
+/// new branch.
+///
+/// Returns the new commit's short hash, or `None` when the tree is identical
+/// to HEAD and there is nothing worth recording.
+pub async fn snapshot_branch(repo: &Path, branch: &str, message: &str) -> Result<Option<String>> {
+    // A commit needs a parent to diff against, and an unborn HEAD has none.
+    // Nothing has ever been committed here, so there is no run to capture.
+    let head = git(repo, &["rev-parse", "HEAD"])
+        .await
+        .map_err(|e| anyhow!("the checkout has no commits to build on ({e})"))?;
+    let head = head.trim().to_string();
+
+    // Scratch index, next to the repo's own git dir rather than in the
+    // worktree — it must not show up as an untracked file in the very tree
+    // we are about to stage. The pid keeps two concurrent runs apart.
+    let common = git(repo, &["rev-parse", "--git-common-dir"]).await?;
+    let common = repo.join(common.trim());
+    let index = common.join(format!("nebula-snapshot-{}.index", std::process::id()));
+    let _ = tokio::fs::remove_file(&index).await;
+
+    let result = snapshot_into(repo, branch, message, &head, &index).await;
+    // Best effort: a leftover scratch index is harmless (git only reads it
+    // when GIT_INDEX_FILE points at it) but there is no reason to keep one.
+    let _ = tokio::fs::remove_file(&index).await;
+    result
+}
+
+async fn snapshot_into(
+    repo: &Path,
+    branch: &str,
+    message: &str,
+    head: &str,
+    index: &Path,
+) -> Result<Option<String>> {
+    let idx = Some(index);
+    // Seed from HEAD so unchanged files keep their stat cache, then let
+    // `add -A` fold in every modification, addition and deletion. `-A`
+    // still honours .gitignore, so build output stays out.
+    git_with_index(repo, &["read-tree", head], idx).await?;
+    git_with_index(repo, &["add", "-A"], idx).await?;
+    let tree = git_with_index(repo, &["write-tree"], idx).await?;
+    let tree = tree.trim().to_string();
+
+    // Identical trees means the run touched nothing that git tracks; a
+    // commit there would be an empty entry in a log the user has to read.
+    let head_tree = git(repo, &["rev-parse", &format!("{head}^{{tree}}")]).await?;
+    if tree == head_tree.trim() {
+        return Ok(None);
+    }
+
+    let commit = git_with_index(
+        repo,
+        &["commit-tree", &tree, "-p", head, "-m", message],
+        idx,
+    )
+    .await?;
+    let commit = commit.trim().to_string();
+    // `update-ref` rather than `branch`: it does not care that we are not on
+    // the branch, and it fails loudly if the name is already taken.
+    git(
+        repo,
+        &["update-ref", &format!("refs/heads/{branch}"), &commit],
+    )
+    .await?;
+    let short = git(repo, &["rev-parse", "--short", &commit]).await?;
+    Ok(Some(short.trim().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +321,131 @@ mod tests {
         // A real git that says "not a repository" must keep saying so.
         let err = repo_toplevel(tmp.path()).await.unwrap_err();
         assert!(!is_missing(&err), "{err:#}");
+    }
+
+    /// The whole point of the plumbing route: an unattended run finishes in
+    /// a checkout the user comes back to in the morning, so capturing it
+    /// must leave HEAD, the branch, the index and the files exactly as they
+    /// were. Only a new ref appears.
+    #[tokio::test]
+    async fn snapshot_branch_records_the_tree_without_disturbing_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+
+        // Something committed, something the "run" changed, something it
+        // added, and something staged by the user beforehand.
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        git(&repo, &["add", "."]).await.unwrap();
+        git(&repo, &["commit", "-m", "tracked"]).await.unwrap();
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+        std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+        git(&repo, &["add", "staged.txt"]).await.unwrap();
+
+        let head_before = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let branch_before = current_branch(&repo).await.unwrap();
+        let status_before = git(&repo, &["status", "--porcelain"]).await.unwrap();
+
+        let hash = snapshot_branch(&repo, "task/nightly/1", "captured")
+            .await
+            .unwrap()
+            .expect("the tree differs from HEAD, so there is a commit");
+
+        // Nothing about the checkout moved.
+        assert_eq!(
+            git(&repo, &["rev-parse", "HEAD"]).await.unwrap(),
+            head_before
+        );
+        assert_eq!(current_branch(&repo).await.unwrap(), branch_before);
+        assert_eq!(
+            git(&repo, &["status", "--porcelain"]).await.unwrap(),
+            status_before,
+            "the user's staged and unstaged work is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "two\n"
+        );
+
+        // The branch exists, is a child of HEAD, and holds the working tree.
+        let listed = git(&repo, &["show", "--stat", "--oneline", "task/nightly/1"])
+            .await
+            .unwrap();
+        assert!(listed.contains(&hash), "{listed}");
+        let shown = git(&repo, &["show", "task/nightly/1:tracked.txt"])
+            .await
+            .unwrap();
+        assert_eq!(shown, "two\n");
+        let added = git(&repo, &["show", "task/nightly/1:new.txt"])
+            .await
+            .unwrap();
+        assert_eq!(added, "fresh\n");
+        let parent = git(&repo, &["rev-parse", "task/nightly/1^"]).await.unwrap();
+        assert_eq!(parent, head_before);
+
+        // No scratch index left lying around.
+        let leftovers: Vec<_> = std::fs::read_dir(repo.join(".git"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("nebula-snapshot-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A run that changed nothing must not leave an empty commit in a log
+    /// the user has to read every morning.
+    #[tokio::test]
+    async fn snapshot_branch_says_nothing_to_commit_on_a_clean_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&repo, &["add", "."]).await.unwrap();
+        git(&repo, &["commit", "-m", "a"]).await.unwrap();
+
+        assert!(snapshot_branch(&repo, "task/x/1", "nope")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            git(&repo, &["rev-parse", "--verify", "task/x/1"])
+                .await
+                .is_err(),
+            "no branch is created when there was nothing to record"
+        );
+    }
+
+    /// A linked worktree keeps its git dir elsewhere (`.git` is a file), so
+    /// the scratch index has to follow `--git-common-dir` rather than being
+    /// dropped next to the checkout — where it would show up as untracked in
+    /// the very tree being staged.
+    #[tokio::test]
+    async fn snapshot_branch_works_from_a_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        std::fs::write(wt.join("work.txt"), "done\n").unwrap();
+
+        let hash = snapshot_branch(&wt, "task/feature/1", "captured")
+            .await
+            .unwrap()
+            .expect("the worktree has a new file");
+        assert!(!hash.is_empty());
+        let shown = git(&wt, &["show", "task/feature/1:work.txt"])
+            .await
+            .unwrap();
+        assert_eq!(shown, "done\n");
+        assert_eq!(
+            git(&wt, &["status", "--porcelain"]).await.unwrap().trim(),
+            "?? work.txt",
+            "the file is still untracked in the worktree itself"
+        );
     }
 
     #[tokio::test]

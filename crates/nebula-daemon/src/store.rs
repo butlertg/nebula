@@ -253,6 +253,18 @@ const MIGRATIONS: &[&str] = &[
       created_at    INTEGER NOT NULL
     );
     ",
+    // 23: what a task does when nobody is watching. `final_prompt` is the
+    // last iteration's prompt, `stall_timeout_secs` is how long a turn may
+    // go without ending before the run is written off, and
+    // `commit_on_finish` captures the checkout on a branch when the run
+    // ends. Existing rows default to the old behaviour in every respect but
+    // the watchdog, which they get because a run that hangs forever was
+    // never the intent — it was just the absence of this column.
+    "
+    ALTER TABLE tasks ADD COLUMN final_prompt TEXT;
+    ALTER TABLE tasks ADD COLUMN stall_timeout_secs INTEGER NOT NULL DEFAULT 1800;
+    ALTER TABLE tasks ADD COLUMN commit_on_finish INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
@@ -303,6 +315,9 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         last_agent_id: r.get::<_, Option<String>>(16)?.map(AgentId),
         sort_order: r.get(17)?,
         created_at: r.get(18)?,
+        final_prompt: r.get(19)?,
+        stall_timeout_secs: r.get(20)?,
+        commit_on_finish: r.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -872,17 +887,22 @@ impl Store {
     // ---- tasks ----
 
     /// Columns every task read selects, in the order `row_to_task` expects.
+    // New columns go on the end: `row_to_task` reads by index, so inserting
+    // one in the middle would silently re-map every field after it.
     const TASK_COLS: &'static str = "id, project_id, name, prompt, kind, model, effort, cron, \
          iterations, unattended, target_kind, target_worktree, enabled, last_run_at, \
-         next_run_at, last_outcome, last_agent_id, sort_order, created_at";
+         next_run_at, last_outcome, last_agent_id, sort_order, created_at, final_prompt, \
+         stall_timeout_secs, commit_on_finish";
 
     pub fn insert_task(&self, t: &Task) -> Result<()> {
         let (target_kind, target_worktree) = target_columns(&t.target);
         self.conn.lock().unwrap().execute(
             "INSERT INTO tasks (id, project_id, name, prompt, kind, model, effort, cron, \
              iterations, unattended, target_kind, target_worktree, enabled, last_run_at, \
-             next_run_at, last_outcome, last_agent_id, sort_order, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             next_run_at, last_outcome, last_agent_id, sort_order, created_at, final_prompt, \
+             stall_timeout_secs, commit_on_finish) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20, ?21, ?22)",
             params![
                 t.id.as_str(),
                 t.project_id.as_str(),
@@ -902,7 +922,14 @@ impl Store {
                 t.last_outcome,
                 t.last_agent_id.as_ref().map(|a| a.0.clone()),
                 t.sort_order,
-                if t.created_at == 0 { now_ms() } else { t.created_at },
+                if t.created_at == 0 {
+                    now_ms()
+                } else {
+                    t.created_at
+                },
+                t.final_prompt,
+                t.stall_timeout_secs,
+                t.commit_on_finish as i64,
             ],
         )?;
         Ok(())
@@ -926,7 +953,8 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE tasks SET project_id = ?2, name = ?3, prompt = ?4, kind = ?5, model = ?6, \
              effort = ?7, cron = ?8, iterations = ?9, unattended = ?10, target_kind = ?11, \
-             target_worktree = ?12, enabled = ?13 WHERE id = ?1",
+             target_worktree = ?12, enabled = ?13, final_prompt = ?14, \
+             stall_timeout_secs = ?15, commit_on_finish = ?16 WHERE id = ?1",
             params![
                 t.id.as_str(),
                 t.project_id.as_str(),
@@ -941,6 +969,9 @@ impl Store {
                 target_kind,
                 target_worktree,
                 t.enabled as i64,
+                t.final_prompt,
+                t.stall_timeout_secs,
+                t.commit_on_finish as i64,
             ],
         )?;
         Ok(())
@@ -1223,6 +1254,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::DEFAULT_STALL_TIMEOUT_SECS;
 
     #[test]
     fn roundtrip_tree() {
@@ -1426,6 +1458,9 @@ mod tests {
             cron: Some("0 2 * * *".into()),
             iterations: 3,
             unattended: true,
+            final_prompt: Some("summarise and stop".into()),
+            stall_timeout_secs: 900,
+            commit_on_finish: true,
             target: TaskTarget::Worktree(worktree.id.clone()),
             enabled: true,
             last_run_at: 0,
@@ -1449,6 +1484,9 @@ mod tests {
         assert_eq!(read.cron.as_deref(), Some("0 2 * * *"));
         assert_eq!(read.iterations, 3);
         assert!(read.unattended);
+        assert_eq!(read.final_prompt.as_deref(), Some("summarise and stop"));
+        assert_eq!(read.stall_timeout_secs, 900);
+        assert!(read.commit_on_finish);
         assert_eq!(read.target, TaskTarget::Worktree(worktree.id.clone()));
         assert!(read.enabled);
         assert!(read.created_at > 0, "insert stamps created_at");
@@ -1527,6 +1565,9 @@ mod tests {
             cron: None,
             iterations: 1,
             unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
             target: TaskTarget::Worktree(worktree.id.clone()),
             enabled: true,
             last_run_at: 0,
@@ -1559,6 +1600,64 @@ mod tests {
             store.get_task(&task.id).unwrap().unwrap().target,
             TaskTarget::Root
         );
+    }
+
+    /// A v22 database has tasks but none of the unattended-run controls.
+    /// The upgrade has to keep every existing task and give it a watchdog:
+    /// a run that hangs forever was never anybody's intent, it was just the
+    /// absence of this column.
+    #[test]
+    fn migration_23_gives_existing_tasks_a_watchdog() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig23-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(22).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at) \
+                 VALUES ('p1', 'p', '/tmp/p', 0, 0); \
+                 INSERT INTO tasks (id, project_id, name, prompt, kind, iterations, \
+                 unattended, target_kind, enabled, created_at) \
+                 VALUES ('t1', 'p1', 'nightly', 'go', 'claude', 4, 1, 'root', 1, 7);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let tasks = store.load_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "the existing task survived the upgrade");
+        let task = &tasks[0];
+        assert_eq!(task.name, "nightly");
+        assert_eq!(task.iterations, 4);
+        assert!(task.unattended);
+        // The new columns take their defaults: no wrap-up, no commit, but a
+        // watchdog rather than an unbounded wait.
+        assert_eq!(task.final_prompt, None);
+        assert_eq!(task.stall_timeout_secs, DEFAULT_STALL_TIMEOUT_SECS);
+        assert!(!task.commit_on_finish);
+
+        // And the new fields are writable on the upgraded table.
+        let edited = Task {
+            final_prompt: Some("wrap up".into()),
+            stall_timeout_secs: 60,
+            commit_on_finish: true,
+            ..task.clone()
+        };
+        store.update_task(&edited).unwrap();
+        let read = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(read.final_prompt.as_deref(), Some("wrap up"));
+        assert_eq!(read.stall_timeout_secs, 60);
+        assert!(read.commit_on_finish);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1597,6 +1696,9 @@ mod tests {
             cron: Some("0 2 * * *".into()),
             iterations: 2,
             unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
             target: TaskTarget::Root,
             enabled: true,
             last_run_at: 0,

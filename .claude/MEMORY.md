@@ -14,6 +14,101 @@ about what is worth recording.
 
 ## Entries
 
+### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
+
+**Asked:** "I want to ensure that I can have Claude work overnight & be constructive when Iam away. How
+best to update the features in this branch to help facilitate that?" — then chose, from four options,
+"Tier 1 + wrap-up + auto-branch" and "commit to a per-run branch" (no push).
+
+**Did:** Three new `Task` fields — `final_prompt`, `stall_timeout_secs`, `commit_on_finish` (`entities.rs`,
+`TaskSpec`, `PROTOCOL_VERSION` 28 → 29, `DEFAULT_STALL_TIMEOUT_SECS = 1800`), **migration 23**
+(three `ALTER TABLE tasks`, appended so `row_to_task`'s positional reads stay valid). In `registry.rs`:
+`LoopState.last_progress_at`; a single `end_task_run` that every stop path goes through (completion,
+stall, question, dead session) which drops the loop, records the outcome, and optionally snapshots;
+`abandon_task_run_on_exit` called from the PTY-exit arm; `abandon_unattended_run_on_question` checked
+first in `continue_task_loop`; `sweep_stalled_runs` + `run_in_flight` at the top of `tick_scheduler`, plus
+a skip-and-restamp guard so an overlapping cron window is dropped instead of stacking agents;
+`task_prompt_text` extracted (pure, so the wrap-up is unit-testable); `task_slug` factored out of
+`task_run_branch` for the new `task_snapshot_branch`. New `git::snapshot_branch` records the working tree
+on `task/<slug>/<stamp>` via `read-tree`/`add -A`/`write-tree`/`commit-tree`/`update-ref` against a
+**scratch `GIT_INDEX_FILE`**, so HEAD, the real index, and the files are all untouched. TUI: three new
+`TaskField` rows, `TASK_STALL_CHOICES`, `PromptKind::TaskFinalPrompt`, and `TASK_LABEL_W` promoted out of
+`ui.rs`. **693 tests green** (was 678), fmt clean, clippy at the pre-existing baseline. Verified live
+against real `claude` v2.1.231 in a throwaway repo: three iterations where turn 3 carried the wrap-up,
+`ran 3 of 3 · task/overnight-notes/… ae5ecd7`, the branch holding the work while the checkout stayed on
+`main` with its dirty files intact; then `kill -9` on the session gave
+`stopped: session exited (1) at iteration 1 of 3 · task/… d6730a1`.
+
+**Gotchas:**
+- **Claude Code opens a trust dialog in any directory it has not seen before** ("Is this a project you
+  created or one you trust?"), and it *swallows the pasted prompt*. No hook fires, the session stays
+  `Fresh`, and the run reads "running" indefinitely. This bit a real run: the first live attempt sat for
+  six minutes doing nothing. It matters most for `TaskTarget::NewWorktree`, whose first run is always in a
+  path Claude has not seen. Mitigated by `FIRST_TURN_TIMEOUT_SECS = 120`: when the agent is still `Fresh`
+  the watchdog uses a two-minute fuse instead of the task's window and the outcome names the trust prompt.
+  **Not fixed** — whether `--dangerously-skip-permissions` bypasses the dialog is still unverified,
+  because the harness classifier blocks launching a real `claude` with that flag (same wall as the
+  previous session). Confirm before relying on an unattended task in a fresh worktree.
+- **The snapshot is a snapshot, not a curated commit.** `add -A` sweeps in whatever else was uncommitted
+  in that checkout — a pre-existing `USER_WIP.txt` landed in the run's commit. Harmless (the working tree
+  is untouched and the commit is only reachable from the new branch) but it is not "the agent's diff".
+- **A scratch index must not live in the checkout.** `GIT_INDEX_FILE` goes under `--git-common-dir`, not
+  `repo/.git` — in a linked worktree `.git` is a *file*, and a scratch file inside the worktree would be
+  staged by the very `add -A` it exists to serve. `snapshot_branch_works_from_a_linked_worktree` pins it.
+- **A `TaskField` label longer than 12 chars silently collides with its own value** — the row pads the
+  label to `TASK_LABEL_W` and writes `[value]` straight after, so it neither wraps nor truncates. A
+  13-character "give up after" overlapped in the live run; now "stall limit", with
+  `every_task_field_label_fits_the_detail_column` guarding it.
+- **New free functions must go *above* `mod tests`** or clippy's `items_after_test_module` fires — the
+  `snapshot_branch` pair was appended to the end of `git.rs` and had to be moved up.
+- **An import used only by tests belongs in the test module.** `DEFAULT_STALL_TIMEOUT_SECS` in
+  `store.rs`'s top-level `use` was dead in non-test builds.
+- **Driving the sessions column by keyboard is unreliable from the pane.** `h`/`l` (FocusLeft/Right) did
+  not move focus out of Worktrees; `Tab` (FocusNext) did. And every task session is named after its task,
+  so the list is rows of identical names — read the DB (`~/.nebula-dev/<slot>/nebula.db`, `SELECT
+  last_outcome FROM tasks`) rather than trusting which row the pane is showing.
+- **`workspace_scope_is_per_connection` still fails under a full-parallel `cargo test --workspace`** and
+  passes at `--test-threads=4` or alone. Unchanged by this work, as the entry below already records.
+
+### Driving The Automation Tab For Real: Tasks Verified End To End Against `claude` — 2026-08-27
+
+**Asked:** "run the feature branch locally to test"
+
+**Did:** No code changed. Ran `feat/task-automation` as a real user through `make dev` inside tmux and
+exercised the whole `Task` surface: `e` opens the Automation tab (the `━` rule tracks the active tab, so
+the `Span::raw("  ")` gutter fix holds), `n` chains the name → prompt prompts, the detail column edits every
+`TaskField`, Space toggles `enabled`, `d` confirms and deletes. Verified against a **real** `claude`
+v2.1.231, which closes the open question in the entry below:
+- **Manual run (`r`)** — the session is created `pinned`, the prompt is submitted, claude answers.
+- **Delivery bytes** — with `AGENT=<stub>` logging its stdin, exactly
+  `\x1b[200~[nebula] Task \`name\`.\n<prompt>\x1b[201~` then the `\r` submit arrive as two reads.
+- **Cron** — `*/20 * * * * *` accepted, header flips to `1 scheduled`, and `tick_scheduler` fired it twice
+  unattended with `NEBULA_SCHEDULER_MS=2000`; disabling it (Space) stopped the sweep.
+- **The loop** — `iterations = 3` drove three real turns in one session, each delivered off the turn-end
+  hook with the correct `iteration N of 3` header, then stopped at 3 (max-iterations exit).
+`unattended = yes` was **not** run against a real agent — it adds `--dangerously-skip-permissions`, which
+is not something to fire at a live repo unasked.
+
+**Gotchas:**
+- **`tmux` is not installed on this machine** and there is no `ttyd` either, so `make browser` is out.
+  `brew install tmux` then `tmux new-session -d -s neb -x 200 -y 50 "make dev"` is the way an agent drives
+  the TUI. Remember `export PATH="/opt/homebrew/bin:$PATH"` *inside* the tmux command too — the shell tmux
+  spawns does not inherit the caller's edit, and `cargo`/`claude` both live there.
+- **Every task session is named after the task, so the sessions list is a wall of identical rows.** I read
+  the wrong one and briefly concluded the 2.5s delay was too short and the prompt had been dropped. It had
+  not — the run had succeeded in a *different* row. Always `h` to the Sessions column and `k` to the top
+  before judging a run; the newest row is the one you just launched.
+- **Mixing `AGENT=<stub>` and real `claude` in one dev instance poisons resume.** The stub run records a
+  `session_id` that claude has never heard of, so the next real spawn resumes into
+  `No conversation found with session ID: …` and the pane sits dead. Use `make dev-reset` when switching
+  between a stubbed and a real agent instead of reusing the slot.
+- **Focus does not move with `Right` once the pane has it** — the status bar tells you the way back
+  (`h: sessions`). `Right` from the automation *list* steps into the detail column, not across panes.
+- **`make dev` really does seed from your live DB**, so the dev instance opens on your real projects and
+  runs agents in real worktrees (`~/dev/scout/elevate` here). Harmless prompts only.
+- **`.claude/MEMORY.md` is 2165 lines**, far past the skill's ~300-line prune threshold. Not pruned here —
+  that is its own task, not a rider on a test run.
+
 ### Tasks: Cron Schedules And Agent Loops, In An Automation Pane Tab — 2026-08-27
 
 **Asked:** "Need to add in ability to add agent looping for a given task as well as scheduling
@@ -81,12 +176,10 @@ codex/cursor take no initial prompt, so *every* iteration goes through the same 
 - **A task's session must be `pinned: true`** or `reap_idle_sessions` kills it between turns after
   `session_idle_timeout`. That function's own comment already anticipated this ("schedules, loops, long
   jobs the status can't see"), as does `status.rs`'s "a scheduled wake-up".
-- **The paste-then-submit delivery was never exercised against a real agent CLI.** The e2e proves the bytes
-  arrive (a stub shell logs its stdin) but not that Claude Code's TUI treats them as a *submitted* prompt.
-  The attempt to drive a real `claude` was blocked by the harness classifier (it launches an agent with
-  `--dangerously-skip-permissions`). What is verified offline: the paste bytes are byte-identical to the
-  TUI's own ⌘V path (`event_loop.rs`), and the submit is `b"\r"` — byte-identical to `keys.rs:102`'s
-  encoding of a plain Enter. First thing to confirm when running it for real.
+- **The paste-then-submit delivery works against a real Claude Code TUI** — confirmed 2026-08-27 against
+  `claude` v2.1.231 (see the run entry at the top of this file), so the old "never exercised against a real
+  agent CLI" caveat is closed. The default `TASK_PROMPT_DELAY_MS = 2_500` is enough: claude draws its input
+  box ~0.6s after exec and accepts the bracketed paste well inside the budget.
 - **README's "one ~4 MB Rust binary" was already stale before this work**: the shipped v0.10.0 asset in
   `~/.local/bin` is 10.3 MB, a clean-tree release build is 10.27 MB, and this change takes it to 10.84 MB
   (+0.58 MB for `cron` + `chrono`). Left alone as a pre-existing claim, not one this work broke.

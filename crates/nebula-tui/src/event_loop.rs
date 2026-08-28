@@ -5,7 +5,7 @@ use crate::app::{
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
     PaletteTarget, PaneMode, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
     RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TaskField, TermSelection,
-    WorktreeRollback, TASK_ITERATION_CHOICES,
+    WorktreeRollback, TASK_ITERATION_CHOICES, TASK_STALL_CHOICES,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -19,7 +19,8 @@ use crossterm::event::{
 use futures::StreamExt;
 use nebula_core::{
     AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef, Task,
-    TaskId, TaskSpec, TaskTarget, WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    TaskId, TaskSpec, TaskTarget, WorkspaceId, WorktreeId, DEFAULT_STALL_TIMEOUT_SECS,
+    MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1706,6 +1707,11 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             "Task schedule".to_string(),
             "Cron — `0 2 * * *`, `*/15 * * * *`, `0 9 * * Mon-Fri`; empty for manual".to_string(),
             task_field_text(app, id, TaskField::Schedule),
+        ),
+        PromptKind::TaskFinalPrompt { id } => (
+            "Task wrap-up".to_string(),
+            "Sent instead of the prompt on the last turn; empty for none".to_string(),
+            task_field_text(app, id, TaskField::FinalPrompt),
         ),
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
@@ -3911,6 +3917,13 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                     cron: None,
                     iterations: 1,
                     unattended: false,
+                    // No wrap-up and no commit until asked for — both change
+                    // what a run *does*, and a new task should do the least
+                    // surprising thing. The watchdog is the exception: a run
+                    // that hangs forever is nobody's intent.
+                    final_prompt: None,
+                    stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
+                    commit_on_finish: false,
                     target: TaskTarget::Root,
                     enabled: true,
                 },
@@ -3934,6 +3947,19 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             if let Some(task) = task_by_id(app, &id) {
                 let spec = TaskSpec {
                     prompt: value,
+                    ..task_spec_of(&task)
+                };
+                send_task_update(app, out, &id, spec);
+            }
+        }
+        PromptKind::TaskFinalPrompt { id } => {
+            if let Some(task) = task_by_id(app, &id) {
+                // Empty clears it: the daemon reads None as "every turn gets
+                // the ordinary prompt", and this is the only way to undo a
+                // wrap-up without rewriting the task.
+                let final_prompt = (!value.trim().is_empty()).then_some(value);
+                let spec = TaskSpec {
+                    final_prompt,
                     ..task_spec_of(&task)
                 };
                 send_task_update(app, out, &id, spec);
@@ -6906,6 +6932,7 @@ fn activate_task_field(app: &mut App, out: &mut Vec<ClientRequest>, delta: i32) 
         let kind = match field {
             TaskField::Name => PromptKind::TaskName { id: task.id },
             TaskField::Prompt => PromptKind::TaskPrompt { id: task.id },
+            TaskField::FinalPrompt => PromptKind::TaskFinalPrompt { id: task.id },
             _ => PromptKind::TaskSchedule { id: task.id },
         };
         open_prompt(app, kind);
@@ -6934,10 +6961,17 @@ fn activate_task_field(app: &mut App, out: &mut Vec<ClientRequest>, delta: i32) 
             spec.iterations = cycle_choice(&TASK_ITERATION_CHOICES, task.iterations, delta)
         }
         TaskField::Unattended => spec.unattended = !task.unattended,
+        TaskField::StallTimeout => {
+            spec.stall_timeout_secs =
+                cycle_choice(&TASK_STALL_CHOICES, task.stall_timeout_secs, delta)
+        }
+        TaskField::CommitOnFinish => spec.commit_on_finish = !task.commit_on_finish,
         TaskField::Target => spec.target = cycle_task_target(app, &task, delta),
         TaskField::Enabled => spec.enabled = !task.enabled,
         // Handled above.
-        TaskField::Name | TaskField::Prompt | TaskField::Schedule => return,
+        TaskField::Name | TaskField::Prompt | TaskField::Schedule | TaskField::FinalPrompt => {
+            return
+        }
     }
     send_task_update(app, out, &task.id, spec);
 }
@@ -6956,6 +6990,9 @@ fn task_spec_of(task: &Task) -> TaskSpec {
         cron: task.cron.clone(),
         iterations: task.iterations,
         unattended: task.unattended,
+        final_prompt: task.final_prompt.clone(),
+        stall_timeout_secs: task.stall_timeout_secs,
+        commit_on_finish: task.commit_on_finish,
         target: task.target.clone(),
         enabled: task.enabled,
     }
@@ -12604,6 +12641,9 @@ diff --git a/src/b.rs b/src/b.rs
                     cron: cron.map(str::to_string),
                     iterations,
                     unattended: false,
+                    final_prompt: None,
+                    stall_timeout_secs: 0,
+                    commit_on_finish: false,
                     target: TaskTarget::Root,
                     enabled: true,
                     last_run_at: 0,
