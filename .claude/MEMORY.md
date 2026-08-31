@@ -14,6 +14,66 @@ about what is worth recording.
 
 ## Entries
 
+### Every Run Keeps A Record: Reports, Transcripts, And A Diff Of Its Own Work — 2026-08-31
+
+**Asked:** "new version looks gret, however how can I ensure automation tasks have an output which I can
+review and keep as needed when the automation finishes (think humanless during the night and need an
+overview of changes, etc after a task finishes)" — then chose "Full run journal" and all three surfaces
+(pane run list, CLI, one overnight digest).
+
+**Did:** New `TaskRun`/`TaskRunStatus` entity (`nebula-core/src/entities.rs`), `TaskRunId`,
+`paths::task_runs_dir()`, `RunArtifact`, three requests (`ListTaskRuns`, `GetTaskRunArtifact`,
+`GetTaskRunDigest`) and four events (`TaskRuns`, `TaskRunText`, `TaskRunDigest`, `TaskRunUpserted`);
+`PROTOCOL_VERSION` 29 → 30. **Migration 24** `CREATE TABLE task_runs` + two indexes, with
+`insert/update/get/list/unfinished_task_runs` and `RUN_LIST_CAP = 200` in `store.rs`. `git.rs` split
+`snapshot_branch` into `snapshot_commit`/`write_ref` and gained `snapshot_ref` (**always** commits, even
+on a clean tree) plus `diff_summary` — two `-z` plumbing calls (`--numstat` and `--name-status`) joined
+**by path** in `merge_diff`. `registry.rs`: `LoopState.run_id`; `run_task` inserts the record before
+anything can fail; `start_task_run` writes `refs/nebula/runs/<id>/base` before the agent starts;
+`end_task_run` takes a `TaskRunStatus`, and **returns early when the loop entry is already gone** (that
+`remove()` is now the one-run-ends-once guard); a new `finish_run_record` writes `…/head`, diffs the
+pair, runs the optional `commit_on_finish` snapshot, renders `report.md`, and appends the diffstat to the
+task's `last_outcome`; `reconcile_unfinished_runs` closes rows the daemon outlived (called from
+`lib.rs::run_daemon`). New `report.rs` (pure `render_report`/`render_digest`, local stamps daemon-side)
+and `pty/transcript.rs` (raw PTY tee, `CAP_BYTES = 32 MiB`, head kept). `task_prompt_text` gained a
+`summary_path` and asks the **last** iteration to write `summary.md`. TUI: `Overlay::Run` + `RunView`,
+a run list under the detail column (`↓` past the last field walks into it), `Enter`/`t` open
+report/transcript, `g` the 24h digest, `readable_dump` strips escapes for transcripts, and
+`ask_for_visible_runs` runs after every key/click. CLI: `nebula runs [--task --since --limit]`,
+`runs digest`, `runs show [id] [--transcript|--summary]` via `ipc::run_runs_op`. **725 tests green**
+(was 693), fmt clean, clippy at the pre-existing baseline. Verified end to end: the `e2e_pty` task-loop
+test now asserts the record, a `files_changed = 1` diff, `report.md`, a non-empty `transcript.log`, the
+two refs in the repo, and the summary ask in the last delivery; the CLI was driven against a live daemon
+with seeded rows.
+
+**Gotchas:**
+- **A run's diff must be base-to-head, not HEAD-to-tree.** The old `commit_on_finish` snapshot swept in
+  whatever the checkout was already carrying (the `USER_WIP.txt` problem in the entry below). Recording
+  the tree in a hidden ref *before* the agent starts puts that dirt on both sides, so it cancels out.
+  `a_run_diff_excludes_what_was_already_dirty` pins it. The snapshot **branch** still sweeps everything —
+  the report says so where it names the branch.
+- **`end_task_run` now always spawns a tokio task** (the report is written even when `commit_on_finish`
+  is off), so the five `#[test]` stop-path tests in `registry.rs` had to become `#[tokio::test]` —
+  otherwise "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
+- **CRLF is a line break, not an overwrite.** The first `readable_dump` treated every `\r` as "clear the
+  line", which ate every line of a normal transcript and left only the last. Bare CR still clears (that
+  is a spinner); `\r\n` does not.
+- **`--numstat` and `--name-status` cannot be paired by position** — renames and binaries make the two
+  lists disagree — so `merge_diff` looks the status up by path and keeps numstat's order. In `-z` mode a
+  rename's numstat record is `adds\tdels\t` with an *empty* path field, then `old`, then `new`.
+- **A daemon that dies mid-run leaves a row saying "running" forever.** `reconcile_unfinished_runs` only
+  rewrites the task's `last_outcome` when it still reads "running" *and* `last_run_at` matches the run,
+  or tidying an old run would clobber a newer one's outcome.
+- **The Automation pane re-scopes without any of its own keys being pressed** (walking the Projects
+  column), so the run request cannot live only in `handle_automation_key` — hence `ask_for_visible_runs`
+  after every key and click.
+- **`ClientRequest` list assertions in TUI tests are now noisier**: the first key in the pane also sends
+  `ListTaskRuns`. `the_list_toggles_with_space_and_delete_asks_first` filters it out.
+- **Nothing prunes run directories.** Rows cascade away with their task; the files on disk stay for the
+  user to read or `rm`. Deliberate — "keep as needed" was the ask — but the disk grows.
+- **A socket path under the scratchpad is too long for a unix socket** (`path must be shorter than
+  SUN_LEN`): smoke-testing the CLI needs `NEBULA_RUNTIME_DIR` under something like `mktemp -d /tmp/neb.XXXX`.
+
 ### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
 
 **Asked:** "I want to ensure that I can have Claude work overnight & be constructive when Iam away. How
