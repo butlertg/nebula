@@ -72,7 +72,13 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
-pub use ipc::WorkspaceOp;
+pub use ipc::{RunsOp, WorkspaceOp};
+
+/// `nebula runs <list|digest|show>` — read what unattended task runs left
+/// behind (see `ipc::run_runs_op`).
+pub fn run_runs(op: RunsOp) -> Result<()> {
+    runtime()?.block_on(ipc::run_runs_op(op))
+}
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
 pub fn run_workspace(op: WorkspaceOp) -> Result<()> {

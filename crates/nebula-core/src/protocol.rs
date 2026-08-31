@@ -1,14 +1,16 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, Task, TaskTarget, TerminalTab,
-    Workspace, Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, Task, TaskRun, TaskTarget,
+    TerminalTab, Workspace, Worktree,
 };
-use crate::ids::{AgentId, LinkId, ProjectId, TaskId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{
+    AgentId, LinkId, ProjectId, TaskId, TaskRunId, TerminalId, WorkspaceId, WorktreeId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -290,6 +292,36 @@ pub enum ClientRequest {
         req_id: u64,
         id: TaskId,
     },
+    /// Past runs, newest first — one task's history, or every task's when
+    /// `task` is None. `since_ms` is an epoch-ms floor (0 = no floor), which
+    /// is how "what happened overnight" is asked for.
+    ///
+    /// Answered by `ServerEvent::TaskRuns` with the same req_id, not an Ack.
+    ListTaskRuns {
+        req_id: u64,
+        task: Option<TaskId>,
+        #[serde(default)]
+        since_ms: i64,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// One run's artifact, read off disk by the daemon rather than by the
+    /// client — a TUI on the other end of an ssh hop has no access to the
+    /// daemon host's filesystem. Answered by `ServerEvent::TaskRunText`.
+    GetTaskRunArtifact {
+        req_id: u64,
+        id: TaskRunId,
+        part: RunArtifact,
+    },
+    /// One markdown page covering every run since `since_ms` — the morning
+    /// read. Rendered daemon-side because it stamps local times, which is
+    /// the daemon's job (as with `next_run_at`). Answered by
+    /// `ServerEvent::TaskRunDigest`.
+    GetTaskRunDigest {
+        req_id: u64,
+        #[serde(default)]
+        since_ms: i64,
+    },
     RenameTerminal {
         req_id: u64,
         id: TerminalId,
@@ -505,4 +537,52 @@ pub enum ServerEvent {
         req_id: u64,
         snapshot: MetricsSnapshot,
     },
+
+    /// Reply to `ClientRequest::ListTaskRuns`, newest first.
+    TaskRuns {
+        req_id: u64,
+        runs: Vec<TaskRun>,
+    },
+    /// Reply to `ClientRequest::GetTaskRunArtifact`. `text` carries the
+    /// daemon's own explanation when the file is missing, so the client
+    /// always has something to show.
+    TaskRunText {
+        req_id: u64,
+        id: TaskRunId,
+        part: RunArtifact,
+        text: String,
+    },
+    /// Reply to `ClientRequest::GetTaskRunDigest`.
+    TaskRunDigest {
+        req_id: u64,
+        text: String,
+    },
+    /// A run started, or finished and grew a report. Pushed to everyone so
+    /// an open Automation pane fills in without polling.
+    TaskRunUpserted {
+        run: TaskRun,
+    },
+}
+
+/// Which file of a run's directory to read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunArtifact {
+    /// `report.md` — what nebula recorded: timings, outcome, diffstat.
+    Report,
+    /// `transcript.log` — the raw PTY bytes of the session, tail-capped on
+    /// the way out because an overnight run's is measured in megabytes.
+    Transcript,
+    /// `summary.md` — the agent's own account, when it wrote one.
+    Summary,
+}
+
+impl RunArtifact {
+    pub fn file_name(&self) -> &'static str {
+        match self {
+            RunArtifact::Report => "report.md",
+            RunArtifact::Transcript => "transcript.log",
+            RunArtifact::Summary => "summary.md",
+        }
+    }
 }

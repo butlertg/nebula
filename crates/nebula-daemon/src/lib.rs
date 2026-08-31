@@ -5,6 +5,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod pty;
 pub mod registry;
+pub mod report;
 pub mod schedule;
 pub mod server;
 pub mod status;
@@ -57,6 +58,9 @@ async fn serve() -> Result<()> {
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
+    // Task runs whose daemon died mid-flight: their rows still say running,
+    // and nothing else will ever close them.
+    daemon.reconcile_unfinished_runs();
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.

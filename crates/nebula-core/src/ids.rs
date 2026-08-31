@@ -38,6 +38,7 @@ id_newtype!(AgentId);
 id_newtype!(TerminalId);
 id_newtype!(LinkId);
 id_newtype!(TaskId);
+id_newtype!(TaskRunId);
 
 /// Id of the built-in workspace every install starts with (and the home of
 /// projects that predate workspaces). A fixed literal, not a ULID, so the

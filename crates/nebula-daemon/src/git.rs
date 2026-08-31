@@ -2,7 +2,7 @@
 //! libgit2's worktree support lags git's, these are rare user-initiated ops,
 //! and git's stderr is the best error message we could show.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -35,7 +35,7 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// `git`, optionally against a scratch index file instead of the repo's own.
-/// Staging into a throwaway index is what lets `snapshot_branch` read the
+/// Staging into a throwaway index is what lets the snapshot helpers read the
 /// working tree without touching what the user has staged.
 async fn git_with_index(repo: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
@@ -218,6 +218,50 @@ pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> 
 /// Returns the new commit's short hash, or `None` when the tree is identical
 /// to HEAD and there is nothing worth recording.
 pub async fn snapshot_branch(repo: &Path, branch: &str, message: &str) -> Result<Option<String>> {
+    let Some(commit) = snapshot_commit(repo, message, false).await? else {
+        return Ok(None);
+    };
+    // `update-ref` rather than `branch`: it does not care that we are not on
+    // the branch, and it fails loudly if the name is already taken.
+    write_ref(repo, &format!("refs/heads/{branch}"), &commit).await?;
+    let short = git(repo, &["rev-parse", "--short", &commit]).await?;
+    Ok(Some(short.trim().to_string()))
+}
+
+/// Record the working tree under `refname`, which is a full ref path — the
+/// run refs (`refs/nebula/runs/<id>/base`) live outside `refs/heads` so they
+/// never show up in a branch list, and holding a ref is also what stops gc
+/// from collecting the commit months later.
+///
+/// Unlike [`snapshot_branch`] this always writes a commit, even when the
+/// tree matches HEAD: the pair of refs is what the run's diff is computed
+/// from, and a missing base means no diff at all rather than an empty one.
+/// Returns the full commit sha.
+pub async fn snapshot_ref(repo: &Path, refname: &str, message: &str) -> Result<String> {
+    let commit = snapshot_commit(repo, message, true)
+        .await?
+        .context("an allow-empty snapshot always produces a commit")?;
+    write_ref(repo, refname, &commit).await?;
+    Ok(commit)
+}
+
+async fn write_ref(repo: &Path, refname: &str, commit: &str) -> Result<()> {
+    git(repo, &["update-ref", refname, commit]).await?;
+    Ok(())
+}
+
+/// Commit the working tree as it stands without touching the checkout, and
+/// return the new commit's full sha. `None` only when `allow_empty` is false
+/// and the tree is identical to HEAD.
+///
+/// This is deliberately not `checkout -b && add && commit`: an unattended
+/// run finishes at 3am in a checkout the user may come back to, and leaving
+/// them on a different branch — or with a swept-up index — is not something
+/// they asked for. Instead the tree is staged into a scratch index and
+/// written with plumbing, so HEAD, the real index, and every file on disk
+/// are exactly as the run left them. The commit is reachable only from the
+/// ref the caller then writes.
+async fn snapshot_commit(repo: &Path, message: &str, allow_empty: bool) -> Result<Option<String>> {
     // A commit needs a parent to diff against, and an unborn HEAD has none.
     // Nothing has ever been committed here, so there is no run to capture.
     let head = git(repo, &["rev-parse", "HEAD"])
@@ -233,7 +277,7 @@ pub async fn snapshot_branch(repo: &Path, branch: &str, message: &str) -> Result
     let index = common.join(format!("nebula-snapshot-{}.index", std::process::id()));
     let _ = tokio::fs::remove_file(&index).await;
 
-    let result = snapshot_into(repo, branch, message, &head, &index).await;
+    let result = snapshot_into(repo, message, &head, &index, allow_empty).await;
     // Best effort: a leftover scratch index is harmless (git only reads it
     // when GIT_INDEX_FILE points at it) but there is no reason to keep one.
     let _ = tokio::fs::remove_file(&index).await;
@@ -242,10 +286,10 @@ pub async fn snapshot_branch(repo: &Path, branch: &str, message: &str) -> Result
 
 async fn snapshot_into(
     repo: &Path,
-    branch: &str,
     message: &str,
     head: &str,
     index: &Path,
+    allow_empty: bool,
 ) -> Result<Option<String>> {
     let idx = Some(index);
     // Seed from HEAD so unchanged files keep their stat cache, then let
@@ -259,7 +303,7 @@ async fn snapshot_into(
     // Identical trees means the run touched nothing that git tracks; a
     // commit there would be an empty entry in a log the user has to read.
     let head_tree = git(repo, &["rev-parse", &format!("{head}^{{tree}}")]).await?;
-    if tree == head_tree.trim() {
+    if tree == head_tree.trim() && !allow_empty {
         return Ok(None);
     }
 
@@ -269,16 +313,115 @@ async fn snapshot_into(
         idx,
     )
     .await?;
-    let commit = commit.trim().to_string();
-    // `update-ref` rather than `branch`: it does not care that we are not on
-    // the branch, and it fails loudly if the name is already taken.
-    git(
-        repo,
-        &["update-ref", &format!("refs/heads/{branch}"), &commit],
-    )
-    .await?;
-    let short = git(repo, &["rev-parse", "--short", &commit]).await?;
-    Ok(Some(short.trim().to_string()))
+    Ok(Some(commit.trim().to_string()))
+}
+
+/// One file the run touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// git's status letter: `A`, `M`, `D`, `R100`, …
+    pub status: String,
+    pub path: String,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// What changed between two commits, in the shape a report wants.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files: Vec<FileChange>,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// `git diff <from> <to>`, summarised. Two plumbing calls rather than one:
+/// `--numstat` has the line counts and `--name-status` has the letters, and
+/// no single format carries both. Both run with `-z`, so a path with a
+/// space, a quote, or a newline in it survives.
+pub async fn diff_summary(repo: &Path, from: &str, to: &str) -> Result<DiffSummary> {
+    let numstat = git(repo, &["diff", "--numstat", "-M", "-z", from, to]).await?;
+    let names = git(repo, &["diff", "--name-status", "-M", "-z", from, to]).await?;
+    Ok(merge_diff(&numstat, &names))
+}
+
+/// `--numstat -z`: `<adds> TAB <dels> TAB <path> NUL`, and for a rename
+/// `<adds> TAB <dels> TAB NUL <old> NUL <new> NUL` — the empty path field is
+/// the tell. A binary file reports `-` for both counts.
+fn parse_numstat(raw: &str) -> Vec<(String, u32, u32)> {
+    let mut out = Vec::new();
+    let mut fields = raw.split('\0');
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let (Some(adds), Some(dels), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let count = |s: &str| s.parse::<u32>().unwrap_or(0);
+        let path = if path.is_empty() {
+            // Rename: the old name comes next, then the new one, which is
+            // the one worth reporting.
+            let _old = fields.next();
+            match fields.next() {
+                Some(new) => new.to_string(),
+                None => continue,
+            }
+        } else {
+            path.to_string()
+        };
+        out.push((path, count(adds), count(dels)));
+    }
+    out
+}
+
+/// `--name-status -z`: `<status> NUL <path> NUL`, and for a rename
+/// `R<score> NUL <old> NUL <new> NUL`.
+fn parse_name_status(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut fields = raw.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let Some(path) = fields.next() else { break };
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            match fields.next() {
+                Some(new) => new.to_string(),
+                None => break,
+            }
+        } else {
+            path.to_string()
+        };
+        out.push((status.to_string(), path));
+    }
+    out
+}
+
+/// Line counts joined to status letters by path, keeping numstat's order —
+/// pairing the two lists by position would mis-label every file after the
+/// first one the formats disagree about.
+fn merge_diff(numstat: &str, name_status: &str) -> DiffSummary {
+    let statuses = parse_name_status(name_status);
+    let files: Vec<FileChange> = parse_numstat(numstat)
+        .into_iter()
+        .map(|(path, insertions, deletions)| {
+            let status = statuses
+                .iter()
+                .find(|(_, p)| *p == path)
+                .map(|(s, _)| s.clone())
+                .unwrap_or_else(|| "M".to_string());
+            FileChange {
+                status,
+                path,
+                insertions,
+                deletions,
+            }
+        })
+        .collect();
+    DiffSummary {
+        insertions: files.iter().map(|f| f.insertions).sum(),
+        deletions: files.iter().map(|f| f.deletions).sum(),
+        files,
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +540,138 @@ mod tests {
 
     /// A run that changed nothing must not leave an empty commit in a log
     /// the user has to read every morning.
+    /// The pair of refs a run is diffed between has to exist even when the
+    /// run changed nothing — otherwise "it did nothing" is indistinguishable
+    /// from "nebula lost track of it".
+    #[tokio::test]
+    async fn snapshot_ref_records_a_commit_even_on_a_clean_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&repo, &["add", "."]).await.unwrap();
+        git(&repo, &["commit", "-m", "a"]).await.unwrap();
+        let head_before = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+
+        let sha = snapshot_ref(&repo, "refs/nebula/runs/r1/base", "before")
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/nebula/runs/r1/base"])
+                .await
+                .unwrap()
+                .trim(),
+            sha,
+            "the ref points at the commit"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "HEAD"]).await.unwrap(),
+            head_before,
+            "the checkout never moved"
+        );
+        assert!(
+            !git(&repo, &["branch", "--list"])
+                .await
+                .unwrap()
+                .contains("runs/r1"),
+            "a run ref is not a branch"
+        );
+    }
+
+    /// The whole point of the base/head pair: the diff is the run's own work,
+    /// and what the checkout was already carrying is on both sides of it.
+    #[tokio::test]
+    async fn a_run_diff_excludes_what_was_already_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("old.txt"), "gone soon\n").unwrap();
+        git(&repo, &["add", "."]).await.unwrap();
+        git(&repo, &["commit", "-m", "tracked"]).await.unwrap();
+
+        // Somebody's uncommitted work, present before the run starts.
+        std::fs::write(repo.join("USER_WIP.txt"), "mine\n").unwrap();
+        let base = snapshot_ref(&repo, "refs/nebula/runs/r2/base", "before")
+            .await
+            .unwrap();
+
+        // What the "run" then did: edit, add, delete.
+        std::fs::write(repo.join("tracked.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+        std::fs::remove_file(repo.join("old.txt")).unwrap();
+        let head = snapshot_ref(&repo, "refs/nebula/runs/r2/head", "after")
+            .await
+            .unwrap();
+
+        let diff = diff_summary(&repo, &base, &head).await.unwrap();
+        let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !paths.contains(&"USER_WIP.txt"),
+            "the pre-existing file is on both sides: {paths:?}"
+        );
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        let by_path = |p: &str| diff.files.iter().find(|f| f.path == p).unwrap().clone();
+        assert_eq!(by_path("tracked.txt").status, "M");
+        assert_eq!(by_path("tracked.txt").insertions, 1);
+        assert_eq!(by_path("new.txt").status, "A");
+        assert_eq!(by_path("old.txt").status, "D");
+        assert_eq!(diff.insertions, 2);
+        assert_eq!(diff.deletions, 1);
+    }
+
+    /// A rename reports the name the file ended up with — the one somebody
+    /// would go looking for — not the one it left behind.
+    #[tokio::test]
+    async fn a_renamed_file_is_reported_under_its_new_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("before.txt"), "same contents\nline two\n").unwrap();
+        git(&repo, &["add", "."]).await.unwrap();
+        git(&repo, &["commit", "-m", "one"]).await.unwrap();
+        let base = snapshot_ref(&repo, "refs/nebula/runs/r3/base", "before")
+            .await
+            .unwrap();
+        std::fs::rename(repo.join("before.txt"), repo.join("after.txt")).unwrap();
+        let head = snapshot_ref(&repo, "refs/nebula/runs/r3/head", "after")
+            .await
+            .unwrap();
+
+        let diff = diff_summary(&repo, &base, &head).await.unwrap();
+        assert_eq!(diff.files.len(), 1, "{:?}", diff.files);
+        assert_eq!(diff.files[0].path, "after.txt");
+        assert!(diff.files[0].status.starts_with('R'), "{:?}", diff.files[0]);
+    }
+
+    /// The two `-z` formats are parsed, not eyeballed: a path with a space in
+    /// it and a rename both have to survive the join.
+    #[test]
+    fn the_two_diff_formats_join_on_the_path() {
+        let numstat = "3\t1\tsrc/a b.rs\0".to_string() + "0\t0\t\0old.rs\0new.rs\0";
+        let names = "M\0src/a b.rs\0R100\0old.rs\0new.rs\0";
+        let merged = merge_diff(&numstat, names);
+        assert_eq!(merged.files.len(), 2, "{:?}", merged.files);
+        assert_eq!(merged.files[0].path, "src/a b.rs");
+        assert_eq!(merged.files[0].status, "M");
+        assert_eq!(merged.files[1].path, "new.rs");
+        assert_eq!(merged.files[1].status, "R100");
+        assert_eq!(merged.insertions, 3);
+        assert_eq!(merged.deletions, 1);
+    }
+
+    /// A binary file has no line counts; it is still a file that changed.
+    #[test]
+    fn a_binary_file_counts_as_changed_with_no_lines() {
+        let merged = merge_diff("-\t-\tlogo.png\0", "M\0logo.png\0");
+        assert_eq!(merged.files.len(), 1);
+        assert_eq!(merged.files[0].insertions, 0);
+        assert_eq!(merged.files[0].deletions, 0);
+    }
+
     #[tokio::test]
     async fn snapshot_branch_says_nothing_to_commit_on_a_clean_tree() {
         let tmp = tempfile::tempdir().unwrap();

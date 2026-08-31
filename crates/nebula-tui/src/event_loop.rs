@@ -4,7 +4,7 @@ use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
     PaletteTarget, PaneMode, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
-    RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TaskField, TermSelection,
+    RowKey, RunView, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TaskField, TermSelection,
     WorktreeRollback, TASK_ITERATION_CHOICES, TASK_STALL_CHOICES,
 };
 use crate::pull_request::PullRequest;
@@ -18,9 +18,9 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef, Task,
-    TaskId, TaskSpec, TaskTarget, WorkspaceId, WorktreeId, DEFAULT_STALL_TIMEOUT_SECS,
-    MAX_CLOUD_PROMPT_BYTES,
+    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, RunArtifact, ServerEvent,
+    SessionRef, Task, TaskId, TaskRunId, TaskSpec, TaskTarget, WorkspaceId, WorktreeId,
+    DEFAULT_STALL_TIMEOUT_SECS, MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1047,9 +1047,13 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             app.flash = None;
             handle_key(app, key, out);
+            ask_for_visible_runs(app, out);
             app.dirty = true;
         }
-        Event::Mouse(mouse) => handle_mouse(app, mouse, out),
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse, out);
+            ask_for_visible_runs(app, out);
+        }
         Event::Paste(text) if app.vim.is_some() => {
             if let Some(vim) = &mut app.vim {
                 // Bracketed paste so vim doesn't auto-indent it to mush.
@@ -1562,6 +1566,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // you came to read.
             if app.pane_mode == PaneMode::Automation {
                 app.focus = Focus::Terminal;
+                if let Some(id) = app.selected_task().map(|t| t.id.clone()) {
+                    request_task_runs(app, out, &id);
+                }
             }
         }
         // Terminal-scope only; never resolved here.
@@ -2896,6 +2903,38 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             ) {
                 app.overlay = None;
             }
+        }
+        Overlay::Run(view) => {
+            let page = view.view_height.max(1);
+            let last = view
+                .lines
+                .len()
+                .saturating_sub(view.view_height.max(1) as usize) as u16;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => app.overlay = None,
+                KeyCode::Char('j') | KeyCode::Down => view.scroll = (view.scroll + 1).min(last),
+                KeyCode::Char('k') | KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    view.scroll = (view.scroll + page).min(last)
+                }
+                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(page),
+                KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => view.scroll = last,
+                // The three files of one run, swapped in place: they answer
+                // different questions about the same night.
+                KeyCode::Char('r') | KeyCode::Char('s') | KeyCode::Char('t') => {
+                    let part = match key.code {
+                        KeyCode::Char('r') => RunArtifact::Report,
+                        KeyCode::Char('s') => RunArtifact::Summary,
+                        _ => RunArtifact::Transcript,
+                    };
+                    if let Some(id) = view.run.clone() {
+                        open_run_artifact(app, out, id, part);
+                    }
+                }
+                _ => {}
+            }
+            app.dirty = true;
         }
         Overlay::Metrics(view) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
@@ -5904,10 +5943,30 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Terminal;
                     app.automation.selected = row;
                     app.automation.on_detail = false;
+                    app.automation.on_runs = false;
+                    if let Some(id) = app.selected_task().map(|t| t.id.clone()) {
+                        request_task_runs(app, out, &id);
+                    }
+                    app.dirty = true;
+                }
+                // A run row: clicking the one already under the cursor opens
+                // its report, the same repeat-to-activate rule as a field.
+                Some(HitTarget::TaskRunRow(row)) => {
+                    app.focus = Focus::Terminal;
+                    let repeat = app.automation.on_runs && app.automation.run == row;
+                    app.automation.on_detail = true;
+                    app.automation.on_runs = true;
+                    app.automation.run = row;
+                    if repeat {
+                        if let Some(id) = app.selected_run().map(|r| r.id.clone()) {
+                            open_run_artifact(app, out, id, RunArtifact::Report);
+                        }
+                    }
                     app.dirty = true;
                 }
                 Some(HitTarget::TaskField(field)) => {
                     app.focus = Focus::Terminal;
+                    app.automation.on_runs = false;
                     // Clicking the row the cursor is already on activates it,
                     // the same rule the settings overlay's rows follow.
                     let repeat = app.automation.on_detail && app.automation.field == field;
@@ -6470,6 +6529,62 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.last_metrics = Some(snapshot);
             app.dirty = true;
         }
+        ServerEvent::TaskRuns { req_id, runs } => {
+            // Answered with TaskRuns, not Ack — clear the slot by hand.
+            app.pending.remove(&req_id);
+            // Grouped rather than assumed to be one task's: the same reply
+            // shape serves the digest's every-task query.
+            let mut by_task: std::collections::HashMap<TaskId, Vec<nebula_core::TaskRun>> =
+                std::collections::HashMap::new();
+            for run in runs {
+                by_task.entry(run.task_id.clone()).or_default().push(run);
+            }
+            for (task, runs) in by_task {
+                app.task_runs.insert(task, runs);
+            }
+            app.clamp_automation();
+            app.dirty = true;
+        }
+        ServerEvent::TaskRunText {
+            req_id,
+            id,
+            part,
+            text,
+        } => {
+            app.pending.remove(&req_id);
+            // Only if it is still the page on screen: a second request sent
+            // before the first came back means the user has moved on.
+            if let Some(Overlay::Run(view)) = &mut app.overlay {
+                if view.run.as_ref() == Some(&id) && view.part == part {
+                    view.lines = match part {
+                        RunArtifact::Transcript => readable_dump(&text),
+                        _ => text.lines().map(str::to_string).collect(),
+                    };
+                    view.loading = false;
+                    view.scroll = 0;
+                }
+            }
+            app.dirty = true;
+        }
+        ServerEvent::TaskRunDigest { req_id, text } => {
+            app.pending.remove(&req_id);
+            if let Some(Overlay::Run(view)) = &mut app.overlay {
+                if view.run.is_none() {
+                    view.lines = text.lines().map(str::to_string).collect();
+                    view.loading = false;
+                }
+            }
+            app.dirty = true;
+        }
+        ServerEvent::TaskRunUpserted { run } => {
+            // Only cached for tasks the pane has already asked about;
+            // otherwise every run of every project would accumulate here.
+            if app.task_runs.contains_key(&run.task_id) {
+                app.upsert_task_run(run);
+                app.clamp_automation();
+                app.dirty = true;
+            }
+        }
         ServerEvent::Error { req_id, message } => {
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
@@ -6810,8 +6925,179 @@ fn set_pane_mode(app: &mut App, mode: PaneMode) {
 /// The Automation pane's keys, handled before the terminal's input-lock
 /// forward. Returns false for anything it doesn't own, so Tab, the focus
 /// arrows and `q` still walk out of the pane rather than being swallowed.
+/// How far back the digest looks when asked for from the pane. A night is
+/// the unit this whole feature exists for; a day covers one however late it
+/// ran and whenever you get up.
+const DIGEST_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Open one of a run's files in the overlay, asking the daemon for the text.
+/// The overlay appears at once, reading, because the round trip is over a
+/// socket that may be an ssh hop away.
+fn open_run_artifact(
+    app: &mut App,
+    out: &mut Vec<ClientRequest>,
+    id: TaskRunId,
+    part: RunArtifact,
+) {
+    let run = app
+        .task_runs
+        .values()
+        .flatten()
+        .find(|r| r.id == id)
+        .cloned();
+    let (title, subtitle) = match (&run, part) {
+        (Some(run), RunArtifact::Report) => (
+            format!("{} — report", run.task_name),
+            run.report_path().display().to_string(),
+        ),
+        (Some(run), RunArtifact::Summary) => (
+            format!("{} — what the agent said", run.task_name),
+            run.summary_path().display().to_string(),
+        ),
+        (Some(run), RunArtifact::Transcript) => (
+            format!("{} — transcript", run.task_name),
+            run.transcript_path().display().to_string(),
+        ),
+        (None, _) => ("run".to_string(), String::new()),
+    };
+    app.overlay = Some(Overlay::Run(RunView {
+        title,
+        subtitle,
+        lines: Vec::new(),
+        scroll: 0,
+        view_height: 1,
+        run: Some(id.clone()),
+        part,
+        loading: true,
+    }));
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::GetTaskRunArtifact { req_id, id, part });
+    app.dirty = true;
+}
+
+/// Open the overnight digest: every task's runs in the last day, worst news
+/// first. Rendered daemon-side, because it stamps local times.
+fn open_run_digest(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.overlay = Some(Overlay::Run(RunView {
+        title: "Last 24 hours".to_string(),
+        subtitle: "every task run since this time yesterday".to_string(),
+        lines: Vec::new(),
+        scroll: 0,
+        view_height: 1,
+        run: None,
+        part: RunArtifact::Report,
+        loading: true,
+    }));
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::GetTaskRunDigest {
+        req_id,
+        since_ms: crate::app::now_ms() - DIGEST_WINDOW_MS,
+    });
+    app.dirty = true;
+}
+
+/// Ask for the runs of whichever task the Automation pane is showing. Called
+/// after every key and click rather than only from the pane's own handler:
+/// walking the Projects column re-scopes the pane without any of its keys
+/// being pressed, and a pane that says "asking…" forever would be a lie.
+fn ask_for_visible_runs(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.pane_mode != PaneMode::Automation {
+        return;
+    }
+    if let Some(id) = app.selected_task().map(|t| t.id.clone()) {
+        request_task_runs(app, out, &id);
+    }
+}
+
+/// Ask for a task's runs once. Called as the cursor lands on a task and when
+/// the pane opens; later changes arrive as `TaskRunUpserted` pushes.
+fn request_task_runs(app: &mut App, out: &mut Vec<ClientRequest>, id: &TaskId) {
+    if !app.runs_requested.insert(id.clone()) {
+        return;
+    }
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::ListTaskRuns {
+        req_id,
+        task: Some(id.clone()),
+        since_ms: 0,
+        limit: RUNS_PER_TASK,
+    });
+}
+
+/// Runs kept per task in the pane's list. Enough to see a pattern ("it has
+/// stalled every night this week"), not so many that the column becomes a
+/// log viewer.
+const RUNS_PER_TASK: u32 = 20;
+
+/// A raw PTY dump as readable lines: control sequences dropped, carriage
+/// returns treated as the overwrites they are, and repeated blank lines
+/// collapsed. An agent CLI repaints constantly, so the file is mostly cursor
+/// choreography — this keeps the words.
+pub fn readable_dump(raw: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // CSI (`ESC [ … final`) and the string-terminated families
+                // (OSC/DCS/APC, `ESC ] … BEL|ESC \`). Anything else is a
+                // two-character sequence.
+                match chars.next() {
+                    Some('[') => {
+                        for c in chars.by_ref() {
+                            if ('\x40'..='\x7e').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') | Some('P') | Some('_') | Some('^') => {
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                                break;
+                            }
+                            prev = c;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // CRLF is a line break, not an overwrite — the clear below is
+            // for a bare CR, where the next write really does replace what
+            // this line has so far (a spinner, a progress bar).
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => current.clear(),
+            '\n' => {
+                let trimmed = current.trim_end().to_string();
+                if !(trimmed.is_empty() && lines.last().map(|l| l.is_empty()).unwrap_or(true)) {
+                    lines.push(trimmed);
+                }
+                current.clear();
+            }
+            c if (c as u32) < 0x20 => {}
+            c => current.push(c),
+        }
+    }
+    let trimmed = current.trim_end().to_string();
+    if !trimmed.is_empty() {
+        lines.push(trimmed);
+    }
+    // A recording ends with whatever repaint was last on screen; blank tail
+    // lines are that, not content.
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines
+}
+
 fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) -> bool {
     let tasks: Vec<Task> = app.project_tasks().into_iter().cloned().collect();
+    // Whatever the key turns out to do, the task under the cursor is the one
+    // whose history the pane is about to draw.
+    if let Some(id) = app.selected_task().map(|t| t.id.clone()) {
+        request_task_runs(app, out, &id);
+    }
     let fields = TaskField::ALL.len();
     match key.code {
         // The pane's keys are its own, so its help is too. Claimed here
@@ -6828,6 +7114,26 @@ fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                 Some(project) => open_prompt(app, PromptKind::NewTask { project }),
                 None => app.flash = Some("select a project first".into()),
             }
+            true
+        }
+        // The run list's own keys, claimed before the pane's: Enter on a run
+        // opens what it left behind rather than stepping into the fields.
+        KeyCode::Enter if app.automation.on_runs => {
+            if let Some(run) = app.selected_run().map(|r| r.id.clone()) {
+                open_run_artifact(app, out, run, RunArtifact::Report);
+            }
+            true
+        }
+        KeyCode::Char('t') if app.automation.on_runs => {
+            if let Some(run) = app.selected_run().map(|r| r.id.clone()) {
+                open_run_artifact(app, out, run, RunArtifact::Transcript);
+            }
+            true
+        }
+        // The morning read: every task's runs since this time yesterday,
+        // from anywhere in the pane.
+        KeyCode::Char('g') => {
+            open_run_digest(app, out);
             true
         }
         KeyCode::Char('r') => {
@@ -6871,16 +7177,33 @@ fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
             true
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.automation.on_detail {
-                app.automation.field = (app.automation.field + 1).min(fields - 1);
+            let runs = app.selected_task_runs().len();
+            if app.automation.on_runs {
+                app.automation.run = (app.automation.run + 1).min(runs.saturating_sub(1));
+            } else if app.automation.on_detail {
+                // Off the bottom of the fields walks on into the run list —
+                // the same column, further down.
+                if app.automation.field + 1 >= fields && runs > 0 {
+                    app.automation.on_runs = true;
+                    app.automation.run = 0;
+                } else {
+                    app.automation.field = (app.automation.field + 1).min(fields - 1);
+                }
             } else if !tasks.is_empty() {
                 app.automation.selected = (app.automation.selected + 1).min(tasks.len() - 1);
+                app.automation.run = 0;
             }
             app.dirty = true;
             true
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.automation.on_detail {
+            if app.automation.on_runs {
+                if app.automation.run == 0 {
+                    app.automation.on_runs = false;
+                } else {
+                    app.automation.run -= 1;
+                }
+            } else if app.automation.on_detail {
                 // Off the top of the fields hands the cursor back to the
                 // list, the way the settings list hands it to the tab strip.
                 if app.automation.field == 0 {
@@ -6890,6 +7213,7 @@ fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
                 }
             } else {
                 app.automation.selected = app.automation.selected.saturating_sub(1);
+                app.automation.run = 0;
             }
             app.dirty = true;
             true
@@ -6897,16 +7221,27 @@ fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
         // In the detail column ←/→ cycle the value under the cursor, exactly
         // as they do on a settings row — so no field needs Enter, and the
         // way back out is ↑ off the top or Esc.
-        KeyCode::Right | KeyCode::Char('l') if app.automation.on_detail => {
+        KeyCode::Right | KeyCode::Char('l')
+            if app.automation.on_detail && !app.automation.on_runs =>
+        {
             activate_task_field(app, out, 1);
             true
         }
-        KeyCode::Left | KeyCode::Char('h') if app.automation.on_detail => {
+        KeyCode::Left | KeyCode::Char('h')
+            if app.automation.on_detail && !app.automation.on_runs =>
+        {
             activate_task_field(app, out, -1);
             true
         }
-        KeyCode::Enter | KeyCode::Char(' ') if app.automation.on_detail => {
+        KeyCode::Enter | KeyCode::Char(' ')
+            if app.automation.on_detail && !app.automation.on_runs =>
+        {
             activate_task_field(app, out, 0);
+            true
+        }
+        KeyCode::Esc if app.automation.on_runs => {
+            app.automation.on_runs = false;
+            app.dirty = true;
             true
         }
         KeyCode::Esc if app.automation.on_detail => {
@@ -12824,6 +13159,183 @@ diff --git a/src/b.rs b/src/b.rs
         }
     }
 
+    fn seed_run(
+        app: &mut App,
+        task: &str,
+        id: &str,
+        age_ms: i64,
+        status: nebula_core::TaskRunStatus,
+    ) {
+        use nebula_core::{TaskRun, TaskRunId};
+        app.upsert_task_run(TaskRun {
+            id: TaskRunId(id.into()),
+            task_id: TaskId(task.into()),
+            project_id: ProjectId("p1".into()),
+            task_name: "nightly review".into(),
+            agent_id: None,
+            started_at: crate::app::now_ms() - age_ms,
+            ended_at: crate::app::now_ms() - age_ms + 60_000,
+            status,
+            outcome: "ran 3 of 3".into(),
+            iterations_planned: 3,
+            iterations_done: 3,
+            worktree_path: "/repo".into(),
+            branch: "main".into(),
+            base_ref: Some("aaa".into()),
+            head_ref: Some("bbb".into()),
+            snapshot: None,
+            files_changed: 2,
+            insertions: 12,
+            deletions: 1,
+            dir: "/runs/nightly/one".into(),
+        });
+    }
+
+    /// The runs live at the bottom of the same column as the fields, so the
+    /// way to them is to keep going down — and Enter there opens what the run
+    /// left behind rather than editing anything.
+    #[test]
+    fn walking_past_the_last_field_lands_in_the_run_list() {
+        use nebula_core::TaskRunStatus;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", Some("0 2 * * *"), 3);
+        seed_run(
+            &mut app,
+            "t1",
+            "run-b",
+            26 * 3_600_000,
+            TaskRunStatus::Stalled,
+        );
+        seed_run(
+            &mut app,
+            "t1",
+            "run-a",
+            2 * 3_600_000,
+            TaskRunStatus::Completed,
+        );
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        // Into the fields, then down past the last of them.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.automation.on_detail);
+        for _ in 0..TaskField::ALL.len() {
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        }
+        assert!(app.automation.on_runs, "the cursor walked into the runs");
+        assert_eq!(app.automation.run, 0);
+
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        match out.as_slice() {
+            [ClientRequest::GetTaskRunArtifact { id, part, .. }] => {
+                assert_eq!(id.as_str(), "run-a", "the newest run is the first row");
+                assert_eq!(*part, RunArtifact::Report);
+            }
+            other => panic!("expected a report request, got {other:?}"),
+        }
+        assert!(matches!(app.overlay, Some(Overlay::Run(_))));
+
+        // `t` on the same row asks for what the session printed instead.
+        app.overlay = None;
+        out.clear();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::GetTaskRunArtifact {
+                part: RunArtifact::Transcript,
+                ..
+            }]
+        ));
+
+        // Back up out of the runs, and the fields are editable again.
+        app.overlay = None;
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(!app.automation.on_runs);
+        assert!(app.automation.on_detail);
+    }
+
+    /// The morning question is "what happened last night", not "what did this
+    /// one task do" — `g` answers it from anywhere in the pane.
+    #[test]
+    fn g_asks_for_the_overnight_digest() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        let since = match out.as_slice() {
+            [ClientRequest::ListTaskRuns { .. }, ClientRequest::GetTaskRunDigest { since_ms, .. }] => {
+                *since_ms
+            }
+            [ClientRequest::GetTaskRunDigest { since_ms, .. }] => *since_ms,
+            other => panic!("expected a digest request, got {other:?}"),
+        };
+        let day = crate::app::now_ms() - 24 * 3_600_000;
+        assert!((since - day).abs() < 5_000, "a day back, give or take");
+
+        // The page arrives as text and fills the overlay that is waiting.
+        hse(
+            &mut app,
+            ServerEvent::TaskRunDigest {
+                req_id: 1,
+                text: "# Task runs\n\nNo runs in that window.\n".into(),
+            },
+        );
+        match &app.overlay {
+            Some(Overlay::Run(view)) => {
+                assert!(!view.loading);
+                assert!(view.lines.iter().any(|l| l.contains("No runs")));
+            }
+            other => panic!("expected the run page, got {other:?}"),
+        }
+    }
+
+    /// A transcript is a terminal recording: the words are worth reading, the
+    /// cursor choreography is not.
+    #[test]
+    fn a_transcript_is_shown_as_words_not_escape_codes() {
+        let raw = "\x1b[2J\x1b[Hhello\r\n\x1b]0;title\x07world\r\nrewritten\rfinal\n\n\n";
+        let lines = readable_dump(raw);
+        assert_eq!(lines, vec!["hello", "world", "final"], "{lines:?}");
+    }
+
+    /// Text that arrives for a page the user has already left must not be
+    /// pasted into whatever is on screen now.
+    #[test]
+    fn a_late_reply_does_not_overwrite_a_different_page() {
+        use nebula_core::TaskRunId;
+        let mut app = App::new();
+        app.overlay = Some(Overlay::Run(RunView {
+            title: "b".into(),
+            subtitle: String::new(),
+            lines: vec!["b's report".into()],
+            scroll: 0,
+            view_height: 10,
+            run: Some(TaskRunId("run-b".into())),
+            part: RunArtifact::Report,
+            loading: false,
+        }));
+        hse(
+            &mut app,
+            ServerEvent::TaskRunText {
+                req_id: 7,
+                id: TaskRunId("run-a".into()),
+                part: RunArtifact::Report,
+                text: "a's report".into(),
+            },
+        );
+        match &app.overlay {
+            Some(Overlay::Run(view)) => assert_eq!(view.lines, vec!["b's report".to_string()]),
+            other => panic!("expected the run page, got {other:?}"),
+        }
+    }
+
     /// `space` on the list is the quick on/off, and `d` asks first — a task
     /// is a definition someone wrote, not a row to lose to a stray key.
     #[test]
@@ -12836,6 +13348,9 @@ diff --git a/src/b.rs b/src/b.rs
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        // The first key in the pane also asks for the task's run history;
+        // it is asked for once, so the `d` press below still sends nothing.
+        out.retain(|r| !matches!(r, ClientRequest::ListTaskRuns { .. }));
         match out.as_slice() {
             [ClientRequest::SetTaskEnabled { id, enabled, .. }] => {
                 assert_eq!(id.as_str(), "t1");
