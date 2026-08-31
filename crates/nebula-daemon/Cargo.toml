@@ -23,6 +23,8 @@ nix = { version = "0.31", features = ["process", "fs", "signal", "term"] }
 tokio-util = "0.7"
 rand = "0.10"
 subtle = "2"
+cron = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, TerminalId,
-    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, Task, TaskId,
+    TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -223,10 +224,101 @@ const MIGRATIONS: &[&str] = &[
     "
     DROP TABLE IF EXISTS notes;
     ",
+    // 22: unattended tasks — a prompt plus when and where to run it. Project
+    // scoped (unlike links): a task describes work the project wants done,
+    // and `target` decides which checkout each run happens in, so the same
+    // definition can spawn into root, one worktree, or a fresh one.
+    // `next_run_at` is a cache of the cron's next fire, recomputed by the
+    // scheduler rather than trusted across a restart.
+    "
+    CREATE TABLE tasks (
+      id            TEXT PRIMARY KEY,
+      project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name          TEXT NOT NULL,
+      prompt        TEXT NOT NULL,
+      kind          TEXT NOT NULL,
+      model         TEXT,
+      effort        TEXT,
+      cron          TEXT,
+      iterations    INTEGER NOT NULL DEFAULT 1,
+      unattended    INTEGER NOT NULL DEFAULT 0,
+      target_kind   TEXT NOT NULL,
+      target_worktree TEXT,
+      enabled       INTEGER NOT NULL DEFAULT 1,
+      last_run_at   INTEGER NOT NULL DEFAULT 0,
+      next_run_at   INTEGER NOT NULL DEFAULT 0,
+      last_outcome  TEXT,
+      last_agent_id TEXT,
+      sort_order    INTEGER NOT NULL DEFAULT 0,
+      created_at    INTEGER NOT NULL
+    );
+    ",
+    // 23: what a task does when nobody is watching. `final_prompt` is the
+    // last iteration's prompt, `stall_timeout_secs` is how long a turn may
+    // go without ending before the run is written off, and
+    // `commit_on_finish` captures the checkout on a branch when the run
+    // ends. Existing rows default to the old behaviour in every respect but
+    // the watchdog, which they get because a run that hangs forever was
+    // never the intent — it was just the absence of this column.
+    "
+    ALTER TABLE tasks ADD COLUMN final_prompt TEXT;
+    ALTER TABLE tasks ADD COLUMN stall_timeout_secs INTEGER NOT NULL DEFAULT 1800;
+    ALTER TABLE tasks ADD COLUMN commit_on_finish INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+/// `TaskTarget` split into its two stored columns. The worktree id only
+/// exists for the `Worktree` arm, so the pair is the storage shape rather
+/// than a serialized enum — a plain string keeps the table readable and
+/// lets a future arm be added without a data migration.
+fn target_columns(t: &TaskTarget) -> (&'static str, Option<String>) {
+    match t {
+        TaskTarget::Root => ("root", None),
+        TaskTarget::Worktree(id) => ("worktree", Some(id.0.clone())),
+        TaskTarget::NewWorktree => ("new_worktree", None),
+    }
+}
+
+fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let target_kind: String = r.get(10)?;
+    let target_worktree: Option<String> = r.get(11)?;
+    let target = match (target_kind.as_str(), target_worktree) {
+        ("worktree", Some(id)) => TaskTarget::Worktree(WorktreeId(id)),
+        ("new_worktree", _) => TaskTarget::NewWorktree,
+        // Unknown kind, or a `worktree` row whose id went missing: fall back
+        // to root rather than dropping the task out of the list entirely.
+        _ => TaskTarget::Root,
+    };
+    Ok(Task {
+        id: TaskId(r.get(0)?),
+        project_id: ProjectId(r.get(1)?),
+        name: r.get(2)?,
+        prompt: r.get(3)?,
+        kind: r
+            .get::<_, String>(4)
+            .ok()
+            .and_then(|k| AgentKind::parse(&k))
+            .unwrap_or_default(),
+        model: r.get(5)?,
+        effort: r.get(6)?,
+        cron: r.get(7)?,
+        iterations: r.get(8)?,
+        unattended: r.get::<_, i64>(9)? != 0,
+        target,
+        enabled: r.get::<_, i64>(12)? != 0,
+        last_run_at: r.get(13)?,
+        next_run_at: r.get(14)?,
+        last_outcome: r.get(15)?,
+        last_agent_id: r.get::<_, Option<String>>(16)?.map(AgentId),
+        sort_order: r.get(17)?,
+        created_at: r.get(18)?,
+        final_prompt: r.get(19)?,
+        stall_timeout_secs: r.get(20)?,
+        commit_on_finish: r.get::<_, i64>(21)? != 0,
+    })
 }
 
 pub type TreeRows = (Vec<Project>, Vec<Worktree>, Vec<Agent>, Vec<TerminalTab>);
@@ -792,6 +884,171 @@ impl Store {
         Ok(links)
     }
 
+    // ---- tasks ----
+
+    /// Columns every task read selects, in the order `row_to_task` expects.
+    // New columns go on the end: `row_to_task` reads by index, so inserting
+    // one in the middle would silently re-map every field after it.
+    const TASK_COLS: &'static str = "id, project_id, name, prompt, kind, model, effort, cron, \
+         iterations, unattended, target_kind, target_worktree, enabled, last_run_at, \
+         next_run_at, last_outcome, last_agent_id, sort_order, created_at, final_prompt, \
+         stall_timeout_secs, commit_on_finish";
+
+    pub fn insert_task(&self, t: &Task) -> Result<()> {
+        let (target_kind, target_worktree) = target_columns(&t.target);
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO tasks (id, project_id, name, prompt, kind, model, effort, cron, \
+             iterations, unattended, target_kind, target_worktree, enabled, last_run_at, \
+             next_run_at, last_outcome, last_agent_id, sort_order, created_at, final_prompt, \
+             stall_timeout_secs, commit_on_finish) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20, ?21, ?22)",
+            params![
+                t.id.as_str(),
+                t.project_id.as_str(),
+                t.name,
+                t.prompt,
+                t.kind.as_str(),
+                t.model,
+                t.effort,
+                t.cron,
+                t.iterations,
+                t.unattended as i64,
+                target_kind,
+                target_worktree,
+                t.enabled as i64,
+                t.last_run_at,
+                t.next_run_at,
+                t.last_outcome,
+                t.last_agent_id.as_ref().map(|a| a.0.clone()),
+                t.sort_order,
+                if t.created_at == 0 {
+                    now_ms()
+                } else {
+                    t.created_at
+                },
+                t.final_prompt,
+                t.stall_timeout_secs,
+                t.commit_on_finish as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sort slot for a new task: after everything else on its project.
+    pub fn next_task_sort_order(&self, project_id: &ProjectId) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM tasks WHERE project_id = ?1",
+            params![project_id.as_str()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Overwrite every editable field. Run state (`last_run_at`,
+    /// `next_run_at`, `last_outcome`, `last_agent_id`) is daemon-owned and
+    /// deliberately absent — an edit must not erase what the last run did.
+    /// `next_run_at` is recomputed by the caller after the edit lands.
+    pub fn update_task(&self, t: &Task) -> Result<()> {
+        let (target_kind, target_worktree) = target_columns(&t.target);
+        self.conn.lock().unwrap().execute(
+            "UPDATE tasks SET project_id = ?2, name = ?3, prompt = ?4, kind = ?5, model = ?6, \
+             effort = ?7, cron = ?8, iterations = ?9, unattended = ?10, target_kind = ?11, \
+             target_worktree = ?12, enabled = ?13, final_prompt = ?14, \
+             stall_timeout_secs = ?15, commit_on_finish = ?16 WHERE id = ?1",
+            params![
+                t.id.as_str(),
+                t.project_id.as_str(),
+                t.name,
+                t.prompt,
+                t.kind.as_str(),
+                t.model,
+                t.effort,
+                t.cron,
+                t.iterations,
+                t.unattended as i64,
+                target_kind,
+                target_worktree,
+                t.enabled as i64,
+                t.final_prompt,
+                t.stall_timeout_secs,
+                t.commit_on_finish as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_task_enabled(&self, id: &TaskId, enabled: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE tasks SET enabled = ?2 WHERE id = ?1",
+            params![id.as_str(), enabled as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp the next due time alone. Called by the scheduler on every tick
+    /// that changes it, including the disable path (0 = not scheduled).
+    pub fn set_task_next_run(&self, id: &TaskId, next_run_at: i64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE tasks SET next_run_at = ?2 WHERE id = ?1",
+            params![id.as_str(), next_run_at],
+        )?;
+        Ok(())
+    }
+
+    /// Record what a run did. `agent` is None when the run never got as far
+    /// as a session, in which case `outcome` says why.
+    pub fn set_task_run_state(
+        &self,
+        id: &TaskId,
+        last_run_at: i64,
+        outcome: &str,
+        agent: Option<&AgentId>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE tasks SET last_run_at = ?2, last_outcome = ?3, last_agent_id = ?4 WHERE id = ?1",
+            params![
+                id.as_str(),
+                last_run_at,
+                outcome,
+                agent.map(|a| a.0.clone())
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_task(&self, id: &TaskId) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id.as_str()])?;
+        Ok(())
+    }
+
+    pub fn get_task(&self, id: &TaskId) -> Result<Option<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {} FROM tasks WHERE id = ?1", Self::TASK_COLS);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(row_to_task(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every task, in per-project list order.
+    pub fn load_tasks(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM tasks ORDER BY project_id, sort_order, created_at",
+            Self::TASK_COLS
+        );
+        let tasks = conn
+            .prepare(&sql)?
+            .query_map([], row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tasks)
+    }
+
     // ---- pull-request read marks ----
 
     /// Remember that this pull request's conversation has been read up to
@@ -997,6 +1254,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::DEFAULT_STALL_TIMEOUT_SECS;
 
     #[test]
     fn roundtrip_tree() {
@@ -1165,6 +1423,297 @@ mod tests {
         store.insert_link(&link).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_links().unwrap().is_empty());
+    }
+    #[test]
+    fn task_crud_roundtrip_and_cascade() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+
+        assert_eq!(store.next_task_sort_order(&project.id).unwrap(), 0);
+        let task = Task {
+            id: TaskId::generate(),
+            project_id: project.id.clone(),
+            name: "nightly review".into(),
+            prompt: "/code-review".into(),
+            kind: AgentKind::Codex,
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            cron: Some("0 2 * * *".into()),
+            iterations: 3,
+            unattended: true,
+            final_prompt: Some("summarise and stop".into()),
+            stall_timeout_secs: 900,
+            commit_on_finish: true,
+            target: TaskTarget::Worktree(worktree.id.clone()),
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: store.next_task_sort_order(&project.id).unwrap(),
+        };
+        store.insert_task(&task).unwrap();
+        assert_eq!(store.next_task_sort_order(&project.id).unwrap(), 1);
+
+        // Every field survives the round trip, including the two-column
+        // target split and the Option<String> model/effort.
+        let read = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(read.name, "nightly review");
+        assert_eq!(read.prompt, "/code-review");
+        assert_eq!(read.kind, AgentKind::Codex);
+        assert_eq!(read.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(read.effort.as_deref(), Some("high"));
+        assert_eq!(read.cron.as_deref(), Some("0 2 * * *"));
+        assert_eq!(read.iterations, 3);
+        assert!(read.unattended);
+        assert_eq!(read.final_prompt.as_deref(), Some("summarise and stop"));
+        assert_eq!(read.stall_timeout_secs, 900);
+        assert!(read.commit_on_finish);
+        assert_eq!(read.target, TaskTarget::Worktree(worktree.id.clone()));
+        assert!(read.enabled);
+        assert!(read.created_at > 0, "insert stamps created_at");
+
+        // Run state is written separately from the editable fields, and an
+        // update must not erase it.
+        let agent = AgentId::generate();
+        store
+            .set_task_run_state(&task.id, 1234, "ran 3 of 3", Some(&agent))
+            .unwrap();
+        store.set_task_next_run(&task.id, 5678).unwrap();
+        let edited = Task {
+            name: "nightly".into(),
+            target: TaskTarget::NewWorktree,
+            enabled: false,
+            ..store.get_task(&task.id).unwrap().unwrap()
+        };
+        store.update_task(&edited).unwrap();
+        let read = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(read.name, "nightly");
+        assert_eq!(read.target, TaskTarget::NewWorktree);
+        assert!(!read.enabled);
+        assert_eq!(read.last_run_at, 1234, "an edit keeps the last run");
+        assert_eq!(read.last_outcome.as_deref(), Some("ran 3 of 3"));
+        assert_eq!(read.last_agent_id, Some(agent));
+        assert_eq!(read.next_run_at, 5678);
+
+        store.set_task_enabled(&task.id, true).unwrap();
+        assert!(store.get_task(&task.id).unwrap().unwrap().enabled);
+        assert_eq!(store.load_tasks().unwrap().len(), 1);
+
+        store.delete_task(&task.id).unwrap();
+        assert!(store.get_task(&task.id).unwrap().is_none());
+
+        // Tasks are project-scoped, so the project's delete takes them.
+        store.insert_task(&task).unwrap();
+        store.delete_project(&project.id).unwrap();
+        assert!(store.load_tasks().unwrap().is_empty());
+    }
+
+    /// Deleting the checkout a task points at must not quietly rewrite the
+    /// task to run somewhere else. The FK is on the project, not on
+    /// `target_worktree`, so the target is preserved verbatim and the *run*
+    /// is what fails — which surfaces as the task's outcome, where the user
+    /// can see it and re-point the task, instead of a nightly job silently
+    /// starting to run against main.
+    #[test]
+    fn a_task_outlives_the_worktree_it_targets() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+        let task = Task {
+            id: TaskId::generate(),
+            project_id: project.id.clone(),
+            name: "t".into(),
+            prompt: "go".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cron: None,
+            iterations: 1,
+            unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
+            target: TaskTarget::Worktree(worktree.id.clone()),
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: 0,
+        };
+        store.insert_task(&task).unwrap();
+        store.delete_worktree(&worktree.id).unwrap();
+        let read = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(
+            read.target,
+            TaskTarget::Worktree(worktree.id.clone()),
+            "the target is kept as written, dangling id and all"
+        );
+        // Only a NULL id — a row hand-edited, or written by a future version
+        // — degrades to root, so a load can never fail on one.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET target_worktree = NULL WHERE id = ?1",
+                rusqlite::params![task.id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_task(&task.id).unwrap().unwrap().target,
+            TaskTarget::Root
+        );
+    }
+
+    /// A v22 database has tasks but none of the unattended-run controls.
+    /// The upgrade has to keep every existing task and give it a watchdog:
+    /// a run that hangs forever was never anybody's intent, it was just the
+    /// absence of this column.
+    #[test]
+    fn migration_23_gives_existing_tasks_a_watchdog() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig23-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(22).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at) \
+                 VALUES ('p1', 'p', '/tmp/p', 0, 0); \
+                 INSERT INTO tasks (id, project_id, name, prompt, kind, iterations, \
+                 unattended, target_kind, enabled, created_at) \
+                 VALUES ('t1', 'p1', 'nightly', 'go', 'claude', 4, 1, 'root', 1, 7);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let tasks = store.load_tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "the existing task survived the upgrade");
+        let task = &tasks[0];
+        assert_eq!(task.name, "nightly");
+        assert_eq!(task.iterations, 4);
+        assert!(task.unattended);
+        // The new columns take their defaults: no wrap-up, no commit, but a
+        // watchdog rather than an unbounded wait.
+        assert_eq!(task.final_prompt, None);
+        assert_eq!(task.stall_timeout_secs, DEFAULT_STALL_TIMEOUT_SECS);
+        assert!(!task.commit_on_finish);
+
+        // And the new fields are writable on the upgraded table.
+        let edited = Task {
+            final_prompt: Some("wrap up".into()),
+            stall_timeout_secs: 60,
+            commit_on_finish: true,
+            ..task.clone()
+        };
+        store.update_task(&edited).unwrap();
+        let read = store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(read.final_prompt.as_deref(), Some("wrap up"));
+        assert_eq!(read.stall_timeout_secs, 60);
+        assert!(read.commit_on_finish);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_22_adds_the_tasks_table_to_a_v21_database() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig22-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(21).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        // The upgrade kept the project and the new table is usable.
+        assert_eq!(store.load_tree().unwrap().0.len(), 1);
+        assert!(store.load_tasks().unwrap().is_empty());
+        let task = Task {
+            id: TaskId::generate(),
+            project_id: ProjectId("p1".into()),
+            name: "t".into(),
+            prompt: "go".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cron: Some("0 2 * * *".into()),
+            iterations: 2,
+            unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
+            target: TaskTarget::Root,
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: 0,
+        };
+        store.insert_task(&task).unwrap();
+        assert_eq!(store.load_tasks().unwrap().len(), 1);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
     }
 
     /// Real upgrade path: a v9 database still carrying `todos` rows walks

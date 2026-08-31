@@ -31,6 +31,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = { version = "3", features = ["serde"] }
 directories = "6"
+# Task scheduling. `cron` parses the expressions; `chrono` is what makes
+# "02:00 local" true across a DST boundary. Daemon-only — the TUI renders
+# the daemon's computed next-due stamp and needs no parser of its own.
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
 lto = "thin"

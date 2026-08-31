@@ -3,8 +3,9 @@
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
-    PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind, RowKey,
-    SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
+    PaletteTarget, PaneMode, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
+    RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TaskField, TermSelection,
+    WorktreeRollback, TASK_ITERATION_CHOICES, TASK_STALL_CHOICES,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -17,8 +18,9 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef,
-    WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef, Task,
+    TaskId, TaskSpec, TaskTarget, WorkspaceId, WorktreeId, DEFAULT_STALL_TIMEOUT_SECS,
+    MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1142,6 +1144,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         return;
     }
 
+    // The pane is showing the project's automation, not a session: its own
+    // keys own it. Before the input-lock forward below, because there is no
+    // PTY here to type into — and anything the pane doesn't claim still
+    // falls through to panel navigation, so Tab and q always work.
+    if app.focus == Focus::Terminal
+        && app.pane_mode == PaneMode::Automation
+        && handle_automation_key(app, key, out)
+    {
+        return;
+    }
+
     // Terminal input-locked with a live session: forward everything except
     // the escape hatches. Merely focusing the pane (Tab / Ctrl+arrows) does
     // not lock — Enter does — so an unlocked pane falls through to panel
@@ -1537,6 +1550,20 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 app.flash = Some("attach a session first".into());
             }
         }
+        Action::ToggleAutomation => {
+            set_pane_mode(
+                app,
+                match app.pane_mode {
+                    PaneMode::Terminal => PaneMode::Automation,
+                    PaneMode::Automation => PaneMode::Terminal,
+                },
+            );
+            // Focusing the pane is the point of the key — the tasks are what
+            // you came to read.
+            if app.pane_mode == PaneMode::Automation {
+                app.focus = Focus::Terminal;
+            }
+        }
         // Terminal-scope only; never resolved here.
         Action::UnlockTerminal => {}
     }
@@ -1658,6 +1685,34 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .unwrap_or_default();
             ("Edit link".to_string(), "URL".to_string(), current)
         }
+        PromptKind::NewTask { .. } => ("New task".to_string(), "Name".to_string(), String::new()),
+        PromptKind::NewTaskPrompt { name, .. } => (
+            format!("Task: {name}"),
+            "Prompt to send each turn".to_string(),
+            String::new(),
+        ),
+        PromptKind::TaskName { id } => (
+            "Rename task".to_string(),
+            "Name".to_string(),
+            task_field_text(app, id, TaskField::Name),
+        ),
+        PromptKind::TaskPrompt { id } => (
+            "Task prompt".to_string(),
+            "Prompt to send each turn".to_string(),
+            task_field_text(app, id, TaskField::Prompt),
+        ),
+        // The label carries the syntax, because a cron expression is the one
+        // field here nobody remembers the shape of.
+        PromptKind::TaskSchedule { id } => (
+            "Task schedule".to_string(),
+            "Cron — `0 2 * * *`, `*/15 * * * *`, `0 9 * * Mon-Fri`; empty for manual".to_string(),
+            task_field_text(app, id, TaskField::Schedule),
+        ),
+        PromptKind::TaskFinalPrompt { id } => (
+            "Task wrap-up".to_string(),
+            "Sent instead of the prompt on the last turn; empty for none".to_string(),
+            task_field_text(app, id, TaskField::FinalPrompt),
+        ),
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
         title, label, input, kind,
@@ -2834,7 +2889,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
     };
     match overlay {
         Overlay::Settings(_) => {}
-        Overlay::Help => {
+        Overlay::Help | Overlay::AutomationHelp => {
             if matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
@@ -3646,16 +3701,27 @@ fn set_show_workspaces(app: &mut App, shown: bool) {
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
-    // A cloud session cannot start without its task. Keep the multiline
-    // dialog open on validation so the user can correct it in place.
+    // The multiline editor holds text something can't start without — a
+    // cloud session's task, a task's prompt — so it validates in place and
+    // keeps the dialog open for a correction rather than closing on an
+    // error. Three kinds share it now, so the noun comes from the kind.
     if prompt.is_multiline() {
+        let subject = match prompt.kind {
+            PromptKind::ClaudeCloudTask { .. } => "Claude Cloud task",
+            _ => "task prompt",
+        };
         let error = if value.is_empty() {
-            Some("Claude Cloud needs a task".to_string())
+            Some(match prompt.kind {
+                PromptKind::ClaudeCloudTask { .. } => "Claude Cloud needs a task".to_string(),
+                _ => "a task needs a prompt to send".to_string(),
+            })
         } else if value.contains('\0') {
-            Some("Claude Cloud task cannot contain NUL bytes".to_string())
+            Some(format!("{subject} cannot contain NUL bytes"))
         } else if value.len() > MAX_CLOUD_PROMPT_BYTES {
+            // Same bound the daemon applies to both (it is an argv-sized
+            // limit either way, see `MAX_CLOUD_PROMPT_BYTES`).
             Some(format!(
-                "Claude Cloud task is too long (max {} KiB)",
+                "{subject} is too long (max {} KiB)",
                 MAX_CLOUD_PROMPT_BYTES / 1024
             ))
         } else {
@@ -3820,6 +3886,98 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 url: value,
             });
         }
+        // Name first, then straight into the prompt: a task with no prompt
+        // is not a task the daemon will accept, so there is no half-created
+        // state to leave behind.
+        PromptKind::NewTask { project } => {
+            let name = if value.trim().is_empty() {
+                "task".to_string()
+            } else {
+                value
+            };
+            open_prompt(app, PromptKind::NewTaskPrompt { project, name });
+        }
+        // Emptiness is already refused by the multiline guard at the top,
+        // which keeps the editor open on the text the user typed.
+        PromptKind::NewTaskPrompt { project, name } => {
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedTask);
+            out.push(ClientRequest::CreateTask {
+                req_id,
+                spec: TaskSpec {
+                    project,
+                    name,
+                    prompt: value,
+                    kind: AgentKind::default(),
+                    model: None,
+                    effort: None,
+                    // Manual and single-turn to begin with: the cron and the
+                    // iteration count are the two fields worth choosing
+                    // deliberately, in the detail column, rather than being
+                    // guessed at create time.
+                    cron: None,
+                    iterations: 1,
+                    unattended: false,
+                    // No wrap-up and no commit until asked for — both change
+                    // what a run *does*, and a new task should do the least
+                    // surprising thing. The watchdog is the exception: a run
+                    // that hangs forever is nobody's intent.
+                    final_prompt: None,
+                    stall_timeout_secs: DEFAULT_STALL_TIMEOUT_SECS,
+                    commit_on_finish: false,
+                    target: TaskTarget::Root,
+                    enabled: true,
+                },
+            });
+        }
+        PromptKind::TaskName { id } => {
+            if let Some(task) = task_by_id(app, &id) {
+                let name = if value.trim().is_empty() {
+                    task.name.clone()
+                } else {
+                    value
+                };
+                let spec = TaskSpec {
+                    name,
+                    ..task_spec_of(&task)
+                };
+                send_task_update(app, out, &id, spec);
+            }
+        }
+        PromptKind::TaskPrompt { id } => {
+            if let Some(task) = task_by_id(app, &id) {
+                let spec = TaskSpec {
+                    prompt: value,
+                    ..task_spec_of(&task)
+                };
+                send_task_update(app, out, &id, spec);
+            }
+        }
+        PromptKind::TaskFinalPrompt { id } => {
+            if let Some(task) = task_by_id(app, &id) {
+                // Empty clears it: the daemon reads None as "every turn gets
+                // the ordinary prompt", and this is the only way to undo a
+                // wrap-up without rewriting the task.
+                let final_prompt = (!value.trim().is_empty()).then_some(value);
+                let spec = TaskSpec {
+                    final_prompt,
+                    ..task_spec_of(&task)
+                };
+                send_task_update(app, out, &id, spec);
+            }
+        }
+        PromptKind::TaskSchedule { id } => {
+            if let Some(task) = task_by_id(app, &id) {
+                // Empty clears the schedule back to manual — the daemon
+                // reads None the same way, and it is the only way to undo a
+                // cron without deleting the task.
+                let cron = (!value.trim().is_empty()).then_some(value);
+                let spec = TaskSpec {
+                    cron,
+                    ..task_spec_of(&task)
+                };
+                send_task_update(app, out, &id, spec);
+            }
+        }
     }
 }
 
@@ -3843,6 +4001,10 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::CloseTerminal { req_id, id });
+        }
+        PendingAction::DeleteTask(id) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::DeleteTask { req_id, id });
         }
         PendingAction::DeleteLink(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -5731,6 +5893,31 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         open_prompt(app, PromptKind::AddProject);
                     }
                 }
+                // The pane's own tabs. Clicking the open one is a no-op
+                // beyond focusing the pane, which is what a click on any
+                // header should do.
+                Some(HitTarget::PaneTab(mode)) => {
+                    set_pane_mode(app, mode);
+                    app.focus = Focus::Terminal;
+                }
+                Some(HitTarget::TaskRow(row)) => {
+                    app.focus = Focus::Terminal;
+                    app.automation.selected = row;
+                    app.automation.on_detail = false;
+                    app.dirty = true;
+                }
+                Some(HitTarget::TaskField(field)) => {
+                    app.focus = Focus::Terminal;
+                    // Clicking the row the cursor is already on activates it,
+                    // the same rule the settings overlay's rows follow.
+                    let repeat = app.automation.on_detail && app.automation.field == field;
+                    app.automation.field = field;
+                    app.automation.on_detail = true;
+                    if repeat {
+                        activate_task_field(app, out, 0);
+                    }
+                    app.dirty = true;
+                }
                 Some(HitTarget::TerminalPane) => {
                     // A click into the pane is deliberate — lock input too.
                     if let Some(t) = &app.term {
@@ -6067,6 +6254,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             agents,
             terminals,
             links,
+            tasks,
             pr_seen,
             ui_state,
         } => {
@@ -6077,6 +6265,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.agents = agents;
             app.tree.terminals = terminals;
             app.tree.links = links;
+            app.tree.tasks = tasks;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             // `--workspace <name>` overrides the daemon's last-opened one.
             // Before the UI-state restore, whose remembered project only
@@ -6204,6 +6393,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
                     if !select_link_by_id(app, &id) {
                         app.select_link_when_seen = Some(id);
+                    }
+                }
+                (Some(PendingIntent::SelectCreatedTask), Some(EntityId::Task(id))) => {
+                    // The upsert arrives with the Ack, so the row is already
+                    // in the list; land on it and step into the fields, which
+                    // is what a just-created task wants next.
+                    if let Some(row) = app.project_tasks().iter().position(|t| t.id == id) {
+                        app.automation.selected = row;
+                        app.automation.on_detail = true;
+                        app.pane_mode = PaneMode::Automation;
+                        app.focus = Focus::Terminal;
                     }
                 }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
@@ -6349,6 +6549,10 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = l,
             None => app.tree.links.push(l),
         },
+        Entity::Task(t) => match app.tree.tasks.iter_mut().find(|x| x.id == t.id) {
+            Some(existing) => *existing = t,
+            None => app.tree.tasks.push(t),
+        },
     }
 }
 
@@ -6395,6 +6599,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
             app.tree.worktrees.retain(|w| &w.project_id != id);
+            app.tree.tasks.retain(|t| &t.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
         EntityId::Worktree(id) => {
@@ -6408,6 +6613,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
+        EntityId::Task(id) => app.tree.tasks.retain(|t| &t.id != id),
     }
 }
 
@@ -6565,6 +6771,299 @@ fn clamp_selections(app: &mut App) {
     if app.sel_session >= sess_len {
         app.sel_session = sess_len.saturating_sub(1);
     }
+}
+
+/// A task by id, wherever it lives — the Automation cursor may have moved
+/// between opening a prompt and submitting it.
+fn task_by_id(app: &App, id: &TaskId) -> Option<Task> {
+    app.tree.tasks.iter().find(|t| &t.id == id).cloned()
+}
+
+/// Current text of one of a task's free-text fields, to prefill its prompt.
+fn task_field_text(app: &App, id: &TaskId, field: TaskField) -> String {
+    let Some(task) = app.tree.tasks.iter().find(|t| &t.id == id) else {
+        return String::new();
+    };
+    match field {
+        TaskField::Name => task.name.clone(),
+        TaskField::Prompt => task.prompt.clone(),
+        TaskField::Schedule => task.cron.clone().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Flip the pane between the live session and the project's automation.
+/// Leaves the input lock cleared: there is no PTY under the Automation tab,
+/// and coming back to a locked terminal you didn't lock is a surprise.
+fn set_pane_mode(app: &mut App, mode: PaneMode) {
+    if app.pane_mode == mode {
+        return;
+    }
+    app.pane_mode = mode;
+    app.term_locked = false;
+    if mode == PaneMode::Automation {
+        app.clamp_automation();
+    }
+    app.dirty = true;
+}
+
+/// The Automation pane's keys, handled before the terminal's input-lock
+/// forward. Returns false for anything it doesn't own, so Tab, the focus
+/// arrows and `q` still walk out of the pane rather than being swallowed.
+fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) -> bool {
+    let tasks: Vec<Task> = app.project_tasks().into_iter().cloned().collect();
+    let fields = TaskField::ALL.len();
+    match key.code {
+        // The pane's keys are its own, so its help is too. Claimed here
+        // rather than through the global `?` so it only ever appears where
+        // these keys actually do something.
+        KeyCode::Char('?') => {
+            app.overlay = Some(Overlay::AutomationHelp);
+            true
+        }
+        // New task: name first, then its prompt — the chained-prompt idiom
+        // the cloud launch already uses for "two things before a create".
+        KeyCode::Char('n') => {
+            match app.selected_project().map(|p| p.id.clone()) {
+                Some(project) => open_prompt(app, PromptKind::NewTask { project }),
+                None => app.flash = Some("select a project first".into()),
+            }
+            true
+        }
+        KeyCode::Char('r') => {
+            match tasks.get(app.automation.selected) {
+                Some(task) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::RunTaskNow {
+                        req_id,
+                        id: task.id.clone(),
+                    });
+                    app.flash = Some(format!("running `{}`", task.name));
+                }
+                None => app.flash = Some("no task selected".into()),
+            }
+            true
+        }
+        KeyCode::Char('d') => {
+            if let Some(task) = tasks.get(app.automation.selected) {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Delete task".into(),
+                    message: format!(
+                        "Delete `{}`?\nA run already in flight keeps its session.",
+                        task.name
+                    ),
+                    action: PendingAction::DeleteTask(task.id.clone()),
+                }));
+            }
+            true
+        }
+        // Space is the list's quick toggle — the one field worth flipping
+        // without stepping into the detail column.
+        KeyCode::Char(' ') if !app.automation.on_detail => {
+            if let Some(task) = tasks.get(app.automation.selected) {
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::SetTaskEnabled {
+                    req_id,
+                    id: task.id.clone(),
+                    enabled: !task.enabled,
+                });
+            }
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.automation.on_detail {
+                app.automation.field = (app.automation.field + 1).min(fields - 1);
+            } else if !tasks.is_empty() {
+                app.automation.selected = (app.automation.selected + 1).min(tasks.len() - 1);
+            }
+            app.dirty = true;
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.automation.on_detail {
+                // Off the top of the fields hands the cursor back to the
+                // list, the way the settings list hands it to the tab strip.
+                if app.automation.field == 0 {
+                    app.automation.on_detail = false;
+                } else {
+                    app.automation.field -= 1;
+                }
+            } else {
+                app.automation.selected = app.automation.selected.saturating_sub(1);
+            }
+            app.dirty = true;
+            true
+        }
+        // In the detail column ←/→ cycle the value under the cursor, exactly
+        // as they do on a settings row — so no field needs Enter, and the
+        // way back out is ↑ off the top or Esc.
+        KeyCode::Right | KeyCode::Char('l') if app.automation.on_detail => {
+            activate_task_field(app, out, 1);
+            true
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.automation.on_detail => {
+            activate_task_field(app, out, -1);
+            true
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if app.automation.on_detail => {
+            activate_task_field(app, out, 0);
+            true
+        }
+        KeyCode::Esc if app.automation.on_detail => {
+            app.automation.on_detail = false;
+            app.dirty = true;
+            true
+        }
+        // From the list, → and Enter step into the fields. ← is deliberately
+        // not ours here: it walks focus back out to Sessions.
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter if !tasks.is_empty() => {
+            app.automation.on_detail = true;
+            app.dirty = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Act on the detail row under the cursor: text fields open the prompt
+/// overlay, everything else cycles by `delta` (0 = "activate", which for a
+/// bool means toggle — the `Config::cycle` contract).
+fn activate_task_field(app: &mut App, out: &mut Vec<ClientRequest>, delta: i32) {
+    let Some(task) = app.selected_task().cloned() else {
+        return;
+    };
+    let Some(field) = TaskField::ALL.get(app.automation.field).copied() else {
+        return;
+    };
+    if field.is_text() {
+        let kind = match field {
+            TaskField::Name => PromptKind::TaskName { id: task.id },
+            TaskField::Prompt => PromptKind::TaskPrompt { id: task.id },
+            TaskField::FinalPrompt => PromptKind::TaskFinalPrompt { id: task.id },
+            _ => PromptKind::TaskSchedule { id: task.id },
+        };
+        open_prompt(app, kind);
+        return;
+    }
+    let mut spec = task_spec_of(&task);
+    match field {
+        TaskField::Agent => {
+            spec.kind = cycle_choice(&AgentKind::ALL, task.kind, delta);
+            // Model and effort are per-kind vocabularies; carrying claude's
+            // model onto codex would spawn a CLI that refuses to start.
+            spec.model = None;
+            spec.effort = None;
+        }
+        TaskField::Model => {
+            spec.model = cycle_optional(crate::config::model_choices(task.kind), &task.model, delta)
+        }
+        TaskField::Effort => {
+            spec.effort = cycle_optional(
+                crate::config::effort_choices(task.kind),
+                &task.effort,
+                delta,
+            )
+        }
+        TaskField::Iterations => {
+            spec.iterations = cycle_choice(&TASK_ITERATION_CHOICES, task.iterations, delta)
+        }
+        TaskField::Unattended => spec.unattended = !task.unattended,
+        TaskField::StallTimeout => {
+            spec.stall_timeout_secs =
+                cycle_choice(&TASK_STALL_CHOICES, task.stall_timeout_secs, delta)
+        }
+        TaskField::CommitOnFinish => spec.commit_on_finish = !task.commit_on_finish,
+        TaskField::Target => spec.target = cycle_task_target(app, &task, delta),
+        TaskField::Enabled => spec.enabled = !task.enabled,
+        // Handled above.
+        TaskField::Name | TaskField::Prompt | TaskField::Schedule | TaskField::FinalPrompt => {
+            return
+        }
+    }
+    send_task_update(app, out, &task.id, spec);
+}
+
+/// Every editable field of a task, as the wire wants them. Update takes the
+/// whole spec, so an edit is read-modify-send — the same shape
+/// `apply_setting_at` uses for config, and it can't half-apply.
+fn task_spec_of(task: &Task) -> TaskSpec {
+    TaskSpec {
+        project: task.project_id.clone(),
+        name: task.name.clone(),
+        prompt: task.prompt.clone(),
+        kind: task.kind,
+        model: task.model.clone(),
+        effort: task.effort.clone(),
+        cron: task.cron.clone(),
+        iterations: task.iterations,
+        unattended: task.unattended,
+        final_prompt: task.final_prompt.clone(),
+        stall_timeout_secs: task.stall_timeout_secs,
+        commit_on_finish: task.commit_on_finish,
+        target: task.target.clone(),
+        enabled: task.enabled,
+    }
+}
+
+fn send_task_update(app: &mut App, out: &mut Vec<ClientRequest>, id: &TaskId, spec: TaskSpec) {
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::UpdateTask {
+        req_id,
+        id: id.clone(),
+        spec,
+    });
+}
+
+/// Step through a fixed choice list, wrapping. `delta == 0` means "the next
+/// one", so Enter and → agree.
+fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: i32) -> T {
+    if choices.is_empty() {
+        return current;
+    }
+    let at = choices.iter().position(|c| *c == current).unwrap_or(0) as i32;
+    let step = if delta == 0 { 1 } else { delta };
+    let next = (at + step).rem_euclid(choices.len() as i32) as usize;
+    choices[next]
+}
+
+/// Cycle a model or effort field. `config::model_choices` already carries
+/// "default" as its first entry, which is how the whole app spells "don't
+/// pass the flag", so the mapping is simply index 0 ↔ None — and cycling
+/// always comes back around to it rather than trapping the user among the
+/// named values. An unrecognised stored value reads as index 0.
+fn cycle_optional(choices: &[&str], current: &Option<String>, delta: i32) -> Option<String> {
+    if choices.is_empty() {
+        return None;
+    }
+    let at = match current {
+        None => 0,
+        Some(v) => choices
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(v))
+            .unwrap_or(0),
+    } as i32;
+    let step = if delta == 0 { 1 } else { delta };
+    let next = (at + step).rem_euclid(choices.len() as i32) as usize;
+    (next != 0).then(|| choices[next].to_string())
+}
+
+/// Root → each of the project's non-main worktrees → its own worktree →
+/// back to root. Listing the real checkouts inline is what lets the field
+/// stay a cycle instead of needing a picker.
+fn cycle_task_target(app: &App, task: &Task, delta: i32) -> TaskTarget {
+    let mut choices = vec![TaskTarget::Root];
+    choices.extend(
+        app.tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == task.project_id && !w.is_main)
+            .map(|w| TaskTarget::Worktree(w.id.clone())),
+    );
+    choices.push(TaskTarget::NewWorktree);
+    let at = choices.iter().position(|c| *c == task.target).unwrap_or(0) as i32;
+    let step = if delta == 0 { 1 } else { delta };
+    let next = (at + step).rem_euclid(choices.len() as i32) as usize;
+    choices[next].clone()
 }
 
 #[cfg(test)]
@@ -7766,7 +8265,10 @@ mod tests {
         app.sel_worktree = 0;
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("TERMINAL · agent-1"), "{text}");
+        // The pane's header is a tab strip now, so the session name trails
+        // both tabs rather than sitting against the title.
+        assert!(text.contains("TERMINAL"), "{text}");
+        assert!(text.contains("· agent-1"), "{text}");
         assert!(!text.contains("Pins a PR to the worktree."), "{text}");
         assert!(!text.contains("+106 -4"), "{text}");
     }
@@ -8391,6 +8893,7 @@ diff --git a/src/b.rs b/src/b.rs
                 agents: tree.agents,
                 terminals: tree.terminals,
                 links: tree.links,
+                tasks: tree.tasks,
                 pr_seen: Vec::new(),
                 ui_state: None,
             },
@@ -8416,6 +8919,7 @@ diff --git a/src/b.rs b/src/b.rs
             agents: tree.agents.clone(),
             terminals: tree.terminals.clone(),
             links: tree.links.clone(),
+            tasks: tree.tasks.clone(),
             pr_seen: Vec::new(),
             ui_state,
         };
@@ -12127,6 +12631,415 @@ diff --git a/src/b.rs b/src/b.rs
 
     fn press(app: &mut App, code: KeyCode, mods: KeyModifiers, out: &mut Vec<ClientRequest>) {
         handle_key(app, KeyEvent::new(code, mods), out);
+    }
+    fn seed_task(app: &mut App, id: &str, name: &str, cron: Option<&str>, iterations: u32) {
+        use nebula_core::{Entity, Task, TaskId, TaskTarget};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Task(Task {
+                    id: TaskId(id.into()),
+                    project_id: ProjectId("p1".into()),
+                    name: name.into(),
+                    prompt: "/code-review".into(),
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    cron: cron.map(str::to_string),
+                    iterations,
+                    unattended: false,
+                    final_prompt: None,
+                    stall_timeout_secs: 0,
+                    commit_on_finish: false,
+                    target: TaskTarget::Root,
+                    enabled: true,
+                    last_run_at: 0,
+                    next_run_at: 0,
+                    last_outcome: None,
+                    last_agent_id: None,
+                    created_at: 0,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    /// The pane has two tenants and one key to swap between them. The
+    /// terminal must come back untouched — the attachment underneath is not
+    /// disturbed by looking at the tasks.
+    #[test]
+    fn e_flips_the_pane_between_the_terminal_and_automation() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", Some("0 2 * * *"), 3);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1, 40, 10));
+        let mut out = Vec::new();
+
+        assert_eq!(app.pane_mode, PaneMode::Terminal);
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.pane_mode, PaneMode::Automation);
+        assert_eq!(app.focus, Focus::Terminal, "the key focuses what it opens");
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("AUTOMATION"), "tab strip:\n{text}");
+        assert!(text.contains("nightly review"), "the task list:\n{text}");
+        assert!(text.contains("0 2 * * *"), "its schedule:\n{text}");
+        assert!(text.contains("3 turns"), "its iteration count:\n{text}");
+        assert!(
+            app.term.is_some(),
+            "the session stays attached while the tasks are on screen"
+        );
+
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.pane_mode, PaneMode::Terminal);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("nightly review"), "tasks left:\n{text}");
+    }
+
+    /// Tasks are project-scoped and the pane follows the cursor, like every
+    /// other tenant of that column. A test with one project can't discriminate
+    /// — the second project has to be the one whose tasks are absent.
+    #[test]
+    fn the_automation_pane_scopes_to_the_selected_project() {
+        use nebula_core::{Entity, Project, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p2".into()),
+                    name: "client".into(),
+                    repo_path: "/tmp/client".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p2".into()),
+                    path: "/tmp/client".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.pane_mode = PaneMode::Automation;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("nightly review"),
+            "demo's task shows while demo is selected"
+        );
+
+        app.sel_project = 1;
+        app.clamp_automation();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("nightly review"),
+            "another project's tasks are not shown:\n{text}"
+        );
+        assert!(text.contains("no tasks yet"), "the empty state:\n{text}");
+    }
+
+    /// The detail column is a row of cyclable values: ←/→ change one and
+    /// send the whole spec, exactly as a settings row does. Nothing is
+    /// stored client-side, so the assertion is on the request.
+    #[test]
+    fn cycling_a_task_field_sends_the_whole_spec() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", Some("0 2 * * *"), 3);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        // Into the fields, down to `iterations`, and one step up.
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert!(app.automation.on_detail);
+        let iterations_row = TaskField::ALL
+            .iter()
+            .position(|f| *f == TaskField::Iterations)
+            .unwrap();
+        for _ in 0..iterations_row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(app.automation.field, iterations_row);
+        out.clear();
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        match out.as_slice() {
+            [ClientRequest::UpdateTask { id, spec, .. }] => {
+                assert_eq!(id.as_str(), "t1");
+                assert_eq!(spec.iterations, 5, "3 steps up to the next choice");
+                // Every other field rides along untouched.
+                assert_eq!(spec.name, "nightly review");
+                assert_eq!(spec.cron.as_deref(), Some("0 2 * * *"));
+                assert!(!spec.unattended);
+            }
+            other => panic!("expected one UpdateTask, got {other:?}"),
+        }
+
+        // The unattended toggle is the one with teeth, so check it directly.
+        out.clear();
+        let unattended_row = TaskField::ALL
+            .iter()
+            .position(|f| *f == TaskField::Unattended)
+            .unwrap();
+        app.automation.field = unattended_row;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        match out.as_slice() {
+            [ClientRequest::UpdateTask { spec, .. }] => assert!(spec.unattended),
+            other => panic!("expected one UpdateTask, got {other:?}"),
+        }
+
+        // A text field opens the editor instead of cycling — and the prompt
+        // for a task's prompt is the multiline one.
+        out.clear();
+        app.automation.field = TaskField::ALL
+            .iter()
+            .position(|f| *f == TaskField::Prompt)
+            .unwrap();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "opening an editor sends nothing");
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert!(matches!(p.kind, PromptKind::TaskPrompt { .. }));
+                assert!(p.is_multiline(), "a task prompt gets the long editor");
+                assert_eq!(p.input.as_str(), "/code-review", "prefilled");
+            }
+            other => panic!("expected a prompt overlay, got {other:?}"),
+        }
+    }
+
+    /// `space` on the list is the quick on/off, and `d` asks first — a task
+    /// is a definition someone wrote, not a row to lose to a stray key.
+    #[test]
+    fn the_list_toggles_with_space_and_delete_asks_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", Some("0 2 * * *"), 1);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        match out.as_slice() {
+            [ClientRequest::SetTaskEnabled { id, enabled, .. }] => {
+                assert_eq!(id.as_str(), "t1");
+                assert!(!enabled, "the seeded task was on, so space turns it off");
+            }
+            other => panic!("expected SetTaskEnabled, got {other:?}"),
+        }
+
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "nothing is sent before the confirm");
+        match &app.overlay {
+            Some(Overlay::Confirm(c)) => {
+                assert!(c.message.contains("nightly review"), "{}", c.message);
+                assert!(matches!(c.action, PendingAction::DeleteTask(_)));
+            }
+            other => panic!("expected a confirm, got {other:?}"),
+        }
+        // Answering yes sends the delete.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::DeleteTask { .. }]),
+            "got {out:?}"
+        );
+    }
+
+    /// The pane is modal, so its help is too: `?` inside it explains its own
+    /// keys and fields, and `?` outside it still opens the global help.
+    #[test]
+    fn question_mark_in_the_automation_pane_opens_its_own_cheatsheet() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        let mut out = Vec::new();
+
+        // Outside the pane, `?` is the global help.
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::AutomationHelp)),
+            "inside the pane it is the pane's own help: {:?}",
+            app.overlay
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Automation"), "titled:\n{text}");
+        // The three fields this window exists to explain.
+        for needle in ["wrap-up", "stall limit", "commit"] {
+            assert!(text.contains(needle), "missing `{needle}`:\n{text}");
+        }
+        // And what a finished run will say, which is the other half of
+        // reading the pane.
+        for needle in ["ran N of N", "stalled", "skipped"] {
+            assert!(text.contains(needle), "missing `{needle}`:\n{text}");
+        }
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "esc closes it");
+        assert_eq!(
+            app.pane_mode,
+            PaneMode::Automation,
+            "and leaves the pane where it was"
+        );
+    }
+
+    /// The cheatsheet names fields by their pane labels. If a label is
+    /// renamed and the window is not, the help starts describing something
+    /// the user cannot find — so the labels it quotes have to be real ones.
+    #[test]
+    fn the_automation_cheatsheet_quotes_real_field_labels() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        app.overlay = Some(Overlay::AutomationHelp);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        for field in [
+            TaskField::Prompt,
+            TaskField::Schedule,
+            TaskField::Iterations,
+            TaskField::FinalPrompt,
+            TaskField::Unattended,
+            TaskField::StallTimeout,
+            TaskField::CommitOnFinish,
+            TaskField::Target,
+        ] {
+            assert!(
+                text.contains(field.label()),
+                "the cheatsheet does not mention `{}`:\n{text}",
+                field.label()
+            );
+        }
+    }
+
+    /// Keys the pane doesn't own must still walk out of it, or the pane is a
+    /// trap: `q` quits, Tab keeps moving focus.
+    #[test]
+    fn the_automation_pane_does_not_swallow_the_keys_out_of_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_ne!(app.focus, Focus::Terminal, "Tab still walks focus");
+
+        app.focus = Focus::Terminal;
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
+        assert!(app.should_quit, "q still quits");
+    }
+
+    /// A new task is two prompts — name, then the prompt to send — because a
+    /// task with no prompt is one the daemon refuses. The create carries
+    /// deliberate defaults: manual and single-turn, so nothing starts running
+    /// on its own until the user says so.
+    #[test]
+    fn a_new_task_asks_for_a_name_then_a_prompt() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        match &mut app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert!(matches!(p.kind, PromptKind::NewTask { .. }));
+                p.input.set_text("nightly review");
+            }
+            other => panic!("expected the name prompt, got {other:?}"),
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "the name alone creates nothing");
+        match &mut app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert!(matches!(p.kind, PromptKind::NewTaskPrompt { .. }));
+                assert!(p.is_multiline());
+                p.input.set_text("/code-review");
+            }
+            other => panic!("expected the prompt prompt, got {other:?}"),
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        match out.as_slice() {
+            [ClientRequest::CreateTask { spec, .. }] => {
+                assert_eq!(spec.name, "nightly review");
+                assert_eq!(spec.prompt, "/code-review");
+                assert_eq!(spec.cron, None, "manual until scheduled deliberately");
+                assert_eq!(spec.iterations, 1, "no loop until asked for");
+                assert!(!spec.unattended, "permissions stay on by default");
+                assert!(spec.enabled);
+            }
+            other => panic!("expected CreateTask, got {other:?}"),
+        }
+    }
+
+    /// An empty prompt is refused client-side too, so the user gets the
+    /// message next to the field rather than a daemon error after the fact.
+    #[test]
+    fn a_task_with_no_prompt_is_refused_before_it_is_sent() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+            p.input.set_text("t");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // Submit the prompt step empty.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "nothing was sent: {out:?}");
+        assert!(
+            app.flash
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs a prompt"),
+            "flash says why: {:?}",
+            app.flash
+        );
+        // And the editor is still up, on the text that was typed, so the
+        // correction happens in place.
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::NewTaskPrompt { .. })
+            ),
+            "the prompt stays open: {:?}",
+            app.overlay
+        );
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {

@@ -103,6 +103,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         agents: vec![],
                         terminals: vec![],
                         links: vec![],
+                        tasks: vec![],
                         pr_seen: vec![],
                         ui_state: None,
                     });
@@ -519,6 +520,38 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::DeleteLink { req_id, id } => {
                     reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
+                }
+                ClientRequest::CreateTask { req_id, spec } => {
+                    reply(&out_tx, req_id, daemon.create_task(spec).map(Some)).await;
+                }
+                ClientRequest::UpdateTask { req_id, id, spec } => {
+                    reply(&out_tx, req_id, daemon.update_task(&id, spec).map(|_| None)).await;
+                }
+                ClientRequest::DeleteTask { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.delete_task(&id).map(|_| None)).await;
+                }
+                ClientRequest::SetTaskEnabled {
+                    req_id,
+                    id,
+                    enabled,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_task_enabled(&id, enabled).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::RunTaskNow { req_id, id } => {
+                    // A run can create a worktree and probe for the agent
+                    // CLI, so it goes off the request loop the way
+                    // DeleteWorktree does — the Ack still reports whether
+                    // the session actually started.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply(&out_tx, req_id, daemon.run_task(&id).await.map(|_| None)).await;
+                    });
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(

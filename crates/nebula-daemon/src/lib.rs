@@ -5,6 +5,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod pty;
 pub mod registry;
+pub mod schedule;
 pub mod server;
 pub mod status;
 pub mod store;
@@ -84,6 +85,11 @@ async fn serve() -> Result<()> {
                 // still carries the old checkout's cwd, which must be seen
                 // (and ignored) while the relocation is still pending.
                 daemon.complete_pending_move(&agent_id, &event);
+                // A task loop's next iteration waits for the same turn-end
+                // signal. After the relocation on purpose: a relocating
+                // session is about to be killed and respawned, so pasting a
+                // prompt at it first would be typing into a dead PTY.
+                daemon.continue_task_loop(&agent_id, &event);
             }
         });
     }
@@ -130,6 +136,27 @@ async fn serve() -> Result<()> {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
                     _ = interval.tick() => daemon.reap_idle_sessions(),
+                }
+            }
+        });
+    }
+
+    // Scheduled tasks: start every task whose cron window has come around.
+    // Its own loop for the same reason the reaper has one — the e2e needs to
+    // drive it far faster than a real schedule ever would.
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let period = std::env::var("NEBULA_SCHEDULER_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30_000)
+                .max(50);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = interval.tick() => daemon.tick_scheduler().await,
                 }
             }
         });

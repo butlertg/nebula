@@ -4,8 +4,8 @@ use crate::git_diff::DiffFile;
 use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef,
-    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef, Task,
+    TaskId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -54,6 +54,15 @@ pub enum HitTarget {
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
+    /// One of the right-hand pane's tabs — TERMINAL or AUTOMATION.
+    /// Registered before the pane's own body targets, since `hit_at` is
+    /// first-match.
+    PaneTab(PaneMode),
+    /// Row in the Automation pane's task list.
+    TaskRow(usize),
+    /// Row in the Automation pane's detail column (index into
+    /// `TaskField::ALL`).
+    TaskField(usize),
     /// Draggable vertical boundary between panels, left to right:
     /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
     Splitter(usize),
@@ -279,6 +288,9 @@ pub enum PendingAction {
         reopen_picker: Option<usize>,
     },
     DeleteLink(LinkId),
+    /// `d` on a task in the Automation pane. A run already in flight keeps
+    /// its session — only the definition and its loop go.
+    DeleteTask(TaskId),
     /// `R` in the settings overlay: rewrite config.json from the defaults
     /// (every setting and every hotkey), then reopen the overlay on them.
     ResetSettings,
@@ -339,6 +351,34 @@ pub enum PromptKind {
     EditLink {
         id: LinkId,
     },
+    /// Name for a new task, asked first; its prompt follows in
+    /// `NewTaskPrompt`. Two prompts rather than a form, the same way a cloud
+    /// launch asks for a name and then a task.
+    NewTask {
+        project: ProjectId,
+    },
+    /// The new task's prompt, carrying the name already given. Multiline:
+    /// a task prompt is as long as the work it describes.
+    NewTaskPrompt {
+        project: ProjectId,
+        name: String,
+    },
+    TaskName {
+        id: TaskId,
+    },
+    /// Rewrite a task's prompt (multiline).
+    TaskPrompt {
+        id: TaskId,
+    },
+    /// A task's cron expression; empty clears it back to manual-only.
+    TaskSchedule {
+        id: TaskId,
+    },
+    /// The prompt a loop's final turn gets instead of the usual one
+    /// (multiline); empty clears it back to "same prompt every turn".
+    TaskFinalPrompt {
+        id: TaskId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +424,13 @@ impl PromptDialog {
 
     /// The Claude Cloud task is the only prompt with a multi-row editor.
     pub fn is_multiline(&self) -> bool {
-        matches!(self.kind, PromptKind::ClaudeCloudTask { .. })
+        matches!(
+            self.kind,
+            PromptKind::ClaudeCloudTask { .. }
+                | PromptKind::NewTaskPrompt { .. }
+                | PromptKind::TaskPrompt { .. }
+                | PromptKind::TaskFinalPrompt { .. }
+        )
     }
 
     fn home() -> Option<std::path::PathBuf> {
@@ -1257,6 +1303,11 @@ pub enum Overlay {
     Confirm(ConfirmDialog),
     Prompt(PromptDialog),
     Help,
+    /// The Automation tab's own cheatsheet. Separate from `Help` because
+    /// the pane is modal — its keys only work inside it — and because the
+    /// half worth explaining is the *fields*, which a two-column list of
+    /// chords has no room for.
+    AutomationHelp,
     Settings(SettingsView),
     Diff(DiffView),
     Palette(Palette),
@@ -1295,6 +1346,9 @@ pub enum PendingIntent {
     SelectCreatedWorktree,
     /// Move the Sessions panel's cursor onto the link just created.
     SelectCreatedLink,
+    /// Put the Automation pane's cursor on the task just created, so the
+    /// fields shown are the ones you are about to fill in.
+    SelectCreatedTask,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1581,6 +1635,118 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
     best
 }
 
+/// What the right-hand pane is showing. The terminal by default; the
+/// AUTOMATION tab swaps in the selected project's tasks, the same way a
+/// selected pull request already swaps in the PR reader. Per-process, like
+/// the settings overlay's cursor — a fresh nebula opens on the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneMode {
+    #[default]
+    Terminal,
+    Automation,
+}
+
+/// Cursor state for the Automation pane: which task in the list, and which
+/// of its fields when the cursor has stepped into the detail column.
+#[derive(Debug, Clone, Default)]
+pub struct AutomationView {
+    /// Row in the selected project's task list.
+    pub selected: usize,
+    /// Row in the detail column, meaningful only while `on_detail`.
+    pub field: usize,
+    /// The cursor is in the detail column rather than the list.
+    pub on_detail: bool,
+    /// First visible list row — the same stateless follow-window every other
+    /// list here uses, written during draw.
+    pub first_row: usize,
+    pub list_area: Rect,
+    pub detail_area: Rect,
+}
+
+/// One editable line in the Automation pane's detail column.
+///
+/// Most fields cycle through a fixed set of choices, exactly like a Settings
+/// row, so they need no text editing at all. The three that are free text
+/// (`Name`, `Prompt`, `Schedule`) open the existing prompt overlay instead of
+/// a bespoke form — `Prompt` in its multiline mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskField {
+    Name,
+    Prompt,
+    Agent,
+    Model,
+    Effort,
+    Schedule,
+    Iterations,
+    FinalPrompt,
+    Unattended,
+    StallTimeout,
+    CommitOnFinish,
+    Target,
+    Enabled,
+}
+
+impl TaskField {
+    pub const ALL: [TaskField; 13] = [
+        TaskField::Name,
+        TaskField::Prompt,
+        TaskField::Agent,
+        TaskField::Model,
+        TaskField::Effort,
+        TaskField::Schedule,
+        TaskField::Iterations,
+        // Directly under `iterations`: it is the last one of them, and the
+        // pair only makes sense read together.
+        TaskField::FinalPrompt,
+        TaskField::Unattended,
+        TaskField::StallTimeout,
+        TaskField::CommitOnFinish,
+        TaskField::Target,
+        TaskField::Enabled,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TaskField::Name => "name",
+            TaskField::Prompt => "prompt",
+            TaskField::Agent => "agent",
+            TaskField::Model => "model",
+            TaskField::Effort => "effort",
+            TaskField::Schedule => "schedule",
+            TaskField::Iterations => "iterations",
+            TaskField::FinalPrompt => "wrap-up",
+            TaskField::Unattended => "unattended",
+            TaskField::StallTimeout => "stall limit",
+            TaskField::CommitOnFinish => "commit",
+            TaskField::Target => "run in",
+            TaskField::Enabled => "enabled",
+        }
+    }
+
+    /// Free-text fields open a prompt; everything else cycles in place.
+    pub fn is_text(&self) -> bool {
+        matches!(
+            self,
+            TaskField::Name | TaskField::Prompt | TaskField::Schedule | TaskField::FinalPrompt
+        )
+    }
+}
+
+/// Width of the label column in the automation detail pane. A label longer
+/// than this runs straight into its own `[value]` — see
+/// `every_task_field_label_fits_the_detail_column`.
+pub const TASK_LABEL_W: usize = 12;
+
+/// Iteration counts the pane cycles through. A loop's only stop condition is
+/// running out of iterations, so the list stops well short of
+/// `MAX_TASK_ITERATIONS` — the cap is a guard rail, not a suggestion.
+pub const TASK_ITERATION_CHOICES: [u32; 7] = [1, 2, 3, 5, 8, 13, 20];
+
+/// Watchdog windows the pane cycles through, in seconds. 0 is "wait
+/// forever", kept last so it takes a deliberate step past every real value
+/// to reach — it is the setting that lets an overnight run hang.
+pub const TASK_STALL_CHOICES: [u32; 6] = [300, 900, 1_800, 3_600, 7_200, 0];
+
 /// Client-side mirror of the entity tree. `projects` holds EVERY workspace's
 /// projects; the panels scope to `active_workspace` (see
 /// [`App::project_rows`]), so a workspace switch is a pure re-filter — no
@@ -1599,6 +1765,9 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub links: Vec<Link>,
+    /// Unattended tasks, project-scoped. Read-only here: every field is
+    /// daemon-owned, and the Automation pane edits them by request.
+    pub tasks: Vec<Task>,
 }
 
 impl Tree {
@@ -1921,6 +2090,11 @@ pub struct App {
     /// puts it somewhere, so a fresh overlay opens with the strip focused
     /// and ←/→ immediately mean "walk the tabs".
     pub settings_on_tabs: bool,
+    /// Which tenant of the right-hand pane is on screen, and the Automation
+    /// tab's own cursor. Deliberately not in `UiState`: the pane's job at
+    /// launch is to show the session the cursor came back to.
+    pub pane_mode: PaneMode,
+    pub automation: AutomationView,
     /// Hotkeys as the panels dispatch them: `config.keymap()`, cached here
     /// because a keymap lookup happens on every single key press. The
     /// event loop refreshes it at startup and whenever a binding changes.
@@ -2097,6 +2271,8 @@ impl App {
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
+            pane_mode: PaneMode::default(),
+            automation: AutomationView::default(),
             keymap: crate::keymap::Keymap::default(),
             splitter_drag: None,
             hover_splitter: None,
@@ -2287,6 +2463,42 @@ impl App {
     /// The project giving the current selection its context.
     pub fn selected_project(&self) -> Option<&Project> {
         self.tree.projects.get(self.selected_project_index()?)
+    }
+
+    /// Tasks of the project under the cursor, in list order. The Automation
+    /// pane is scoped to the selection rather than to a project it was
+    /// opened on, so walking the Projects column re-scopes it — the same way
+    /// every other pane tenant follows the cursor.
+    pub fn project_tasks(&self) -> Vec<&Task> {
+        let Some(project) = self.selected_project() else {
+            return Vec::new();
+        };
+        self.tree
+            .tasks
+            .iter()
+            .filter(|t| t.project_id == project.id)
+            .collect()
+    }
+
+    /// The task the Automation pane's cursor is on.
+    pub fn selected_task(&self) -> Option<&Task> {
+        let tasks = self.project_tasks();
+        tasks.get(self.automation.selected).copied()
+    }
+
+    /// Clamp the Automation cursor after the list changed under it (a task
+    /// deleted elsewhere, a workspace switch, a different project selected).
+    pub fn clamp_automation(&mut self) {
+        let len = self.project_tasks().len();
+        if self.automation.selected >= len {
+            self.automation.selected = len.saturating_sub(1);
+        }
+        if self.automation.field >= TaskField::ALL.len() {
+            self.automation.field = 0;
+        }
+        if len == 0 {
+            self.automation.on_detail = false;
+        }
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
@@ -2722,6 +2934,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detail pane pads each label to `TASK_LABEL_W` and then writes the
+    /// value straight after it, so a longer label does not wrap or truncate
+    /// — it shunts its own value one cell right and collides with it. Caught
+    /// exactly that way with a 13-character "give up after".
+    #[test]
+    fn every_task_field_label_fits_the_detail_column() {
+        for field in TaskField::ALL {
+            let label = field.label();
+            assert!(
+                label.len() <= TASK_LABEL_W,
+                "`{label}` is {} chars, and the column is {TASK_LABEL_W}",
+                label.len()
+            );
+        }
+    }
+
+    /// Every field is reachable: the pane walks `ALL` by index, so one left
+    /// out of the array is a field the user can never see or edit.
+    #[test]
+    fn every_task_field_is_listed_once() {
+        let mut seen = TaskField::ALL.to_vec();
+        let before = seen.len();
+        seen.sort_by_key(|f| f.label());
+        seen.dedup();
+        assert_eq!(seen.len(), before, "a TaskField is listed twice in ALL");
+    }
 
     // ---- worktree links ----
 

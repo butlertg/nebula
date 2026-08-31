@@ -84,6 +84,9 @@ pub enum Action {
     // terminal
     Zoom,
     UnlockTerminal,
+    /// Flip the right-hand pane between the live session and the selected
+    /// project's automation.
+    ToggleAutomation,
     // general
     Workspaces,
     ToggleWorkspaces,
@@ -395,6 +398,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "TERMINAL",
         scope: Scope::Global,
         defaults: &["z"],
+    },
+    ActionSpec {
+        action: Action::ToggleAutomation,
+        id: "toggle_automation",
+        label: "Automation",
+        hint: "Show the selected project's scheduled and looping tasks in the pane",
+        group: "TERMINAL",
+        scope: Scope::Global,
+        defaults: &["e"],
     },
     ActionSpec {
         action: Action::UnlockTerminal,
