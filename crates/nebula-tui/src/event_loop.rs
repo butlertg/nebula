@@ -2889,7 +2889,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
     };
     match overlay {
         Overlay::Settings(_) => {}
-        Overlay::Help => {
+        Overlay::Help | Overlay::AutomationHelp => {
             if matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
@@ -6814,6 +6814,13 @@ fn handle_automation_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientReque
     let tasks: Vec<Task> = app.project_tasks().into_iter().cloned().collect();
     let fields = TaskField::ALL.len();
     match key.code {
+        // The pane's keys are its own, so its help is too. Claimed here
+        // rather than through the global `?` so it only ever appears where
+        // these keys actually do something.
+        KeyCode::Char('?') => {
+            app.overlay = Some(Overlay::AutomationHelp);
+            true
+        }
         // New task: name first, then its prompt — the chained-prompt idiom
         // the cloud launch already uses for "two things before a create".
         KeyCode::Char('n') => {
@@ -12853,6 +12860,85 @@ diff --git a/src/b.rs b/src/b.rs
             matches!(out.as_slice(), [ClientRequest::DeleteTask { .. }]),
             "got {out:?}"
         );
+    }
+
+    /// The pane is modal, so its help is too: `?` inside it explains its own
+    /// keys and fields, and `?` outside it still opens the global help.
+    #[test]
+    fn question_mark_in_the_automation_pane_opens_its_own_cheatsheet() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        let mut out = Vec::new();
+
+        // Outside the pane, `?` is the global help.
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::AutomationHelp)),
+            "inside the pane it is the pane's own help: {:?}",
+            app.overlay
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Automation"), "titled:\n{text}");
+        // The three fields this window exists to explain.
+        for needle in ["wrap-up", "stall limit", "commit"] {
+            assert!(text.contains(needle), "missing `{needle}`:\n{text}");
+        }
+        // And what a finished run will say, which is the other half of
+        // reading the pane.
+        for needle in ["ran N of N", "stalled", "skipped"] {
+            assert!(text.contains(needle), "missing `{needle}`:\n{text}");
+        }
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "esc closes it");
+        assert_eq!(
+            app.pane_mode,
+            PaneMode::Automation,
+            "and leaves the pane where it was"
+        );
+    }
+
+    /// The cheatsheet names fields by their pane labels. If a label is
+    /// renamed and the window is not, the help starts describing something
+    /// the user cannot find — so the labels it quotes have to be real ones.
+    #[test]
+    fn the_automation_cheatsheet_quotes_real_field_labels() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_task(&mut app, "t1", "nightly review", None, 1);
+        app.pane_mode = PaneMode::Automation;
+        app.focus = Focus::Terminal;
+        app.overlay = Some(Overlay::AutomationHelp);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        for field in [
+            TaskField::Prompt,
+            TaskField::Schedule,
+            TaskField::Iterations,
+            TaskField::FinalPrompt,
+            TaskField::Unattended,
+            TaskField::StallTimeout,
+            TaskField::CommitOnFinish,
+            TaskField::Target,
+        ] {
+            assert!(
+                text.contains(field.label()),
+                "the cheatsheet does not mention `{}`:\n{text}",
+                field.label()
+            );
+        }
     }
 
     /// Keys the pane doesn't own must still walk out of it, or the pane is a

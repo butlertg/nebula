@@ -476,6 +476,119 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 p.list_area = list_area;
             }
         }
+        Overlay::AutomationHelp => {
+            // Two columns like `Help`, but the split is keys-versus-meaning
+            // rather than panel-versus-panel: what the pane's chords do on
+            // the left, what the fields and outcomes mean on the right.
+            // Only `e` is rebindable — everything else belongs to the pane
+            // itself, so it is a literal.
+            type Row = (&'static str, &'static str);
+            type Section = (&'static str, &'static [Row]);
+            let toggle = app.keymap.label(crate::keymap::Action::ToggleAutomation);
+            let keys: &[Section] = &[(
+                "KEYS",
+                &[
+                    ("n", "new task (name, then prompt)"),
+                    ("r", "run this task now"),
+                    ("space", "enable / disable"),
+                    ("d", "delete"),
+                    ("↑↓ / kj", "move between tasks"),
+                    ("→ / enter", "step into the fields"),
+                    ("←→", "change the value"),
+                    ("enter", "edit (text opens an editor)"),
+                    ("esc / ↑", "back to the task list"),
+                    ("tab", "leave the pane"),
+                ],
+            )];
+            let meaning: &[Section] = &[
+                (
+                    "FIELDS",
+                    &[
+                        ("prompt", "typed at the agent every turn"),
+                        ("schedule", "cron — 5 fields, or 6 for seconds"),
+                        ("iterations", "how many turns; the only exit"),
+                        ("wrap-up", "replaces the prompt on the LAST turn"),
+                        ("unattended", "launch with skip-permissions on"),
+                        ("stall limit", "give up if a turn never ends"),
+                        ("commit", "snapshot to task/<name>/<time>"),
+                        ("run in", "main checkout, a worktree, or its own"),
+                    ],
+                ),
+                (
+                    "HOW A RUN ENDS",
+                    &[
+                        ("ran N of N", "it used every turn"),
+                        ("stopped", "session died, or it asked a question"),
+                        ("stalled", "no turn ended inside the stall limit"),
+                        ("skipped", "the previous run was still going"),
+                    ],
+                ),
+            ];
+            let rows = |sections: &[Section]| -> u16 {
+                sections
+                    .iter()
+                    .map(|(_, e)| e.len() as u16 + 1)
+                    .sum::<u16>()
+                    + sections.len().saturating_sub(1) as u16
+            };
+            // +2 for the border, +2 for the footer line and its blank.
+            let height = rows(keys).max(rows(meaning)) + 4;
+            let area = centered_rect(f.area(), 100, height);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(th.accent))
+                .title(" Automation ");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let [body, footer] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            // A fixed left column rather than a percentage: the key names
+            // there are short and the field names on the right are not, so
+            // an even split starves the side that needs the room.
+            let [left_a, right_a] =
+                Layout::horizontal([Constraint::Length(41), Constraint::Min(1)]).areas(body);
+            // `key_w` is per column for the same reason — 11 fits the longest
+            // chord with a gutter, 12 the longest field label.
+            let column = |sections: &[Section], width: u16, key_w: usize| -> Vec<Line> {
+                let mut lines = Vec::new();
+                for (i, (title, entries)) in sections.iter().enumerate() {
+                    if i > 0 {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!(" {title}"),
+                        Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+                    )));
+                    for (k, v) in *entries {
+                        let key = truncate(k, key_w);
+                        lines.push(Line::from(vec![
+                            Span::styled(format!(" {key:<key_w$}"), Style::default().fg(th.accent)),
+                            Span::styled(
+                                truncate(v, (width as usize).saturating_sub(key_w + 2)),
+                                Style::default().fg(th.dim),
+                            ),
+                        ]));
+                    }
+                }
+                lines
+            };
+            f.render_widget(Paragraph::new(column(keys, left_a.width, 11)), left_a);
+            f.render_widget(Paragraph::new(column(meaning, right_a.width, 12)), right_a);
+            // The one thing a reader of this window cannot discover from
+            // inside it: how they got here, and that a wrap-up needs a
+            // spare turn to land on.
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(
+                        " {toggle} toggles this tab  ·  a wrap-up needs 2+ iterations  ·  esc closes"
+                    ),
+                    Style::default().fg(th.dim),
+                )),
+                footer,
+            );
+        }
         Overlay::Help => {
             // Grouped keymap in two columns: reads by task instead of one
             // giant list, and at ~24 rows it fits a stock terminal window
@@ -558,6 +671,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
                         (Act(&[UnlockTerminal]), "unlock, back to panels"),
+                        (
+                            Act(&[ToggleAutomation]),
+                            "automation tab (? in it for its keys)",
+                        ),
                         (Lit("drag"), "select + copy (2×click: word)"),
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),

@@ -1303,6 +1303,11 @@ pub enum Overlay {
     Confirm(ConfirmDialog),
     Prompt(PromptDialog),
     Help,
+    /// The Automation tab's own cheatsheet. Separate from `Help` because
+    /// the pane is modal — its keys only work inside it — and because the
+    /// half worth explaining is the *fields*, which a two-column list of
+    /// chords has no room for.
+    AutomationHelp,
     Settings(SettingsView),
     Diff(DiffView),
     Palette(Palette),
