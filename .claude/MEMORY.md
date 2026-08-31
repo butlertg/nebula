@@ -71,6 +71,15 @@ with seeded rows.
   `ListTaskRuns`. `the_list_toggles_with_space_and_delete_asks_first` filters it out.
 - **Nothing prunes run directories.** Rows cascade away with their task; the files on disk stay for the
   user to read or `rm`. Deliberate — "keep as needed" was the ask — but the disk grows.
+- **`gh` defaults to the *upstream* remote here, not `origin`.** This checkout has `origin =
+  butlertg/nebula` and `upstream = AgentSystemLabs/nebula`, and `gh pr create` resolves to the latter —
+  which fails with the very misleading `No commits between main and feat/task-automation` (plus "Head sha
+  can't be blank"), because that repo's `main` is unrelated to the branch. `gh pr list` likewise lists the
+  wrong repo's PRs. Pass `-R butlertg/nebula` (or `gh api repos/butlertg/nebula/pulls`) for anything
+  PR-shaped.
+- **`make install` writes to `$(HOME)/.cargo/bin` by default, which does not exist on this machine**
+  (rust is from homebrew, and the live binary is `~/.local/bin/nebula`). It fails with `cp: …/nebula.new:
+  No such file or directory` — run `make install PREFIX="$HOME/.local/bin"`.
 - **A socket path under the scratchpad is too long for a unix socket** (`path must be shorter than
   SUN_LEN`): smoke-testing the CLI needs `NEBULA_RUNTIME_DIR` under something like `mktemp -d /tmp/neb.XXXX`.
 
