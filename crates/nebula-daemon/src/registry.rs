@@ -3,15 +3,18 @@
 
 use crate::git;
 use crate::hooks::{self, HookEnv};
+use crate::pty::dialog::{self, StartupDialog};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec};
+use crate::report::{self, ReportInput};
 use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
+use chrono::TimeZone;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Project,
-    ProjectId, ServerEvent, SessionRef, Task, TaskId, TaskSpec, TaskTarget, TerminalId,
-    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
-    MAX_TASK_ITERATIONS,
+    paths, Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
+    Project, ProjectId, RunArtifact, ServerEvent, SessionRef, Task, TaskId, TaskRun, TaskRunId,
+    TaskRunStatus, TaskSpec, TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
+    WorktreeId, MAX_CLOUD_PROMPT_BYTES, MAX_TASK_ITERATIONS,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +44,10 @@ const TASK_PROMPT_DELAY_MS: u64 = 2_500;
 /// bracketed paste asynchronously, and a submit that arrives in the same
 /// read as the paste lands as a newline inside the text instead.
 const SUBMIT_GAP: Duration = Duration::from_millis(250);
+/// How long to give the CLI to redraw after its startup dialog is answered.
+/// The paste that follows must land in the input box, not in the frame the
+/// dialog was still occupying.
+const DIALOG_SETTLE: Duration = Duration::from_millis(750);
 /// Ceiling on how long a run may sit before its *first* turn even starts.
 /// Much shorter than the task's own watchdog, because this is a different
 /// failure: a turn that is running can legitimately take half an hour, but a
@@ -62,6 +69,11 @@ fn first_prompt_delay() -> Duration {
 /// have been claimed, and how many there are in total.
 struct LoopState {
     task_id: TaskId,
+    /// The row and directory this run is recording itself into. Carried on
+    /// the loop so every stop path — completion, stall, question, dead
+    /// session — finishes the same record without having to guess which of a
+    /// task's runs it is ending.
+    run_id: TaskRunId,
     /// Iterations claimed, incremented as a delivery is scheduled rather
     /// than when its bytes land. A write that fails therefore costs an
     /// iteration instead of repeating one — the right way round, since the
@@ -94,6 +106,9 @@ struct SpawnOpts<'a> {
     /// Launch with the CLI's skip-permissions flag because nothing is
     /// watching to answer a prompt (a task marked unattended).
     unattended: bool,
+    /// Write everything the child prints to this file as well as the ring.
+    /// Only task runs ask for one — see `pty::transcript`.
+    transcript: Option<PathBuf>,
 }
 
 /// Argv-shaping flags that aren't properties of the Agent row.
@@ -2255,10 +2270,18 @@ impl Daemon {
                 "run stalled past its watchdog"
             );
             let summary = if never_started {
+                // What the CLI is holding, in its own words where possible:
+                // "session exited (1)" sent one debugging session digging
+                // through a raw PTY transcript to find a modal.
+                let waiting_on = self
+                    .session(&SessionRef::Agent(agent.clone()))
+                    .and_then(|s| dialog::visible(&s.snapshot(None).1))
+                    .map(|d| d.describe().to_string())
+                    .unwrap_or_else(|| "something that is not a prompt box".into());
                 format!(
-                    "stalled: no turn started in {} — a checkout the CLI has not seen \
-                     before opens with a trust prompt that swallows the task's first prompt",
-                    mins_label(window)
+                    "stalled: no turn started in {} — the CLI is waiting at {}",
+                    mins_label(window),
+                    waiting_on
                 )
             } else {
                 format!(
@@ -2268,7 +2291,7 @@ impl Daemon {
                     task.iterations
                 )
             };
-            self.end_task_run(&agent, &task, summary);
+            self.end_task_run(&agent, &task, summary, TaskRunStatus::Stalled);
         }
     }
 
@@ -2279,33 +2302,105 @@ impl Daemon {
     pub async fn run_task(self: &Arc<Self>, id: &TaskId) -> Result<AgentId> {
         let task = self.store.get_task(id)?.context("task not found")?;
         let started = epoch_ms();
-        match self.start_task_run(&task).await {
+        // The record exists before anything can go wrong, so "it never even
+        // started" is a run in the history rather than a silence in it. Every
+        // later step updates this row; nothing else inserts one.
+        let mut run = new_run_record(&task, started);
+        if let Err(e) = self.store.insert_task_run(&run) {
+            // Not fatal: a run that cannot be recorded is still a run worth
+            // doing, and the task row's outcome still reports it.
+            tracing::warn!(task = %task.id, error = %e, "could not open a run record");
+        }
+        self.broadcast(ServerEvent::TaskRunUpserted { run: run.clone() });
+        match self.start_task_run(&task, &mut run).await {
             Ok(agent_id) => {
+                run.agent_id = Some(agent_id.clone());
+                let _ = self.store.update_task_run(&run);
                 self.store
                     .set_task_run_state(&task.id, started, "running", Some(&agent_id))?;
                 self.rebroadcast_task(&task.id);
+                self.broadcast(ServerEvent::TaskRunUpserted { run });
                 Ok(agent_id)
             }
             Err(e) => {
                 // The failure is the run's outcome, so it shows in the pane
                 // rather than only in the daemon log.
-                let _ = self.store.set_task_run_state(
-                    &task.id,
-                    started,
-                    &format!("failed: {e:#}"),
-                    None,
-                );
+                let outcome = format!("failed: {e:#}");
+                let _ = self
+                    .store
+                    .set_task_run_state(&task.id, started, &outcome, None);
+                run.ended_at = epoch_ms();
+                run.status = TaskRunStatus::Failed;
+                run.outcome = outcome;
+                let _ = self.store.update_task_run(&run);
+                self.write_run_report(&run, Some(&task), None).await;
                 self.rebroadcast_task(&task.id);
+                self.broadcast(ServerEvent::TaskRunUpserted { run });
                 Err(e)
             }
         }
     }
 
-    async fn start_task_run(self: &Arc<Self>, task: &Task) -> Result<AgentId> {
+    /// Runs whose daemon died under them. Called once at boot: a row that
+    /// still says "running" is lying, and a task whose newest run reads
+    /// running forever is one the user will never trust again.
+    pub fn reconcile_unfinished_runs(self: &Arc<Self>) {
+        let Ok(runs) = self.store.unfinished_task_runs() else {
+            return;
+        };
+        for mut run in runs {
+            tracing::info!(run = %run.id, task = %run.task_id, "closing a run the daemon outlived");
+            run.ended_at = epoch_ms();
+            run.status = TaskRunStatus::Stopped;
+            run.outcome = format!(
+                "stopped: the daemon restarted at iteration {} of {}",
+                run.iterations_done.max(1),
+                run.iterations_planned
+            );
+            let _ = self.store.update_task_run(&run);
+            // The task row is only corrected when it is still showing this
+            // run — a later run's outcome must not be overwritten by an old
+            // one being tidied up.
+            if let Ok(Some(task)) = self.store.get_task(&run.task_id) {
+                if task.last_outcome.as_deref() == Some("running")
+                    && task.last_run_at == run.started_at
+                {
+                    let _ = self.store.set_task_run_state(
+                        &task.id,
+                        task.last_run_at,
+                        &run.outcome,
+                        run.agent_id.as_ref(),
+                    );
+                }
+            }
+        }
+    }
+
+    async fn start_task_run(self: &Arc<Self>, task: &Task, run: &mut TaskRun) -> Result<AgentId> {
         let worktree = self.resolve_task_worktree(task).await?;
         if !self.cli_available_for_create(task.kind).await {
             bail!("{}", cli_missing_message(task.kind));
         }
+        run.worktree_path = worktree.path.clone();
+        run.branch = worktree.branch.clone();
+        // The base ref is written before the agent starts, so the diff at the
+        // end is the run's own work and not whatever the checkout was already
+        // carrying. Best effort: a repo git cannot snapshot still gets a run,
+        // it just gets one whose report says it has no diff.
+        match git::snapshot_ref(
+            &worktree.path,
+            &run_ref(&run.id, "base"),
+            &format!("[nebula] task `{}` — the tree before the run", task.name),
+        )
+        .await
+        {
+            Ok(sha) => run.base_ref = Some(sha),
+            Err(e) => {
+                tracing::warn!(task = %task.id, error = %e, "could not record the run's base tree")
+            }
+        }
+        let _ = self.store.update_task_run(run);
+
         let agent = Agent {
             id: AgentId::generate(),
             worktree_id: worktree.id.clone(),
@@ -2337,6 +2432,9 @@ impl Daemon {
             24,
             SpawnOpts {
                 unattended: task.unattended,
+                // Nobody is watching, so the scrollback ring is not a record
+                // of anything — the file is.
+                transcript: Some(run.transcript_path()),
                 ..SpawnOpts::default()
             },
         );
@@ -2345,12 +2443,14 @@ impl Daemon {
             agent.id.clone(),
             LoopState {
                 task_id: task.id.clone(),
+                run_id: run.id.clone(),
                 delivered: 1,
                 total: task.iterations,
                 in_flight: true,
                 last_progress_at: epoch_ms(),
             },
         );
+        run.iterations_done = 1;
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -2359,7 +2459,7 @@ impl Daemon {
         // Iteration 1 goes through the same paste-and-submit path as every
         // later one, so a slash command runs the way it would for a human
         // and codex/cursor (which take no initial prompt at all) work too.
-        self.deliver_task_prompt(&agent.id, task, 1, first_prompt_delay());
+        self.deliver_task_prompt(&agent.id, task, 1, first_prompt_delay(), Some(run));
         Ok(agent.id)
     }
 
@@ -2427,6 +2527,7 @@ impl Daemon {
             let Some(state) = loops.get_mut(id) else {
                 return;
             };
+            let run_id = state.run_id.clone();
             if state.in_flight {
                 return;
             }
@@ -2435,15 +2536,16 @@ impl Daemon {
             state.last_progress_at = epoch_ms();
             if state.delivered >= state.total {
                 let task_id = state.task_id.clone();
-                loops.remove(id);
-                (task_id, None)
+                // Left in place: `end_task_run` removes it, and it is what
+                // tells the finisher which record to close.
+                (task_id, None, run_id)
             } else {
                 state.delivered += 1;
                 state.in_flight = true;
-                (state.task_id.clone(), Some(state.delivered))
+                (state.task_id.clone(), Some(state.delivered), run_id)
             }
         };
-        let (task_id, iteration) = next;
+        let (task_id, iteration, run_id) = next;
         let Ok(Some(task)) = self.store.get_task(&task_id) else {
             // Task deleted mid-run: leave the session alone, just stop.
             self.task_loops.lock().unwrap().remove(id);
@@ -2452,12 +2554,25 @@ impl Daemon {
         match iteration {
             Some(n) => {
                 tracing::info!(agent = %id, task = %task_id, iteration = n, "delivering next task iteration");
-                self.deliver_task_prompt(id, &task, n, Duration::from_millis(0));
+                // Progress goes on the record as it happens: a run killed
+                // mid-flight is then honest about how far it got even if the
+                // finisher never runs.
+                let run = self
+                    .store
+                    .get_task_run(&run_id)
+                    .ok()
+                    .flatten()
+                    .map(|mut r| {
+                        r.iterations_done = n;
+                        let _ = self.store.update_task_run(&r);
+                        r
+                    });
+                self.deliver_task_prompt(id, &task, n, Duration::from_millis(0), run.as_ref());
             }
             None => {
                 tracing::info!(agent = %id, task = %task_id, "task run finished its iterations");
                 let summary = format!("ran {} of {}", task.iterations, task.iterations);
-                self.end_task_run(id, &task, summary);
+                self.end_task_run(id, &task, summary, TaskRunStatus::Completed);
             }
         }
     }
@@ -2507,7 +2622,7 @@ impl Daemon {
             "stopped: asked for input at iteration {} of {}",
             delivered, task.iterations
         );
-        self.end_task_run(id, &task, summary);
+        self.end_task_run(id, &task, summary, TaskRunStatus::Stopped);
         true
     }
 
@@ -2540,44 +2655,216 @@ impl Daemon {
             "stopped: {} at iteration {} of {}",
             how, delivered, task.iterations
         );
-        self.end_task_run(id, &task, summary);
+        self.end_task_run(id, &task, summary, TaskRunStatus::Stopped);
     }
 
     /// The one way a run stops — completion, stall, question, or a dead
     /// session all come through here. Drops the loop first (so a late
-    /// turn-end cannot revive it), records the outcome, and then, if the
-    /// task asked for it, captures the checkout on a branch of its own.
-    fn end_task_run(self: &Arc<Self>, agent: &AgentId, task: &Task, summary: String) {
-        self.task_loops.lock().unwrap().remove(agent);
+    /// turn-end cannot revive it), records the outcome, and then, off the hot
+    /// path, works out what the run actually did.
+    ///
+    /// A run whose loop is already gone has already ended: returning here is
+    /// what keeps two racing stop paths from writing two outcomes.
+    fn end_task_run(
+        self: &Arc<Self>,
+        agent: &AgentId,
+        task: &Task,
+        summary: String,
+        status: TaskRunStatus,
+    ) {
+        let Some(state) = self.task_loops.lock().unwrap().remove(agent) else {
+            return;
+        };
         let _ = self
             .store
             .set_task_run_state(&task.id, task.last_run_at, &summary, Some(agent));
         self.rebroadcast_task(&task.id);
-        if !task.commit_on_finish {
-            return;
-        }
-        // Off the hot path: this shells out to git four times, and the hook
-        // drain that usually calls us is holding up the next turn.
+        // Off the hot path: this shells out to git several times and writes a
+        // file, and the hook drain that usually calls us is holding up the
+        // next turn of every other session.
         let daemon = self.clone();
         let agent = agent.clone();
         let task = task.clone();
         tokio::spawn(async move {
-            let extra = match daemon.snapshot_task_run(&agent, &task).await {
-                Ok(Some(where_)) => format!(" · {where_}"),
-                Ok(None) => " · nothing to commit".to_string(),
+            daemon
+                .finish_run_record(
+                    state.run_id,
+                    state.delivered,
+                    &agent,
+                    &task,
+                    summary,
+                    status,
+                )
+                .await;
+        });
+    }
+
+    /// Everything a finished run leaves behind: the head ref, the diff
+    /// against the base recorded at the start, the optional snapshot branch,
+    /// the report, and a task outcome line that now carries the diffstat.
+    async fn finish_run_record(
+        self: &Arc<Self>,
+        run_id: TaskRunId,
+        delivered: u32,
+        agent: &AgentId,
+        task: &Task,
+        summary: String,
+        status: TaskRunStatus,
+    ) {
+        let Ok(Some(mut run)) = self.store.get_task_run(&run_id) else {
+            // No record to finish (an old run from before the table, or a
+            // failed insert): the task row's outcome is already written, and
+            // the snapshot below is the only other thing owed.
+            if task.commit_on_finish {
+                if let Ok(Some(where_)) = self.snapshot_task_run(agent, task).await {
+                    let _ = self.store.set_task_run_state(
+                        &task.id,
+                        task.last_run_at,
+                        &format!("{summary} · {where_}"),
+                        Some(agent),
+                    );
+                    self.rebroadcast_task(&task.id);
+                }
+            }
+            return;
+        };
+        run.ended_at = epoch_ms();
+        run.status = status;
+        run.outcome = summary.clone();
+        run.iterations_done = delivered;
+        run.agent_id = Some(agent.clone());
+
+        let repo = run.worktree_path.clone();
+        let mut diff = None;
+        if repo.is_dir() {
+            match git::snapshot_ref(
+                &repo,
+                &run_ref(&run.id, "head"),
+                &format!("[nebula] task `{}` — the tree after the run", task.name),
+            )
+            .await
+            {
+                Ok(sha) => run.head_ref = Some(sha),
+                Err(e) => {
+                    tracing::warn!(run = %run.id, error = %e, "could not record the run's head tree")
+                }
+            }
+            if let (Some(base), Some(head)) = (run.base_ref.clone(), run.head_ref.clone()) {
+                match git::diff_summary(&repo, &base, &head).await {
+                    Ok(d) => {
+                        run.files_changed = d.files.len() as u32;
+                        run.insertions = d.insertions;
+                        run.deletions = d.deletions;
+                        diff = Some(d);
+                    }
+                    Err(e) => tracing::warn!(run = %run.id, error = %e, "run diff failed"),
+                }
+            }
+        } else {
+            tracing::warn!(run = %run.id, path = %repo.display(), "the run's checkout is gone");
+        }
+
+        if task.commit_on_finish {
+            match self.snapshot_task_run(agent, task).await {
+                Ok(Some(where_)) => run.snapshot = Some(where_),
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(task = %task.id, error = %e, "run snapshot failed");
-                    format!(" · commit failed: {e:#}")
+                    run.snapshot = Some(format!("commit failed: {e:#}"));
                 }
-            };
-            let _ = daemon.store.set_task_run_state(
-                &task.id,
-                task.last_run_at,
-                &format!("{summary}{extra}"),
-                Some(&agent),
-            );
-            daemon.rebroadcast_task(&task.id);
+            }
+        }
+
+        self.write_run_report(&run, Some(task), diff.as_ref()).await;
+        let _ = self.store.update_task_run(&run);
+
+        // The outcome line grows the two things a person scanning the pane
+        // wants next: how much changed, and where it was put.
+        let mut line = summary;
+        if run.files_changed > 0 {
+            line.push_str(&format!(
+                " · {}",
+                report::diffstat_label(run.files_changed, run.insertions, run.deletions)
+            ));
+        }
+        match run.snapshot.as_deref() {
+            Some(where_) => line.push_str(&format!(" · {where_}")),
+            None if task.commit_on_finish => line.push_str(" · nothing to commit"),
+            None => {}
+        }
+        let _ = self
+            .store
+            .set_task_run_state(&task.id, task.last_run_at, &line, Some(agent));
+        self.rebroadcast_task(&task.id);
+        self.broadcast(ServerEvent::TaskRunUpserted { run });
+    }
+
+    /// Render `report.md` into the run's directory. Best effort by design:
+    /// nothing about a run should fail because its write-up could not be
+    /// saved, but the daemon log says so when it could not.
+    async fn write_run_report(
+        self: &Arc<Self>,
+        run: &TaskRun,
+        task: Option<&Task>,
+        diff: Option<&git::DiffSummary>,
+    ) {
+        let agent_summary = tokio::fs::read_to_string(run.summary_path()).await.ok();
+        let transcript_bytes = tokio::fs::metadata(run.transcript_path())
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let text = report::render_report(&ReportInput {
+            run,
+            task,
+            diff,
+            agent_summary: agent_summary.as_deref(),
+            transcript_bytes,
         });
+        if let Err(e) = tokio::fs::create_dir_all(&run.dir).await {
+            tracing::warn!(run = %run.id, error = %e, "could not create the run directory");
+            return;
+        }
+        if let Err(e) = tokio::fs::write(run.report_path(), text).await {
+            tracing::warn!(run = %run.id, error = %e, "could not write the run report");
+        }
+    }
+
+    /// Past runs, newest first. `task` None spans every task.
+    pub fn list_task_runs(
+        &self,
+        task: Option<&TaskId>,
+        since_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<TaskRun>> {
+        self.store.list_task_runs(task, since_ms, limit)
+    }
+
+    /// One of a run's files, read off disk. The transcript is tail-capped on
+    /// the way out: a client asking for it wants to see how the run ended,
+    /// not to be sent thirty megabytes of screen repaints.
+    pub async fn read_run_artifact(&self, id: &TaskRunId, part: RunArtifact) -> Result<String> {
+        let run = self
+            .store
+            .get_task_run(id)?
+            .context("no run by that id — it may have been deleted with its task")?;
+        let path = run.dir.join(part.file_name());
+        match part {
+            RunArtifact::Transcript => {
+                let raw = tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("no transcript at {}", path.display()))?;
+                Ok(tail_text(&raw, ARTIFACT_TAIL_BYTES))
+            }
+            _ => tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("no {} at {}", part.file_name(), path.display())),
+        }
+    }
+
+    /// The overnight page across every task.
+    pub fn task_run_digest(&self, since_ms: i64) -> Result<String> {
+        let runs = self.store.list_task_runs(None, since_ms, 0)?;
+        Ok(report::render_digest(&runs, since_ms, epoch_ms()))
     }
 
     /// Capture the run's checkout on `task/<slug>/<stamp>`. Returns the
@@ -2618,9 +2905,14 @@ impl Daemon {
         task: &Task,
         iteration: u32,
         delay: Duration,
+        run: Option<&TaskRun>,
     ) {
         let sref = SessionRef::Agent(id.clone());
-        let text = task_prompt_text(task, iteration);
+        // The last turn is also asked to leave an account of itself. This is
+        // the only summary written by something that knows what the work was
+        // for — the diff says what changed, not why.
+        let summary_path = run.map(|r| r.summary_path());
+        let text = task_prompt_text(task, iteration, summary_path.as_deref());
         let daemon = self.clone();
         let agent_id = id.clone();
         let task_id = task.id.clone();
@@ -2633,6 +2925,16 @@ impl Daemon {
                 daemon.task_loops.lock().unwrap().remove(&agent_id);
                 return;
             };
+            // Iteration 1 is the only one that can meet a startup dialog: it
+            // is the first thing the CLI draws, before it has an input box
+            // at all. Pasting into it would answer it — with "No, exit",
+            // which is what killed every unattended run before this.
+            if iteration == 1 && !daemon.clear_startup_dialog(&session, &agent_id).await {
+                if let Some(state) = daemon.task_loops.lock().unwrap().get_mut(&agent_id) {
+                    state.in_flight = false;
+                }
+                return;
+            }
             let mut paste = b"\x1b[200~".to_vec();
             paste.extend_from_slice(text.as_bytes());
             paste.extend_from_slice(b"\x1b[201~");
@@ -2657,6 +2959,50 @@ impl Daemon {
                 state.last_progress_at = epoch_ms();
             }
         });
+    }
+
+    /// Answer the dialog a freshly spawned CLI may be sitting on, so the
+    /// prompt that follows lands in an input box rather than on a modal.
+    /// Returns whether it is safe to type.
+    ///
+    /// Only the bypass-permissions warning is answered — `pty::dialog` has
+    /// the reasoning for leaving the trust prompt alone. Either way a dialog
+    /// still standing means *do not type*: the run then ends through the
+    /// watchdog, which names what the CLI is waiting on, and that is far
+    /// better than a paste whose Enter silently picks an option.
+    async fn clear_startup_dialog(&self, session: &Arc<PtySession>, agent: &AgentId) -> bool {
+        let (base, before) = session.snapshot(None);
+        let Some(open) = dialog::visible(&before) else {
+            return true;
+        };
+        if open != StartupDialog::BypassPermissions {
+            tracing::warn!(agent = %agent, dialog = ?open, "CLI is holding a dialog nebula will not answer");
+            return false;
+        }
+        tracing::info!(agent = %agent, "accepting the CLI's bypass-permissions warning");
+        // Everything the CLI says from here is its answer to these keys, so
+        // the verification below reads the delta and not the ring — the
+        // dialog's own bytes are still in the scrollback either way.
+        let mark = base + before.len() as u64;
+        if let Err(e) = session.write_input(dialog::ACCEPT_BYPASS_KEYS) {
+            tracing::warn!(agent = %agent, error = %e, "could not answer the bypass warning");
+            return false;
+        }
+        tokio::time::sleep(DIALOG_SETTLE).await;
+        let (_, after) = session.snapshot(Some(mark));
+        // Silence means the keys went nowhere: accepting redraws the whole
+        // screen, so a CLI that took them always says something back.
+        if after.is_empty() {
+            tracing::warn!(agent = %agent, "the bypass warning did not react to being answered");
+            return false;
+        }
+        match dialog::visible(&after) {
+            None => true,
+            Some(still) => {
+                tracing::warn!(agent = %agent, dialog = ?still, "the dialog is still up after being answered");
+                false
+            }
+        }
     }
 
     fn rebroadcast_task(self: &Arc<Self>, id: &TaskId) {
@@ -2789,6 +3135,7 @@ impl Daemon {
             cloud,
             initial_prompt,
             unattended,
+            transcript,
         } = opts;
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
@@ -2860,6 +3207,7 @@ impl Daemon {
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
+            transcript,
         };
         let sref = SessionRef::Agent(agent.id.clone());
         let session = PtySession::spawn(sref, spec)?;
@@ -2954,6 +3302,7 @@ impl Daemon {
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
+            transcript: None,
         };
         let sref = SessionRef::Terminal(terminal.id.clone());
         let session = PtySession::spawn(sref, spec)?;
@@ -3154,14 +3503,14 @@ fn task_run_branch(task: &Task) -> String {
 /// still the only exit, but the run gets to spend its final turn landing the
 /// work rather than being cut off mid-thought. A single-turn task has no turn
 /// to spare, so it never wraps up.
-fn task_prompt_text(task: &Task, iteration: u32) -> String {
+fn task_prompt_text(task: &Task, iteration: u32, summary_path: Option<&Path>) -> String {
     let wrap_up =
         task.iterations > 1 && iteration == task.iterations && task.final_prompt.is_some();
     let body = match (wrap_up, task.final_prompt.as_deref()) {
         (true, Some(f)) => f,
         _ => task.prompt.as_str(),
     };
-    if task.iterations > 1 {
+    let mut text = if task.iterations > 1 {
         format!(
             "[nebula] Task `{}` — iteration {} of {}{}.\n{}",
             task.name,
@@ -3172,7 +3521,97 @@ fn task_prompt_text(task: &Task, iteration: u32) -> String {
         )
     } else {
         format!("[nebula] Task `{}`.\n{}", task.name, body)
+    };
+    // Only on the way out, and only once: an instruction repeated every turn
+    // would have the agent rewriting its summary instead of doing the work,
+    // and one asked for on turn 2 of 5 would describe a third of a run.
+    if iteration >= task.iterations {
+        if let Some(path) = summary_path {
+            text.push_str(&format!(
+                "\n\nBefore you finish, write a short account of this run to `{}` — what you \
+                 changed, what you decided, and anything left undone. Markdown, 20 lines at \
+                 most. Nobody watched this run; that file is what they will read instead.",
+                path.display()
+            ));
+        }
     }
+    text
+}
+
+/// How much of a run's transcript a client is sent when it asks. An
+/// overnight run's file is measured in megabytes of screen repaints; the tail
+/// is the part that says how it ended, and anything more belongs to `less`.
+const ARTIFACT_TAIL_BYTES: usize = 256 * 1024;
+
+/// A fresh run record, before anything is known about it beyond which task
+/// it came from and when it started.
+fn new_run_record(task: &Task, started: i64) -> TaskRun {
+    let id = TaskRunId::generate();
+    TaskRun {
+        dir: run_dir(task, started, &id),
+        id,
+        task_id: task.id.clone(),
+        project_id: task.project_id.clone(),
+        task_name: task.name.clone(),
+        agent_id: None,
+        started_at: started,
+        ended_at: 0,
+        status: TaskRunStatus::Running,
+        outcome: "running".to_string(),
+        iterations_planned: task.iterations,
+        iterations_done: 0,
+        worktree_path: PathBuf::new(),
+        branch: String::new(),
+        base_ref: None,
+        head_ref: None,
+        snapshot: None,
+        files_changed: 0,
+        insertions: 0,
+        deletions: 0,
+    }
+}
+
+/// Where a run keeps its files: `<data>/task-runs/<slug>/<stamp>-<tail>/`.
+/// Stamp first so a directory listing is chronological, and the id's tail
+/// after it so two runs of the same task in the same second cannot collide.
+fn run_dir(task: &Task, started: i64, id: &TaskRunId) -> PathBuf {
+    let stamp = match chrono::Local.timestamp_millis_opt(started).single() {
+        Some(t) => t.format("%Y%m%d-%H%M%S").to_string(),
+        None => started.to_string(),
+    };
+    let tail: String = id
+        .as_str()
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    paths::task_runs_dir()
+        .join(task_slug(task))
+        .join(format!("{stamp}-{}", tail.to_ascii_lowercase()))
+}
+
+/// The refs a run's before and after trees are kept under. Outside
+/// `refs/heads` so they never clutter a branch list, and named after the run
+/// so `git for-each-ref refs/nebula/runs` is a readable index of them.
+fn run_ref(id: &TaskRunId, part: &str) -> String {
+    format!("refs/nebula/runs/{id}/{part}")
+}
+
+/// The last `cap` bytes of a file, as text, saying so when it truncated.
+/// Byte-sliced rather than char-sliced, so the cut can land mid-codepoint —
+/// `from_utf8_lossy` absorbs that, and this is a terminal dump either way.
+fn tail_text(raw: &[u8], cap: usize) -> String {
+    if raw.len() <= cap {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    let skipped = raw.len() - cap;
+    format!(
+        "[nebula] …{skipped} earlier bytes not shown; the whole file is on disk\n{}",
+        String::from_utf8_lossy(&raw[skipped..])
+    )
 }
 
 /// Branch a finished run is captured on. Stamped rather than reused: each
@@ -4008,8 +4447,8 @@ mod tests {
     /// The loop's bookkeeping, exercised without a PTY. `delivered` is only
     /// advanced by a delivery that actually wrote bytes, so this walks the
     /// counter by hand and checks the turn-end gate and the retire path.
-    #[test]
-    fn a_task_loop_retires_when_its_iterations_run_out() {
+    #[tokio::test]
+    async fn a_task_loop_retires_when_its_iterations_run_out() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         let spec = TaskSpec {
@@ -4023,6 +4462,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id: task_id.clone(),
                 delivered: 2,
                 total: 2,
@@ -4060,8 +4500,8 @@ mod tests {
     /// The failure this whole feature exists to avoid: a run whose session
     /// dies leaves the loop entry behind, and the task reads "running"
     /// forever while nothing at all is happening.
-    #[test]
-    fn a_dead_session_ends_the_run() {
+    #[tokio::test]
+    async fn a_dead_session_ends_the_run() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         let spec = TaskSpec {
@@ -4075,6 +4515,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id,
                 delivered: 2,
                 total: 5,
@@ -4099,8 +4540,8 @@ mod tests {
     /// `--dangerously-skip-permissions` does not cover `AskUserQuestion`: the
     /// CLI parks on the dialog, fires no turn end, and an unattended loop
     /// would wait for a person who is asleep.
-    #[test]
-    fn an_unattended_run_that_asks_a_question_ends() {
+    #[tokio::test]
+    async fn an_unattended_run_that_asks_a_question_ends() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         let spec = TaskSpec {
@@ -4115,6 +4556,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id,
                 delivered: 3,
                 total: 5,
@@ -4154,6 +4596,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id,
                 delivered: 3,
                 total: 5,
@@ -4172,8 +4615,8 @@ mod tests {
 
     /// A turn that never ends is the other silent stall: nothing crashed, so
     /// there is no exit to react to. Only the clock can tell.
-    #[test]
-    fn a_stalled_run_is_written_off() {
+    #[tokio::test]
+    async fn a_stalled_run_is_written_off() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         let spec = TaskSpec {
@@ -4189,6 +4632,7 @@ mod tests {
             daemon.task_loops.lock().unwrap().insert(
                 agent.clone(),
                 LoopState {
+                    run_id: TaskRunId("run-test".into()),
                     task_id: task_id.clone(),
                     delivered: 2,
                     total: 5,
@@ -4213,14 +4657,247 @@ mod tests {
         );
     }
 
-    /// The overnight failure that actually happened when this was first run
-    /// for real: a checkout Claude Code had not seen before opened with its
-    /// trust dialog, which swallowed the pasted prompt. No hook ever fired,
-    /// so the session stayed `Fresh` and the run sat there. A first turn that
-    /// has not started is a different failure from a turn taking a long time,
-    /// and it is caught on a much shorter fuse — and named.
+    /// A task row for the pure-function tests below, with no store behind it.
+    fn sample_task() -> Task {
+        Task {
+            id: TaskId("t".into()),
+            project_id: ProjectId("p".into()),
+            name: "nightly".into(),
+            prompt: "keep going".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cron: None,
+            iterations: 1,
+            unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 0,
+            commit_on_finish: false,
+            target: TaskTarget::Root,
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: 0,
+        }
+    }
+
+    /// A finished run has to leave something behind that outlives it: the
+    /// row keeps the numbers, the directory keeps the write-up. Without both,
+    /// "what happened last night" is a single line that the next run
+    /// overwrites.
+    #[tokio::test]
+    async fn a_finished_run_records_what_it_did() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 2,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let task = daemon.store.get_task(&task_id).unwrap().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let run = TaskRun {
+            dir: tmp.path().join("run"),
+            // No checkout on disk: the git half is skipped and the report
+            // still has to be written.
+            ..new_run_record(&task, epoch_ms())
+        };
+        daemon.store.insert_task_run(&run).unwrap();
+        let agent = AgentId("a1".into());
+
+        daemon
+            .finish_run_record(
+                run.id.clone(),
+                2,
+                &agent,
+                &task,
+                "ran 2 of 2".to_string(),
+                TaskRunStatus::Completed,
+            )
+            .await;
+
+        let read = daemon.store.get_task_run(&run.id).unwrap().unwrap();
+        assert_eq!(read.status, TaskRunStatus::Completed);
+        assert_eq!(read.outcome, "ran 2 of 2");
+        assert_eq!(read.iterations_done, 2);
+        assert!(read.ended_at > 0, "the run is over and says so");
+        assert_eq!(read.agent_id.as_ref(), Some(&agent));
+
+        let report = std::fs::read_to_string(read.report_path()).expect("a report on disk");
+        assert!(report.contains("ran 2 of 2"), "{report}");
+        assert!(report.contains("nightly"), "{report}");
+        assert_eq!(
+            only_task(&daemon).last_outcome.as_deref(),
+            Some("ran 2 of 2"),
+            "nothing to add to the line when nothing was diffed"
+        );
+    }
+
+    /// Every stop path calls `end_task_run`, and two of them can fire for the
+    /// same run (a stall sweep while the session is dying). The second must
+    /// not overwrite the first's account of it.
+    #[tokio::test]
+    async fn only_the_first_stop_path_ends_a_run() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let EntityId::Task(task_id) = daemon.create_task(task_spec("p", "go")).unwrap() else {
+            panic!("non-task id");
+        };
+        let task = daemon.store.get_task(&task_id).unwrap().unwrap();
+        let agent = AgentId("a1".into());
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                run_id: TaskRunId("run-test".into()),
+                task_id: task_id.clone(),
+                delivered: 1,
+                total: 1,
+                in_flight: false,
+                last_progress_at: epoch_ms(),
+            },
+        );
+
+        daemon.end_task_run(&agent, &task, "ran 1 of 1".into(), TaskRunStatus::Completed);
+        daemon.end_task_run(
+            &agent,
+            &task,
+            "stopped: session exited (1) at iteration 1 of 1".into(),
+            TaskRunStatus::Stopped,
+        );
+        assert_eq!(
+            only_task(&daemon).last_outcome.as_deref(),
+            Some("ran 1 of 1"),
+            "the late stop path found the loop already gone"
+        );
+    }
+
+    /// A daemon that dies mid-run leaves a row saying "running" that nothing
+    /// will ever close — and a task whose newest outcome is a lie.
+    #[tokio::test]
+    async fn a_run_the_daemon_outlived_is_closed_at_boot() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let spec = TaskSpec {
+            iterations: 3,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let task = daemon.store.get_task(&task_id).unwrap().unwrap();
+        let started = epoch_ms();
+        let mut run = new_run_record(&task, started);
+        run.iterations_done = 2;
+        daemon.store.insert_task_run(&run).unwrap();
+        daemon
+            .store
+            .set_task_run_state(&task_id, started, "running", None)
+            .unwrap();
+
+        daemon.reconcile_unfinished_runs();
+
+        let read = daemon.store.get_task_run(&run.id).unwrap().unwrap();
+        assert_eq!(read.status, TaskRunStatus::Stopped);
+        assert!(
+            read.outcome.contains("daemon restarted"),
+            "{}",
+            read.outcome
+        );
+        assert!(read.ended_at > 0);
+        assert_eq!(
+            only_task(&daemon).last_outcome.as_deref(),
+            Some(read.outcome.as_str()),
+            "the task row stops claiming the run is still going"
+        );
+        assert!(
+            daemon.store.unfinished_task_runs().unwrap().is_empty(),
+            "and it is not swept twice"
+        );
+    }
+
+    /// The run directory is the thing somebody finds in a file browser six
+    /// weeks later, so it has to say which task and which night on sight.
     #[test]
-    fn a_run_whose_first_turn_never_starts_is_caught_early_and_explained() {
+    fn a_run_directory_names_its_task_and_its_night() {
+        let task = Task {
+            name: "Nightly Notes!".into(),
+            ..sample_task()
+        };
+        let a = run_dir(
+            &task,
+            1_700_000_000_000,
+            &TaskRunId("01ABCDEFGHIJKLMNOP".into()),
+        );
+        let b = run_dir(
+            &task,
+            1_700_000_000_000,
+            &TaskRunId("01ABCDEFGHIJKLMNZZ".into()),
+        );
+        let a = a.to_string_lossy().to_string();
+        assert!(a.contains("nightly-notes"), "{a}");
+        assert!(a.contains("klmnop"), "the id's tail keeps runs apart: {a}");
+        assert_ne!(a, b.to_string_lossy(), "same second, different runs");
+    }
+
+    /// Only the last turn is asked for a summary, and it is asked alongside
+    /// the wrap-up rather than instead of it.
+    #[test]
+    fn the_last_turn_is_asked_to_write_the_run_up() {
+        let path = std::path::PathBuf::from("/runs/x/summary.md");
+        let task = Task {
+            iterations: 3,
+            final_prompt: Some("stop and land it".into()),
+            ..sample_task()
+        };
+        let first = task_prompt_text(&task, 1, Some(&path));
+        assert!(
+            !first.contains("summary.md"),
+            "a summary asked for on turn 1 would describe a third of a run: {first}"
+        );
+        let last = task_prompt_text(&task, 3, Some(&path));
+        assert!(last.contains("stop and land it"), "{last}");
+        assert!(last.contains("/runs/x/summary.md"), "{last}");
+
+        // A one-turn task has no turn to spare, and still gets asked.
+        let single = Task {
+            iterations: 1,
+            final_prompt: None,
+            ..sample_task()
+        };
+        assert!(task_prompt_text(&single, 1, Some(&path)).contains("summary.md"));
+        // And a run with nowhere to write it is not asked at all.
+        assert!(!task_prompt_text(&single, 1, None).contains("summary.md"));
+    }
+
+    /// A transcript is megabytes; what crosses the socket is its end, and it
+    /// says that it is only the end.
+    #[test]
+    fn a_long_artifact_is_sent_as_its_tail() {
+        let short = tail_text(b"all of it", 64);
+        assert_eq!(short, "all of it");
+
+        let raw: Vec<u8> = std::iter::repeat_n(b'x', 100).chain(*b"THE END").collect();
+        let tail = tail_text(&raw, 8);
+        assert!(tail.contains("THE END"), "{tail}");
+        assert!(tail.contains("earlier bytes not shown"), "{tail}");
+    }
+
+    /// The overnight failure that actually happened when this was first run
+    /// for real: Claude Code opened a modal instead of an input box — a trust
+    /// dialog in an unseen checkout, or the bypass-permissions warning an
+    /// unattended run always meets — and it swallowed the pasted prompt. No
+    /// hook ever fired, so the session stayed `Fresh` and the run sat there.
+    /// A first turn that has not started is a different failure from a turn
+    /// taking a long time: it is caught on a much shorter fuse, and the
+    /// outcome names whatever the CLI is actually holding (here nothing is
+    /// on the PTY to read, so it says so rather than guessing).
+    #[tokio::test]
+    async fn a_run_whose_first_turn_never_starts_is_caught_early_and_explained() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         seed_worktree(&daemon, "p", "w", "/tmp/p", true);
@@ -4238,6 +4915,7 @@ mod tests {
             daemon.task_loops.lock().unwrap().insert(
                 agent.clone(),
                 LoopState {
+                    run_id: TaskRunId("run-test".into()),
                     task_id: task_id.clone(),
                     delivered: 1,
                     total: 3,
@@ -4271,9 +4949,56 @@ mod tests {
             "caught on the short fuse: {outcome}"
         );
         assert!(
-            outcome.contains("trust prompt"),
-            "and it names the likely cause: {outcome}"
+            outcome.contains("waiting at something that is not a prompt box"),
+            "and it says what it is stuck on: {outcome}"
         );
+    }
+
+    /// The dialog-clearing path against a real PTY: a child that opens with
+    /// the bypass warning is answered and the delivery is cleared to type.
+    /// `cat` stands in for the CLI redrawing after the keys land — what the
+    /// check actually requires is that the child says *something* back.
+    #[tokio::test]
+    async fn a_bypass_warning_is_answered_before_the_prompt_is_typed() {
+        let daemon = test_daemon();
+        let agent = AgentId("a1".into());
+        let sref = SessionRef::Agent(agent.clone());
+        let screen = "WARNING: Claude Code running in Bypass Permissions mode\n\
+                      In Bypass Permissions mode, Claude Code will not ask for approval\n\
+                      1. No, exit\n  2. Yes, I accept\n";
+        let session = PtySession::spawn(
+            sref,
+            SpawnSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), format!("printf %s '{screen}'; cat")],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+                transcript: None,
+            },
+        )
+        .expect("spawn a pty");
+
+        // The child has to have drawn before there is anything to detect.
+        for _ in 0..100 {
+            if dialog::visible(&session.snapshot(None).1).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            dialog::visible(&session.snapshot(None).1),
+            Some(StartupDialog::BypassPermissions),
+            "the fixture never reached the ring"
+        );
+
+        assert!(
+            daemon.clear_startup_dialog(&session, &agent).await,
+            "answered, so the prompt may be typed"
+        );
+        session.kill();
     }
 
     /// 0 means "wait forever" — the one setting that lets an overnight run
@@ -4294,6 +5019,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id,
                 delivered: 1,
                 total: 5,
@@ -4326,6 +5052,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id: task_id.clone(),
                 delivered: 1,
                 total: 5,
@@ -4381,18 +5108,18 @@ mod tests {
             sort_order: 0,
         };
         assert_eq!(
-            task_prompt_text(&task, 1),
+            task_prompt_text(&task, 1, None),
             "[nebula] Task `nightly` — iteration 1 of 3.\nkeep going"
         );
         assert_eq!(
-            task_prompt_text(&task, 3),
+            task_prompt_text(&task, 3, None),
             "[nebula] Task `nightly` — iteration 3 of 3 (wrap-up).\nstop and summarise"
         );
 
         // No wrap-up set: the last turn is an ordinary turn.
         task.final_prompt = None;
         assert_eq!(
-            task_prompt_text(&task, 3),
+            task_prompt_text(&task, 3, None),
             "[nebula] Task `nightly` — iteration 3 of 3.\nkeep going"
         );
 
@@ -4401,7 +5128,7 @@ mod tests {
         task.final_prompt = Some("stop and summarise".into());
         task.iterations = 1;
         assert_eq!(
-            task_prompt_text(&task, 1),
+            task_prompt_text(&task, 1, None),
             "[nebula] Task `nightly`.\nkeep going"
         );
     }
@@ -4436,6 +5163,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id,
                 delivered: 1,
                 total: 5,
@@ -4480,6 +5208,7 @@ mod tests {
         daemon.task_loops.lock().unwrap().insert(
             agent.clone(),
             LoopState {
+                run_id: TaskRunId("run-test".into()),
                 task_id: task_id.clone(),
                 delivered: 1,
                 total: 5,

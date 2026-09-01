@@ -38,9 +38,11 @@ nebula replaces that with a tree and a color:
 - **A daemon that owns the PTYs.** Quit the UI, close the laptop lid, come back tomorrow — the agents
   never stopped, and your scrollback is replayed.
 - **Real git worktrees, one keystroke.** Two agents in two directories don't collide.
-- **Work that runs itself.** Give a project a task — a prompt, a cron schedule, and how many turns to
-  keep going for — and the daemon starts the session at 02:00 and re-prompts it turn after turn with
-  nobody watching. `e` opens the tab.
+- **Work that runs itself, and writes itself up.** Give a project a task — a prompt, a cron schedule,
+  and how many turns to keep going for — and the daemon starts the session at 02:00 and re-prompts it
+  turn after turn with nobody watching. Every run keeps a record: what changed (a real diff of its own
+  work), what the agent said it did, everything the session printed, and where the code went. `e` opens
+  the tab; `g` in it — or `nebula runs digest` — is the morning read.
 - **Every open pull request under them, readable in place.** Open a project and nebula asks `gh` what's
   still open on the repo. Hover one to read its description and comments in the pane, `g` for its diff,
   `Enter` for the browser.
@@ -227,6 +229,16 @@ The panels aren't the only view. With a worktree selected, from any panel:
   **unattended** launches Claude with `--dangerously-skip-permissions` (codex and cursor already run with
   `--yolo` / `--force`), because a permission prompt with nobody there is a run that never finishes; it is
   off by default and per task.
+- **A run leaves a record.** Nothing about an overnight run is worth much if the morning after is a
+  single line of status, so every run gets a row in the history and a directory of its own under
+  `~/.local/share/nebula/task-runs/<task>/<when>/`: `report.md` (outcome, timings, changed files, where
+  the work went), `transcript.log` (everything the session printed, capped at 32 MiB), and `summary.md`
+  — the agent's own account, which the last turn of every run is asked to write. The diff is honest
+  about whose work it is: nebula records the working tree in a hidden ref (`refs/nebula/runs/<id>/base`)
+  *before* the agent starts and another after, so `git diff base head` is the run's own changes and not
+  whatever the checkout was already carrying. Read them from the Automation pane (`↓` past the fields
+  into the run list, `Enter` for the report, `t` for the transcript, `g` for the last 24 hours) or from
+  the shell with `nebula runs`, `nebula runs show <id>`, and `nebula runs digest --since 12h`.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI while you're still naming
   the session, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
@@ -286,7 +298,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
 | Any panel | `e` | flip the pane to **AUTOMATION**: the selected project's tasks — a prompt plus when to run it. `n` adds one (name, then the prompt), `space` turns one on or off, `r` runs it now, `d` deletes it (asks first), `→` steps into its fields where `←/→` cycle each value |
-| Automation | fields | `name`, `prompt`, `agent`, `model`, `effort`, `schedule` (cron), `iterations`, `unattended`, `run in`, `enabled` — the three text fields open an editor, the rest cycle in place. Below them: when it next runs, and what the last run did |
+| Automation | fields | `name`, `prompt`, `agent`, `model`, `effort`, `schedule` (cron), `iterations`, `wrap-up`, `unattended`, `stall limit`, `commit`, `run in`, `enabled` — the text fields open an editor, the rest cycle in place. Below them: when it next runs |
+| Automation | runs | `↓` past the last field walks into the task's past runs — when, whether it worked, how much it changed. `Enter` opens that run's report, `t` what the session printed, `g` (anywhere in the pane) every task's runs from the last 24 hours |
 | Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation) |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `Shift+N` | replay the startup splash (any key returns) |
@@ -324,6 +337,11 @@ nebula workspace open <name>    # open it in the next instance you launch
 nebula workspace list           # list workspaces; * marks the one new instances open into
 nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
+nebula runs               # every task run, newest first: when, which task, whether it worked,
+                          # how much it changed. --task <name>, --since 12h, --limit N
+nebula runs digest        # one page covering the window (default 24h), worst news first
+nebula runs show [id]     # a run's report (no id = the newest); --transcript for what the
+                          # session printed, --summary for the agent's own account
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
 nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only) and open

@@ -8,7 +8,7 @@ use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
 use crate::text_input::TextInput;
 use crate::theme::Theme;
-use nebula_core::{AgentStatus, SessionRef, Task, TaskTarget};
+use nebula_core::{AgentStatus, SessionRef, Task, TaskRunStatus, TaskTarget};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -496,6 +496,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ("→ / enter", "step into the fields"),
                     ("←→", "change the value"),
                     ("enter", "edit (text opens an editor)"),
+                    ("↓ past the end", "into this task's past runs"),
+                    ("enter", "on a run: its report"),
+                    ("t", "on a run: what it printed"),
+                    ("g", "every task's runs, last 24h"),
                     ("esc / ↑", "back to the task list"),
                     ("tab", "leave the pane"),
                 ],
@@ -521,6 +525,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         ("stopped", "session died, or it asked a question"),
                         ("stalled", "no turn ended inside the stall limit"),
                         ("skipped", "the previous run was still going"),
+                    ],
+                ),
+                (
+                    "WHAT A RUN LEAVES",
+                    &[
+                        ("report", "timings, diffstat, where the work went"),
+                        ("summary", "the agent's own account of the run"),
+                        ("transcript", "everything the session printed"),
+                        ("refs", "git diff base..head, kept per run"),
                     ],
                 ),
             ];
@@ -1195,6 +1208,71 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     width: inner.width,
                     height: (shown as u16).min(inner.height.saturating_sub(rows_start as u16)),
                 };
+            }
+        }
+        Overlay::Run(view) => {
+            let area = centered_rect_pct(f.area(), 86, 88);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    format!(" {} ", view.title),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Span::styled(
+                    " r: report  s: summary  t: transcript  esc: close ",
+                    Style::default().fg(th.dim),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            // Header: where this text came from. A report is only useful if
+            // you can find it again tomorrow without nebula.
+            let body = if inner.height > 2 {
+                if let Some(r) = row_rect(inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            truncate(&view.subtitle, r.width as usize),
+                            Style::default().fg(th.dim),
+                        )),
+                        r,
+                    );
+                }
+                Rect {
+                    y: inner.y + 1,
+                    height: inner.height - 1,
+                    ..inner
+                }
+            } else {
+                inner
+            };
+
+            let height = body.height as usize;
+            let scroll = (view.scroll as usize).min(view.lines.len().saturating_sub(height.max(1)));
+            let text: Vec<Line<'static>> = if view.loading {
+                vec![Line::from(Span::styled(
+                    "  reading…",
+                    Style::default().fg(th.dim),
+                ))]
+            } else if view.lines.is_empty() {
+                vec![Line::from(Span::styled(
+                    "  nothing here",
+                    Style::default().fg(th.dim),
+                ))]
+            } else {
+                view.lines
+                    .iter()
+                    .skip(scroll)
+                    .take(height)
+                    .map(|l| Line::from(markdownish(l, th)))
+                    .collect()
+            };
+            f.render_widget(Paragraph::new(text), body);
+            if let Some(Overlay::Run(v)) = &mut app.overlay {
+                v.view_height = body.height;
+                v.scroll = scroll as u16;
             }
         }
         Overlay::Diff(view) => {
@@ -1901,6 +1979,32 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
         return "Enter: rebind  a: add  ⌫: default  x: unbind  R: reset all  Tab: next  ↑: tabs";
     }
     "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
+}
+
+/// The little markdown a run report uses, in colour: headings, bullets, and
+/// the fenced blocks that hold diffstats and prompts. Not a parser — the
+/// text is nebula's own, and anything it does not recognise is left alone.
+fn markdownish(line: &str, th: Theme) -> Vec<Span<'static>> {
+    let owned = line.to_string();
+    if let Some(rest) = line.strip_prefix("# ") {
+        return vec![Span::styled(
+            rest.to_string(),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )];
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return vec![Span::styled(
+            rest.to_string(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        )];
+    }
+    if line.starts_with("```") {
+        return vec![Span::styled(String::new(), Style::default())];
+    }
+    if line.starts_with("- ") || line.starts_with("  ") {
+        return vec![Span::styled(owned, Style::default().fg(th.muted))];
+    }
+    vec![Span::styled(owned, Style::default().fg(th.text))]
 }
 
 fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
@@ -3646,7 +3750,6 @@ fn draw_automation(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         );
     }
     let now = crate::app::now_ms();
-    let mut lines: Vec<Line<'static>> = Vec::new();
     // `next_run_at` is the daemon's stamp, so "0" alone doesn't mean manual:
     // a task with a cron whose stamp hasn't come back yet is scheduled, and
     // saying "manual" there would be a lie about what happens next.
@@ -3665,41 +3768,101 @@ fn draw_automation(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             Style::default().fg(th.warn),
         )
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {:<label_w$}", "next run"),
-            Style::default().fg(th.dim),
-        ),
-        next,
-    ]));
-    let last = match (task.last_run_at, task.last_outcome.as_deref()) {
-        (0, _) => Span::styled("never".to_string(), Style::default().fg(th.dim)),
-        (at, outcome) => {
-            let outcome = outcome.unwrap_or("ran");
-            let color = if outcome.starts_with("failed") {
-                th.err
-            } else if outcome == "running" {
-                th.warn
-            } else {
-                th.ok
-            };
-            Span::styled(
-                format!("{} · {}", crate::hosts::ago_label(now - at), outcome),
-                Style::default().fg(color),
-            )
-        }
+    if let Some(r) = row_rect(detail_area, status_row + 1) {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {:<label_w$}", "next run"),
+                    Style::default().fg(th.dim),
+                ),
+                next,
+            ])),
+            r,
+        );
+    }
+
+    // ---- runs ----
+    // The history, not just the newest line: an overnight task that has
+    // stalled three nights running says so here, and each row opens what
+    // that run left behind.
+    let runs = app.task_runs.get(&task.id).cloned().unwrap_or_default();
+    let heading_row = status_row + 2;
+    if let Some(r) = row_rect(detail_area, heading_row) {
+        let known = app.runs_requested.contains(&task.id);
+        let label = match (runs.is_empty(), known, task.last_run_at) {
+            (false, _, _) => format!(" runs ({})", runs.len()),
+            (true, true, 0) => " runs — never run yet".to_string(),
+            (true, true, _) => " runs — none recorded".to_string(),
+            (true, false, _) => " runs — asking…".to_string(),
+        };
+        let hint = if runs.is_empty() {
+            "g: last 24h".to_string()
+        } else {
+            "enter: report  t: transcript  g: last 24h".to_string()
+        };
+        let pad =
+            (r.width as usize).saturating_sub(label.chars().count() + hint.chars().count() + 1);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, Style::default().fg(th.dim)),
+                Span::styled(" ".repeat(pad), Style::default()),
+                Span::styled(hint, Style::default().fg(th.dim)),
+            ])),
+            r,
+        );
+    }
+
+    let rows_top = heading_row + 1;
+    let space = (detail_area.height as usize).saturating_sub(rows_top);
+    let selected_run = app.automation.run.min(runs.len().saturating_sub(1));
+    let first = (selected_run + 1).saturating_sub(space);
+    app.automation.run_first = first;
+    app.automation.runs_area = Rect {
+        x: detail_area.x,
+        y: detail_area.y + rows_top as u16,
+        width: detail_area.width,
+        height: (space as u16).min(runs.len().saturating_sub(first) as u16),
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {:<label_w$}", "last run"),
-            Style::default().fg(th.dim),
-        ),
-        last,
-    ]));
-    for (i, line) in lines.into_iter().enumerate() {
-        if let Some(r) = row_rect(detail_area, status_row + 1 + i) {
-            f.render_widget(Paragraph::new(line), r);
+    for (i, run) in runs.iter().enumerate().skip(first).take(space) {
+        let Some(r) = row_rect(detail_area, rows_top + i - first) else {
+            break;
+        };
+        let is_sel = detail_focused && app.automation.on_runs && i == selected_run;
+        if is_sel {
+            f.render_widget(Block::default().style(Style::default().bg(th.sel_bg)), r);
         }
+        let (glyph, color) = match run.status {
+            TaskRunStatus::Completed => ("✓", th.ok),
+            TaskRunStatus::Running => ("·", th.warn),
+            TaskRunStatus::Failed => ("✗", th.err),
+            TaskRunStatus::Stalled | TaskRunStatus::Stopped => ("!", th.warn),
+        };
+        // "3h ago  ✓  12 files +430 −58  ran 3 of 3" — when, whether, how
+        // much, and in what words, in that order of what gets read first.
+        let changed = if run.has_changes() {
+            format!(
+                "{} +{} −{}",
+                run.files_changed, run.insertions, run.deletions
+            )
+        } else if run.status == TaskRunStatus::Running {
+            String::new()
+        } else {
+            "no changes".to_string()
+        };
+        let ago = crate::hosts::ago_label(now - run.started_at);
+        let head = format!(" {:<9} {} {:<16} ", truncate(&ago, 9), glyph, changed);
+        let rest = (r.width as usize).saturating_sub(head.chars().count());
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(head, Style::default().fg(color)),
+                Span::styled(
+                    truncate(&run.outcome, rest),
+                    Style::default().fg(if is_sel { th.text } else { th.muted }),
+                ),
+            ])),
+            r,
+        );
+        app.hits.push((r, HitTarget::TaskRunRow(i)));
     }
 }
 

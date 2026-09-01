@@ -3898,8 +3898,11 @@ async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
     std::fs::write(
         &script,
         format!(
+            // It also writes into its *cwd* — the checkout — so the run has
+            // work to be diffed and reported, the way a real agent would.
             "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
-             while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{d}'/$NEBULA_AGENT_ID.typed; done\n",
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{d}'/$NEBULA_AGENT_ID.typed; \
+             printf '%s\\n' \"$line\" >> run-output.txt; done\n",
             d = env_dir.display()
         ),
     )
@@ -4131,6 +4134,79 @@ async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
     assert_eq!(status, 200);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(deliveries(&typed).len(), 3, "still three");
+
+    // ---- what the run left behind ----
+    // The point of all of the above is that somebody who was asleep can read
+    // it in the morning: a row in the history, a diff of the run's own work,
+    // and a report on disk that outlives the daemon.
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::TaskRunUpserted { run } if run.ended_at > 0))
+    })
+    .await;
+    assert!(
+        !events.is_empty(),
+        "the finished run is broadcast: {events:#?}"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ListTaskRuns {
+            req_id: 90,
+            task: Some(task_id.clone()),
+            since_ms: 0,
+            limit: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::TaskRuns { req_id: 90, .. }))
+    })
+    .await;
+    let Some(ServerEvent::TaskRuns { runs, .. }) = events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::TaskRuns { req_id: 90, .. }))
+    else {
+        panic!("no run list came back: {events:#?}");
+    };
+    assert_eq!(runs.len(), 1, "one run, once: {runs:#?}");
+    let run = &runs[0];
+    assert_eq!(run.status, nebula_core::TaskRunStatus::Completed);
+    assert_eq!(run.outcome, "ran 3 of 3");
+    assert_eq!(run.iterations_done, 3);
+    assert_eq!(
+        run.files_changed, 1,
+        "the file the stand-in wrote in the checkout: {run:#?}"
+    );
+    assert!(run.insertions >= 3, "one line per turn at least: {run:#?}");
+    assert!(run.base_ref.is_some() && run.head_ref.is_some());
+
+    let report = std::fs::read_to_string(run.report_path()).expect("a report on disk");
+    assert!(report.contains("ran 3 of 3"), "{report}");
+    assert!(report.contains("run-output.txt"), "{report}");
+    assert!(
+        std::fs::metadata(run.transcript_path()).unwrap().len() > 0,
+        "the session's output was captured"
+    );
+
+    // The refs the report tells the user to diff really are in the repo.
+    let refs = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["for-each-ref", "--format=%(refname)", "refs/nebula/runs"])
+        .output()
+        .unwrap();
+    let refs = String::from_utf8_lossy(&refs.stdout);
+    assert!(refs.contains("/base") && refs.contains("/head"), "{refs}");
+
+    // The last turn was also asked to write the run up in its own words.
+    let body = std::fs::read_to_string(&typed).unwrap();
+    assert!(
+        body.contains("summary.md"),
+        "the wrap-up turn carries the ask: {body}"
+    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);

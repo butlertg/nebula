@@ -65,6 +65,21 @@ enum Command {
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
+    /// Read what unattended task runs left behind: the table of runs, the
+    /// overnight digest, or one run's report / summary / transcript.
+    Runs {
+        #[command(subcommand)]
+        command: Option<RunsCommand>,
+        /// Only this task's runs (a substring of its name is enough).
+        #[arg(long, value_name = "NAME")]
+        task: Option<String>,
+        /// Window to look back over: 90m, 12h, 3d (default: everything).
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+        /// Most rows to print (default: the daemon's cap).
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+    },
     /// Manage workspaces — named project groups. Each nebula instance has
     /// one open and scopes its project list (and `/` search) to it.
     Workspace {
@@ -106,6 +121,30 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum RunsCommand {
+    /// One page covering every run in the window — the morning read.
+    Digest {
+        /// How far back to look (default: 24h).
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+    },
+    /// Print one run's write-up. With no id, the newest run.
+    Show {
+        /// The short id from `nebula runs` (or a full one).
+        id: Option<String>,
+        /// Only consider this task's runs when picking the newest.
+        #[arg(long, value_name = "NAME")]
+        task: Option<String>,
+        /// Everything the session printed, instead of the report.
+        #[arg(long, conflicts_with = "summary")]
+        transcript: bool,
+        /// The agent's own account of the run, instead of the report.
+        #[arg(long)]
+        summary: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorkspaceCommand {
     /// Create a workspace (does not open it).
     Add { name: String },
@@ -143,6 +182,36 @@ fn main() -> Result<()> {
                 }
             };
             nebula_tui::run_workspace(op)
+        }
+        Some(Command::Runs {
+            command,
+            task,
+            since,
+            limit,
+        }) => {
+            use nebula_core::RunArtifact;
+            use nebula_tui::RunsOp;
+            let op = match command {
+                None => RunsOp::List { task, since, limit },
+                Some(RunsCommand::Digest { since: window }) => RunsOp::Digest {
+                    since: window.or(since),
+                },
+                Some(RunsCommand::Show {
+                    id,
+                    task: only,
+                    transcript,
+                    summary,
+                }) => RunsOp::Show {
+                    id,
+                    task: only.or(task),
+                    part: match (transcript, summary) {
+                        (true, _) => RunArtifact::Transcript,
+                        (_, true) => RunArtifact::Summary,
+                        _ => RunArtifact::Report,
+                    },
+                },
+            };
+            nebula_tui::run_runs(op)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),

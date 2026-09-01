@@ -1,7 +1,9 @@
 pub mod cloud;
+pub mod dialog;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
+pub mod transcript;
 
 use anyhow::{Context, Result};
 use cloud::CloudScanner;
@@ -12,6 +14,7 @@ use ring::ScrollbackRing;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
+use transcript::Transcript;
 
 const RING_CAPACITY: usize = 1024 * 1024;
 /// Flush coalesced output at this size…
@@ -82,6 +85,11 @@ pub struct PtySession {
     /// Claude Cloud session id / attach-refusal scanner; `None` until a
     /// `--cloud` launch arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
+    /// Everything the child printed, on disk. `None` for ordinary sessions:
+    /// only a task run asks for one, because only a task run is expected to
+    /// be read after nobody was watching (the ring is a megabyte of memory
+    /// and dies with the daemon).
+    transcript: Mutex<Option<Transcript>>,
 }
 
 pub struct SpawnSpec {
@@ -94,6 +102,10 @@ pub struct SpawnSpec {
     pub scrub_env: Vec<String>,
     pub cols: u16,
     pub rows: u16,
+    /// Write the child's output to this file as well as the ring. Created
+    /// (with its parent directories) on spawn; a failure to open it is
+    /// logged and the session runs on without one.
+    pub transcript: Option<std::path::PathBuf>,
 }
 
 impl PtySession {
@@ -144,6 +156,15 @@ impl PtySession {
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
             cloud: Mutex::new(None),
+            transcript: Mutex::new(spec.transcript.as_deref().and_then(|path| {
+                match Transcript::create(path) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "transcript open failed");
+                        None
+                    }
+                }
+            })),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -322,6 +343,9 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
         };
+        if let Some(transcript) = session.transcript.lock().unwrap().as_mut() {
+            transcript.write(pending);
+        }
         let seq = session.ring.lock().unwrap().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,

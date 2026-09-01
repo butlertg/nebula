@@ -553,6 +553,57 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         reply(&out_tx, req_id, daemon.run_task(&id).await.map(|_| None)).await;
                     });
                 }
+                ClientRequest::ListTaskRuns {
+                    req_id,
+                    task,
+                    since_ms,
+                    limit,
+                } => {
+                    match daemon.list_task_runs(task.as_ref(), since_ms, limit) {
+                        Ok(runs) => {
+                            let _ = out_tx.send(ServerEvent::TaskRuns { req_id, runs }).await;
+                        }
+                        Err(e) => {
+                            let _ = out_tx
+                                .send(ServerEvent::Error {
+                                    req_id: Some(req_id),
+                                    message: format!("{e:#}"),
+                                })
+                                .await;
+                        }
+                    };
+                }
+                ClientRequest::GetTaskRunArtifact { req_id, id, part } => {
+                    // Reading a capped transcript off disk is slow enough to
+                    // keep off the request loop.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let ev = match daemon.read_run_artifact(&id, part).await {
+                            Ok(text) => ServerEvent::TaskRunText {
+                                req_id,
+                                id,
+                                part,
+                                text,
+                            },
+                            Err(e) => ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{e:#}"),
+                            },
+                        };
+                        let _ = out_tx.send(ev).await;
+                    });
+                }
+                ClientRequest::GetTaskRunDigest { req_id, since_ms } => {
+                    let ev = match daemon.task_run_digest(since_ms) {
+                        Ok(text) => ServerEvent::TaskRunDigest { req_id, text },
+                        Err(e) => ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: format!("{e:#}"),
+                        },
+                    };
+                    let _ = out_tx.send(ev).await;
+                }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(
                         &out_tx,

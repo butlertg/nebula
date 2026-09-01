@@ -1,4 +1,6 @@
-use crate::ids::{AgentId, LinkId, ProjectId, TaskId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{
+    AgentId, LinkId, ProjectId, TaskId, TaskRunId, TerminalId, WorkspaceId, WorktreeId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -285,6 +287,127 @@ impl TaskTarget {
             TaskTarget::Worktree(_) => "worktree",
             TaskTarget::NewWorktree => "new worktree",
         }
+    }
+}
+
+/// How a run ended. The outcome string says it in words; this says it in a
+/// shape the pane can colour and the digest can count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunStatus {
+    /// Still going: the loop holds it and no stop path has fired yet.
+    Running,
+    /// Every iteration was delivered and the last turn ended.
+    Completed,
+    /// The watchdog gave up on a turn that never ended.
+    Stalled,
+    /// Ended early but on purpose: an unattended run that asked a question,
+    /// or a session that exited under the loop.
+    Stopped,
+    /// Never got going — no checkout, no CLI, spawn refused.
+    Failed,
+}
+
+impl TaskRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskRunStatus::Running => "running",
+            TaskRunStatus::Completed => "completed",
+            TaskRunStatus::Stalled => "stalled",
+            TaskRunStatus::Stopped => "stopped",
+            TaskRunStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => TaskRunStatus::Running,
+            "completed" => TaskRunStatus::Completed,
+            "stalled" => TaskRunStatus::Stalled,
+            "stopped" => TaskRunStatus::Stopped,
+            "failed" => TaskRunStatus::Failed,
+            _ => return None,
+        })
+    }
+
+    /// A run nothing is waiting on any more.
+    pub fn is_over(&self) -> bool {
+        !matches!(self, TaskRunStatus::Running)
+    }
+}
+
+/// One execution of a `Task`, kept after it ends so the morning after has
+/// something to read. Rows accumulate — `last_outcome` on the task is the
+/// newest one's one-liner, this is the history behind it.
+///
+/// Everything the run produced lives in one directory (`dir`): the rendered
+/// `report.md`, the raw `transcript.log`, and the agent's own `summary.md`
+/// when it wrote one. The two git refs are the run's real evidence: `base`
+/// is the working tree as the run found it (dirty files included, so
+/// somebody else's WIP is not attributed to the agent), `head` is how it
+/// left it, and the diff between them is what the run actually did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub id: TaskRunId,
+    pub task_id: TaskId,
+    pub project_id: ProjectId,
+    /// Copied at start: the run outlives renames, and a report that names a
+    /// task something it is no longer called is a report about nothing.
+    pub task_name: String,
+    /// The session the run drove. None when it never got one.
+    pub agent_id: Option<AgentId>,
+    pub started_at: i64,
+    /// 0 while the run is still going.
+    pub ended_at: i64,
+    pub status: TaskRunStatus,
+    /// The same sentence the task row shows: "ran 3 of 3", "stalled: …".
+    pub outcome: String,
+    pub iterations_planned: u32,
+    /// Iterations actually delivered, which is where a stall stopped.
+    pub iterations_done: u32,
+    /// The checkout it ran in, and the branch that checkout was on.
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    /// `refs/nebula/runs/<id>/base` and `…/head` once written. Diff them to
+    /// see the run's work: `git diff <base> <head>`.
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    /// `task/<slug>/<stamp> <short sha>` when the task asked for a branch.
+    pub snapshot: Option<String>,
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    /// Directory holding report.md / transcript.log / summary.md.
+    pub dir: PathBuf,
+}
+
+impl TaskRun {
+    pub fn report_path(&self) -> PathBuf {
+        self.dir.join("report.md")
+    }
+
+    pub fn transcript_path(&self) -> PathBuf {
+        self.dir.join("transcript.log")
+    }
+
+    /// Where the agent is asked to leave its own account of the run. Written
+    /// by the agent, not by nebula, so it is often absent.
+    pub fn summary_path(&self) -> PathBuf {
+        self.dir.join("summary.md")
+    }
+
+    pub fn duration_ms(&self, now: i64) -> i64 {
+        let end = if self.ended_at > 0 {
+            self.ended_at
+        } else {
+            now
+        };
+        (end - self.started_at).max(0)
+    }
+
+    /// True when the run changed something git can see.
+    pub fn has_changes(&self) -> bool {
+        self.files_changed > 0
     }
 }
 

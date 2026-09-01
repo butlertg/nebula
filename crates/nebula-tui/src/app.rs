@@ -4,8 +4,9 @@ use crate::git_diff::DiffFile;
 use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef, Task,
-    TaskId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, RunArtifact,
+    SessionRef, Task, TaskId, TaskRun, TaskRunId, TerminalId, TerminalTab, Workspace, WorkspaceId,
+    Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -63,6 +64,9 @@ pub enum HitTarget {
     /// Row in the Automation pane's detail column (index into
     /// `TaskField::ALL`).
     TaskField(usize),
+    /// Row in the Automation pane's run list (index into the selected task's
+    /// runs, newest first).
+    TaskRunRow(usize),
     /// Draggable vertical boundary between panels, left to right:
     /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
     Splitter(usize),
@@ -1316,6 +1320,35 @@ pub enum Overlay {
     Tree(crate::tree_browser::TreeBrowser),
     Metrics(MetricsView),
     Hosts(HostsView),
+    /// A run's write-up, or the overnight digest across all of them: text
+    /// the daemon rendered, scrolled here. Everything in it came off the
+    /// daemon's disk, which is the only place it exists.
+    Run(RunView),
+}
+
+/// A page of run text on screen: the report, the agent's own summary, the
+/// raw transcript, or the digest.
+#[derive(Debug, Clone)]
+pub struct RunView {
+    pub title: String,
+    /// Where the text came from, shown under the title — a path, usually,
+    /// because the point of these files is that they are still there
+    /// tomorrow.
+    pub subtitle: String,
+    /// Lines as rendered: already stripped of terminal control sequences,
+    /// so a transcript reads as text rather than as escape soup.
+    pub lines: Vec<String>,
+    pub scroll: u16,
+    /// Inner height from the last draw, for paging and scroll clamping (the
+    /// `DiffView::view_height` pattern).
+    pub view_height: u16,
+    /// The run on screen, so `r`/`s`/`t` can swap between its files without
+    /// closing the overlay. None for the digest, which is not one run.
+    pub run: Option<TaskRunId>,
+    pub part: RunArtifact,
+    /// True while a fetch is in flight, so the page can say so instead of
+    /// showing the previous file's text as if it were the new one.
+    pub loading: bool,
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -1656,6 +1689,15 @@ pub struct AutomationView {
     pub field: usize,
     /// The cursor is in the detail column rather than the list.
     pub on_detail: bool,
+    /// The cursor has walked past the fields into the run list below them.
+    /// Only ever true alongside `on_detail`: the runs are the bottom of the
+    /// same column, not a third place for the cursor to live.
+    pub on_runs: bool,
+    /// Row in the selected task's run list.
+    pub run: usize,
+    /// First visible run row, written during draw.
+    pub run_first: usize,
+    pub runs_area: Rect,
     /// First visible list row — the same stateless follow-window every other
     /// list here uses, written during draw.
     pub first_row: usize,
@@ -2095,6 +2137,14 @@ pub struct App {
     /// launch is to show the session the cursor came back to.
     pub pane_mode: PaneMode,
     pub automation: AutomationView,
+    /// Past runs per task, newest first, as the daemon reports them. Filled
+    /// on demand (opening the pane, or moving onto a task) and kept up to
+    /// date by `TaskRunUpserted` pushes — the daemon owns the history, this
+    /// is a cache of the slice being looked at.
+    pub task_runs: HashMap<TaskId, Vec<TaskRun>>,
+    /// Tasks a `ListTaskRuns` has already been sent for, so walking the list
+    /// does not re-ask on every keystroke.
+    pub runs_requested: std::collections::HashSet<TaskId>,
     /// Hotkeys as the panels dispatch them: `config.keymap()`, cached here
     /// because a keymap lookup happens on every single key press. The
     /// event loop refreshes it at startup and whenever a binding changes.
@@ -2301,6 +2351,8 @@ impl App {
             pr_preview_lines: 0,
             pr_diff_inflight: None,
             pr_diff_tx: None,
+            task_runs: HashMap::new(),
+            runs_requested: std::collections::HashSet::new(),
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
@@ -2486,6 +2538,39 @@ impl App {
         tasks.get(self.automation.selected).copied()
     }
 
+    /// Known runs of the task under the cursor, newest first. Empty until
+    /// the daemon has answered — which is not the same as "it never ran",
+    /// and the pane says so.
+    pub fn selected_task_runs(&self) -> &[TaskRun] {
+        match self.selected_task() {
+            Some(task) => self.task_runs.get(&task.id).map(|v| v.as_slice()),
+            None => None,
+        }
+        .unwrap_or(&[])
+    }
+
+    /// The run the Automation pane's run list is on.
+    pub fn selected_run(&self) -> Option<&TaskRun> {
+        self.selected_task_runs().get(self.automation.run)
+    }
+
+    /// Fold a run the daemon just pushed into the cache, newest first.
+    /// Replaces the row when it is one already held: a run is upserted at
+    /// start and again at every stage of finishing.
+    pub fn upsert_task_run(&mut self, run: TaskRun) {
+        let runs = self.task_runs.entry(run.task_id.clone()).or_default();
+        match runs.iter().position(|r| r.id == run.id) {
+            Some(at) => runs[at] = run,
+            None => {
+                let at = runs
+                    .iter()
+                    .position(|r| r.started_at <= run.started_at)
+                    .unwrap_or(runs.len());
+                runs.insert(at, run);
+            }
+        }
+    }
+
     /// Clamp the Automation cursor after the list changed under it (a task
     /// deleted elsewhere, a workspace switch, a different project selected).
     pub fn clamp_automation(&mut self) {
@@ -2498,6 +2583,14 @@ impl App {
         }
         if len == 0 {
             self.automation.on_detail = false;
+            self.automation.on_runs = false;
+        }
+        let runs = self.selected_task_runs().len();
+        if self.automation.run >= runs {
+            self.automation.run = runs.saturating_sub(1);
+        }
+        if runs == 0 {
+            self.automation.on_runs = false;
         }
     }
 

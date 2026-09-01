@@ -62,6 +62,14 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
+/// Where a task run's artifacts live: `<data>/task-runs/<slug>/<stamp>-<id>/`
+/// holding report.md, transcript.log and (if the agent wrote one) summary.md.
+/// Under the data dir rather than the state dir on purpose — these are
+/// records the user keeps and greps, not logs nebula rotates.
+pub fn task_runs_dir() -> PathBuf {
+    data_dir().join("task-runs")
+}
+
 pub fn log_dir() -> PathBuf {
     // Tests and parallel instances override the data dir; keep their logs
     // beside their data instead of the real user's state dir.

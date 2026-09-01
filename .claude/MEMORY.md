@@ -14,6 +14,135 @@ about what is worth recording.
 
 ## Entries
 
+### Answering Claude's Bypass-Permissions Modal, So Unattended Runs Can Start — 2026-08-31
+
+**Asked:** "What's a good automation task I could set up to test this out?" → "set up the smoke test
+task" → mid-run, "Update the path to ensure the latest gets run".
+
+**Did:** No code changed. Built the branch and installed it with `make install PREFIX="$HOME/.local/bin"`
+(the live daemon was left on the old binary — the `nebula kill` cutover would have killed the agent
+session doing the work). Created task `heartbeat` in the `make dev` instance for this checkout by driving
+the TUI in tmux: cron `*/2 * * * *`, `iterations = 2`, a wrap-up prompt, `unattended = yes`,
+`stall limit = 5 min`, `commit = on a branch of its own`, `run in` = the `electric-zebra-gallops`
+worktree. It fired twice on schedule and **both runs died the same way**:
+`stopped: session exited (1) at iteration 1 of 2` — the CLI was sitting on a modal, and the paste's `\r`
+answered it with "No, exit".
+
+Then, asked to fix it: new **`crates/nebula-daemon/src/pty/dialog.rs`** — `visible()` returns
+`Some(StartupDialog::{BypassPermissions,Trust})` for a PTY stream, and `ACCEPT_BYPASS_KEYS` (`\x1b[B\r`,
+↓ then Enter) answers the bypass one. Detection normalises the stream by stripping escape sequences *and
+all whitespace* before matching, because the CLI places each word with `ESC[nG` rather than spaces — the
+markers are stored despaced for the same reason. In `registry.rs`, `clear_startup_dialog` (called from
+`deliver_task_prompt`, iteration 1 only) answers the warning, waits `DIALOG_SETTLE` (750ms), and
+re-checks against the *delta* snapshot — `session.snapshot(Some(mark))`, since the dialog's own bytes stay
+in the ring forever. When a dialog is still up, or is a trust prompt, **delivery is skipped entirely**
+rather than typing into a modal; the watchdog then ends the run, and its `never_started` summary now names
+what the CLI is holding (`the CLI is waiting at its bypass-permissions warning`) instead of the old
+trust-prompt guess. The trust prompt is detected but deliberately not answered: it is remembered in
+`~/.claude.json`, so answering it would grant trust the user never gave.
+
+**Verified for real, not just in tests:** with `IS_SANDBOX` gone from the environment, `r` on the task ran
+`completed · ran 2 of 2`, the transcript shows `No, exit ❯Yes, I accept ✔` followed by the normal CLI UI,
+both prompts landed (iteration 1, then the wrap-up), `scratch/heartbeat.md` was written, the report's diff
+listed only `scratch/heartbeat.md +1 −0` despite a dirty tree, and `task/heartbeat/20260831-203953` holds
+the snapshot. 218 tests green (8 new), fmt clean, clippy unchanged.
+
+**Gotchas:**
+- **`--dangerously-skip-permissions` opens its own modal** (now answered, but know it is there) — "WARNING: Claude Code running in Bypass
+  Permissions mode … 1. No, exit / 2. Yes, I accept", cursor defaulting to **No**. The task's paste lands
+  on that dialog and the `\r` submit picks "No, exit", so the session exits 1 before the prompt is ever
+  read. This is a *different* dialog from the trust prompt (which `FIRST_TURN_TIMEOUT_SECS` already
+  guards) and it fires even in a directory Claude has seen: the run target was this very worktree.
+  Read it with `nebula runs show --transcript`, which is what made it visible.
+- **`IS_SANDBOX=1` does not suppress it.** Re-launched the whole dev instance with it exported (the
+  daemon hands its environment to the agent) and the second run hit the identical dialog. There is also
+  **no stored acceptance** to lean on: every per-project key in `~/.claude.json` was dumped and the set is
+  `hasTrustDialogAccepted`, `allowedTools`, … — nothing bypass-shaped, so it is asked every launch.
+- **Re-checking a dialog against the whole ring never clears it.** The scrollback still holds the modal's
+  bytes after it is answered, so the verification has to read only what arrived *after* the keys —
+  `snapshot(Some(base + before.len()))`. An empty delta is treated as failure: accepting redraws the
+  screen, so a CLI that took the keys always says something back.
+- **`session exited (1)` is what every failed spawn says**, which is why this took a raw PTY transcript
+  to diagnose. The `never_started` outcome now reads the screen and names the dialog instead.
+- **Everything else in the run path was proven by these two failures**: cron fired on the minute, the
+  `task_runs` row was written before the failure, `refs/nebula/runs/<id>/{base,head}` were recorded,
+  `files_changed = 0` with no snapshot branch (correct — nothing changed), and the task survived a full
+  daemon restart still scheduled.
+- **The `run in` row prints `[a worktree]`, not which one.** The only way to confirm the target was
+  `sqlite3 nebula.db "select target_kind, target_worktree from tasks"` against the dev DB.
+- **The detail column keeps its field cursor.** Leaving the fields with Esc and re-entering with `l`
+  returns to the row you left, not to `name` — a blind `l` + `j`×N walk edits the wrong field (it cycled
+  `run in` before I noticed). Press `k` past the top first, then step down.
+
+### Every Run Keeps A Record: Reports, Transcripts, And A Diff Of Its Own Work — 2026-08-31
+
+**Asked:** "new version looks gret, however how can I ensure automation tasks have an output which I can
+review and keep as needed when the automation finishes (think humanless during the night and need an
+overview of changes, etc after a task finishes)" — then chose "Full run journal" and all three surfaces
+(pane run list, CLI, one overnight digest).
+
+**Did:** New `TaskRun`/`TaskRunStatus` entity (`nebula-core/src/entities.rs`), `TaskRunId`,
+`paths::task_runs_dir()`, `RunArtifact`, three requests (`ListTaskRuns`, `GetTaskRunArtifact`,
+`GetTaskRunDigest`) and four events (`TaskRuns`, `TaskRunText`, `TaskRunDigest`, `TaskRunUpserted`);
+`PROTOCOL_VERSION` 29 → 30. **Migration 24** `CREATE TABLE task_runs` + two indexes, with
+`insert/update/get/list/unfinished_task_runs` and `RUN_LIST_CAP = 200` in `store.rs`. `git.rs` split
+`snapshot_branch` into `snapshot_commit`/`write_ref` and gained `snapshot_ref` (**always** commits, even
+on a clean tree) plus `diff_summary` — two `-z` plumbing calls (`--numstat` and `--name-status`) joined
+**by path** in `merge_diff`. `registry.rs`: `LoopState.run_id`; `run_task` inserts the record before
+anything can fail; `start_task_run` writes `refs/nebula/runs/<id>/base` before the agent starts;
+`end_task_run` takes a `TaskRunStatus`, and **returns early when the loop entry is already gone** (that
+`remove()` is now the one-run-ends-once guard); a new `finish_run_record` writes `…/head`, diffs the
+pair, runs the optional `commit_on_finish` snapshot, renders `report.md`, and appends the diffstat to the
+task's `last_outcome`; `reconcile_unfinished_runs` closes rows the daemon outlived (called from
+`lib.rs::run_daemon`). New `report.rs` (pure `render_report`/`render_digest`, local stamps daemon-side)
+and `pty/transcript.rs` (raw PTY tee, `CAP_BYTES = 32 MiB`, head kept). `task_prompt_text` gained a
+`summary_path` and asks the **last** iteration to write `summary.md`. TUI: `Overlay::Run` + `RunView`,
+a run list under the detail column (`↓` past the last field walks into it), `Enter`/`t` open
+report/transcript, `g` the 24h digest, `readable_dump` strips escapes for transcripts, and
+`ask_for_visible_runs` runs after every key/click. CLI: `nebula runs [--task --since --limit]`,
+`runs digest`, `runs show [id] [--transcript|--summary]` via `ipc::run_runs_op`. **725 tests green**
+(was 693), fmt clean, clippy at the pre-existing baseline. Verified end to end: the `e2e_pty` task-loop
+test now asserts the record, a `files_changed = 1` diff, `report.md`, a non-empty `transcript.log`, the
+two refs in the repo, and the summary ask in the last delivery; the CLI was driven against a live daemon
+with seeded rows.
+
+**Gotchas:**
+- **A run's diff must be base-to-head, not HEAD-to-tree.** The old `commit_on_finish` snapshot swept in
+  whatever the checkout was already carrying (the `USER_WIP.txt` problem in the entry below). Recording
+  the tree in a hidden ref *before* the agent starts puts that dirt on both sides, so it cancels out.
+  `a_run_diff_excludes_what_was_already_dirty` pins it. The snapshot **branch** still sweeps everything —
+  the report says so where it names the branch.
+- **`end_task_run` now always spawns a tokio task** (the report is written even when `commit_on_finish`
+  is off), so the five `#[test]` stop-path tests in `registry.rs` had to become `#[tokio::test]` —
+  otherwise "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
+- **CRLF is a line break, not an overwrite.** The first `readable_dump` treated every `\r` as "clear the
+  line", which ate every line of a normal transcript and left only the last. Bare CR still clears (that
+  is a spinner); `\r\n` does not.
+- **`--numstat` and `--name-status` cannot be paired by position** — renames and binaries make the two
+  lists disagree — so `merge_diff` looks the status up by path and keeps numstat's order. In `-z` mode a
+  rename's numstat record is `adds\tdels\t` with an *empty* path field, then `old`, then `new`.
+- **A daemon that dies mid-run leaves a row saying "running" forever.** `reconcile_unfinished_runs` only
+  rewrites the task's `last_outcome` when it still reads "running" *and* `last_run_at` matches the run,
+  or tidying an old run would clobber a newer one's outcome.
+- **The Automation pane re-scopes without any of its own keys being pressed** (walking the Projects
+  column), so the run request cannot live only in `handle_automation_key` — hence `ask_for_visible_runs`
+  after every key and click.
+- **`ClientRequest` list assertions in TUI tests are now noisier**: the first key in the pane also sends
+  `ListTaskRuns`. `the_list_toggles_with_space_and_delete_asks_first` filters it out.
+- **Nothing prunes run directories.** Rows cascade away with their task; the files on disk stay for the
+  user to read or `rm`. Deliberate — "keep as needed" was the ask — but the disk grows.
+- **`gh` defaults to the *upstream* remote here, not `origin`.** This checkout has `origin =
+  butlertg/nebula` and `upstream = AgentSystemLabs/nebula`, and `gh pr create` resolves to the latter —
+  which fails with the very misleading `No commits between main and feat/task-automation` (plus "Head sha
+  can't be blank"), because that repo's `main` is unrelated to the branch. `gh pr list` likewise lists the
+  wrong repo's PRs. Pass `-R butlertg/nebula` (or `gh api repos/butlertg/nebula/pulls`) for anything
+  PR-shaped.
+- **`make install` writes to `$(HOME)/.cargo/bin` by default, which does not exist on this machine**
+  (rust is from homebrew, and the live binary is `~/.local/bin/nebula`). It fails with `cp: …/nebula.new:
+  No such file or directory` — run `make install PREFIX="$HOME/.local/bin"`.
+- **A socket path under the scratchpad is too long for a unix socket** (`path must be shorter than
+  SUN_LEN`): smoke-testing the CLI needs `NEBULA_RUNTIME_DIR` under something like `mktemp -d /tmp/neb.XXXX`.
+
 ### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
 
 **Asked:** "I want to ensure that I can have Claude work overnight & be constructive when Iam away. How
@@ -46,9 +175,8 @@ against real `claude` v2.1.231 in a throwaway repo: three iterations where turn 
   six minutes doing nothing. It matters most for `TaskTarget::NewWorktree`, whose first run is always in a
   path Claude has not seen. Mitigated by `FIRST_TURN_TIMEOUT_SECS = 120`: when the agent is still `Fresh`
   the watchdog uses a two-minute fuse instead of the task's window and the outcome names the trust prompt.
-  **Not fixed** — whether `--dangerously-skip-permissions` bypasses the dialog is still unverified,
-  because the harness classifier blocks launching a real `claude` with that flag (same wall as the
-  previous session). Confirm before relying on an unattended task in a fresh worktree.
+  **Answered 2026-08-31 (see the top entry): `--dangerously-skip-permissions` does not clear the way —
+  it adds a *second* modal of its own**, so an unattended run stops at a dialog whichever path it takes.
 - **The snapshot is a snapshot, not a curated commit.** `add -A` sweeps in whatever else was uncommitted
   in that checkout — a pre-existing `USER_WIP.txt` landed in the run's commit. Harmless (the working tree
   is untouched and the commit is only reachable from the new branch) but it is not "the agent's diff".

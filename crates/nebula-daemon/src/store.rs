@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, Task, TaskId,
-    TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
-    DEFAULT_WORKSPACE_ID,
+    TaskRun, TaskRunId, TaskRunStatus, TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId,
+    Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -265,6 +265,38 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tasks ADD COLUMN stall_timeout_secs INTEGER NOT NULL DEFAULT 1800;
     ALTER TABLE tasks ADD COLUMN commit_on_finish INTEGER NOT NULL DEFAULT 0;
     ",
+    // 24: one row per run, kept after the run ends — the history behind
+    // `tasks.last_outcome`, which only ever holds the newest one-liner.
+    // `task_name` is denormalised because a report that names the task
+    // something it is no longer called is a report about nothing, and the
+    // artifacts on disk outlive the row (the cascade drops rows with the
+    // task; the directories stay for the user to read or bin).
+    "
+    CREATE TABLE task_runs (
+      id            TEXT PRIMARY KEY,
+      task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      project_id    TEXT NOT NULL,
+      task_name     TEXT NOT NULL,
+      agent_id      TEXT,
+      started_at    INTEGER NOT NULL,
+      ended_at      INTEGER NOT NULL DEFAULT 0,
+      status        TEXT NOT NULL,
+      outcome       TEXT NOT NULL DEFAULT '',
+      iterations_planned INTEGER NOT NULL DEFAULT 1,
+      iterations_done    INTEGER NOT NULL DEFAULT 0,
+      worktree_path TEXT NOT NULL DEFAULT '',
+      branch        TEXT NOT NULL DEFAULT '',
+      base_ref      TEXT,
+      head_ref      TEXT,
+      snapshot      TEXT,
+      files_changed INTEGER NOT NULL DEFAULT 0,
+      insertions    INTEGER NOT NULL DEFAULT 0,
+      deletions     INTEGER NOT NULL DEFAULT 0,
+      dir           TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX task_runs_by_task ON task_runs (task_id, started_at DESC);
+    CREATE INDEX task_runs_by_time ON task_runs (started_at DESC);
+    ",
 ];
 
 pub struct Store {
@@ -280,6 +312,40 @@ fn target_columns(t: &TaskTarget) -> (&'static str, Option<String>) {
         TaskTarget::Worktree(id) => ("worktree", Some(id.0.clone())),
         TaskTarget::NewWorktree => ("new_worktree", None),
     }
+}
+
+/// Most runs any one list request will hand back. A nightly task a year
+/// old has hundreds of rows and no client wants them all at once.
+const RUN_LIST_CAP: u32 = 200;
+
+fn row_to_task_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRun> {
+    let status: String = r.get(7)?;
+    let worktree_path: String = r.get(11)?;
+    let dir: String = r.get(19)?;
+    Ok(TaskRun {
+        id: TaskRunId(r.get(0)?),
+        task_id: TaskId(r.get(1)?),
+        project_id: ProjectId(r.get(2)?),
+        task_name: r.get(3)?,
+        agent_id: r.get::<_, Option<String>>(4)?.map(AgentId),
+        started_at: r.get(5)?,
+        ended_at: r.get(6)?,
+        // An unreadable status is still a finished run if it has an end
+        // stamp — `Stopped` says "it is over and nebula won't guess how".
+        status: TaskRunStatus::parse(&status).unwrap_or(TaskRunStatus::Stopped),
+        outcome: r.get(8)?,
+        iterations_planned: r.get(9)?,
+        iterations_done: r.get(10)?,
+        worktree_path: PathBuf::from(worktree_path),
+        branch: r.get(12)?,
+        base_ref: r.get(13)?,
+        head_ref: r.get(14)?,
+        snapshot: r.get(15)?,
+        files_changed: r.get(16)?,
+        insertions: r.get(17)?,
+        deletions: r.get(18)?,
+        dir: PathBuf::from(dir),
+    })
 }
 
 fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -1049,6 +1115,136 @@ impl Store {
         Ok(tasks)
     }
 
+    // ---- task runs ----
+
+    /// Columns every run read selects, in the order `row_to_task_run` wants.
+    /// New ones go on the end, for the same reason as `TASK_COLS`.
+    const RUN_COLS: &'static str = "id, task_id, project_id, task_name, agent_id, started_at, \
+         ended_at, status, outcome, iterations_planned, iterations_done, worktree_path, branch, \
+         base_ref, head_ref, snapshot, files_changed, insertions, deletions, dir";
+
+    pub fn insert_task_run(&self, r: &TaskRun) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO task_runs (id, task_id, project_id, task_name, agent_id, started_at, \
+             ended_at, status, outcome, iterations_planned, iterations_done, worktree_path, \
+             branch, base_ref, head_ref, snapshot, files_changed, insertions, deletions, dir) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20)",
+            params![
+                r.id.as_str(),
+                r.task_id.as_str(),
+                r.project_id.as_str(),
+                r.task_name,
+                r.agent_id.as_ref().map(|a| a.0.clone()),
+                r.started_at,
+                r.ended_at,
+                r.status.as_str(),
+                r.outcome,
+                r.iterations_planned,
+                r.iterations_done,
+                r.worktree_path.to_string_lossy(),
+                r.branch,
+                r.base_ref,
+                r.head_ref,
+                r.snapshot,
+                r.files_changed,
+                r.insertions,
+                r.deletions,
+                r.dir.to_string_lossy(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite everything a run learns after it starts. The identity
+    /// columns (task, project, start) are deliberately not in the SET list:
+    /// a run's identity is fixed the moment it begins.
+    pub fn update_task_run(&self, r: &TaskRun) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE task_runs SET agent_id = ?2, ended_at = ?3, status = ?4, outcome = ?5, \
+             iterations_planned = ?6, iterations_done = ?7, worktree_path = ?8, branch = ?9, \
+             base_ref = ?10, head_ref = ?11, snapshot = ?12, files_changed = ?13, \
+             insertions = ?14, deletions = ?15, dir = ?16, task_name = ?17 WHERE id = ?1",
+            params![
+                r.id.as_str(),
+                r.agent_id.as_ref().map(|a| a.0.clone()),
+                r.ended_at,
+                r.status.as_str(),
+                r.outcome,
+                r.iterations_planned,
+                r.iterations_done,
+                r.worktree_path.to_string_lossy(),
+                r.branch,
+                r.base_ref,
+                r.head_ref,
+                r.snapshot,
+                r.files_changed,
+                r.insertions,
+                r.deletions,
+                r.dir.to_string_lossy(),
+                r.task_name,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task_run(&self, id: &TaskRunId) -> Result<Option<TaskRun>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {} FROM task_runs WHERE id = ?1", Self::RUN_COLS);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(row_to_task_run(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Runs newest first. `task` None means every task; `since_ms` 0 means
+    /// no floor; `limit` 0 means [`RUN_LIST_CAP`] of them.
+    pub fn list_task_runs(
+        &self,
+        task: Option<&TaskId>,
+        since_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<TaskRun>> {
+        let limit = if limit == 0 {
+            RUN_LIST_CAP
+        } else {
+            limit.min(RUN_LIST_CAP)
+        };
+        let conn = self.conn.lock().unwrap();
+        // One statement either way: a NULL task id makes the task filter a
+        // tautology, which keeps the two callers on the same query plan.
+        let sql = format!(
+            "SELECT {} FROM task_runs WHERE (?1 IS NULL OR task_id = ?1) AND started_at >= ?2 \
+             ORDER BY started_at DESC, id DESC LIMIT ?3",
+            Self::RUN_COLS
+        );
+        let runs = conn
+            .prepare(&sql)?
+            .query_map(
+                params![task.map(|t| t.0.clone()), since_ms, limit],
+                row_to_task_run,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
+    }
+
+    /// Runs still marked running. Called once at daemon start: a run whose
+    /// daemon died is not running any more, whatever its row says.
+    pub fn unfinished_task_runs(&self) -> Result<Vec<TaskRun>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM task_runs WHERE ended_at = 0 ORDER BY started_at",
+            Self::RUN_COLS
+        );
+        let runs = conn
+            .prepare(&sql)?
+            .query_map([], row_to_task_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
+    }
+
     // ---- pull-request read marks ----
 
     /// Remember that this pull request's conversation has been read up to
@@ -1525,6 +1721,131 @@ mod tests {
         store.insert_task(&task).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_tasks().unwrap().is_empty());
+    }
+
+    fn seed_project(store: &Store, name: &str) -> Project {
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: name.into(),
+            repo_path: format!("/tmp/{name}").into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        project
+    }
+
+    fn seed_task_row(store: &Store, project: &Project) -> Task {
+        let task = Task {
+            id: TaskId::generate(),
+            project_id: project.id.clone(),
+            name: "nightly".into(),
+            prompt: "go".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cron: None,
+            iterations: 3,
+            unattended: false,
+            final_prompt: None,
+            stall_timeout_secs: 1_800,
+            commit_on_finish: false,
+            target: TaskTarget::Root,
+            enabled: true,
+            last_run_at: 0,
+            next_run_at: 0,
+            last_outcome: None,
+            last_agent_id: None,
+            created_at: 0,
+            sort_order: 0,
+        };
+        store.insert_task(&task).unwrap();
+        task
+    }
+
+    fn test_run(store: &Store, task: &Task, started: i64, status: TaskRunStatus) -> TaskRun {
+        let run = TaskRun {
+            id: TaskRunId::generate(),
+            task_id: task.id.clone(),
+            project_id: task.project_id.clone(),
+            task_name: task.name.clone(),
+            agent_id: None,
+            started_at: started,
+            ended_at: 0,
+            status,
+            outcome: "running".into(),
+            iterations_planned: task.iterations,
+            iterations_done: 0,
+            worktree_path: PathBuf::from("/repo"),
+            branch: "main".into(),
+            base_ref: None,
+            head_ref: None,
+            snapshot: None,
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            dir: PathBuf::from("/runs/x"),
+        };
+        store.insert_task_run(&run).unwrap();
+        run
+    }
+
+    /// A run is written once and updated as it learns things; the history is
+    /// what the task's single `last_outcome` line cannot be.
+    #[test]
+    fn task_runs_accumulate_and_update_in_place() {
+        let store = Store::open_in_memory().unwrap();
+        let project = seed_project(&store, "p");
+        let task = seed_task_row(&store, &project);
+
+        let old = test_run(&store, &task, 1_000, TaskRunStatus::Running);
+        let new = test_run(&store, &task, 2_000, TaskRunStatus::Running);
+
+        let listed = store.list_task_runs(Some(&task.id), 0, 0).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, new.id, "newest first");
+
+        // Finishing one is an update, not a second row.
+        let mut done = new.clone();
+        done.ended_at = 3_000;
+        done.status = TaskRunStatus::Completed;
+        done.outcome = "ran 3 of 3".into();
+        done.iterations_done = 3;
+        done.files_changed = 4;
+        done.insertions = 40;
+        done.deletions = 2;
+        done.head_ref = Some("abc".into());
+        store.update_task_run(&done).unwrap();
+
+        let read = store.get_task_run(&done.id).unwrap().unwrap();
+        assert_eq!(read.status, TaskRunStatus::Completed);
+        assert_eq!(read.outcome, "ran 3 of 3");
+        assert_eq!(read.files_changed, 4);
+        assert_eq!(read.head_ref.as_deref(), Some("abc"));
+        assert_eq!(read.started_at, new.started_at, "identity is not rewritten");
+        assert_eq!(store.list_task_runs(Some(&task.id), 0, 0).unwrap().len(), 2);
+
+        // Windows and caps.
+        assert_eq!(store.list_task_runs(None, 1_500, 0).unwrap().len(), 1);
+        assert_eq!(store.list_task_runs(None, 0, 1).unwrap().len(), 1);
+
+        // Only the run still going is unfinished, and only until it isn't.
+        let unfinished = store.unfinished_task_runs().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, old.id);
+    }
+
+    /// Runs belong to their task: deleting it takes the rows with it (the
+    /// files on disk are the user's and stay).
+    #[test]
+    fn deleting_a_task_takes_its_runs() {
+        let store = Store::open_in_memory().unwrap();
+        let project = seed_project(&store, "p");
+        let task = seed_task_row(&store, &project);
+        test_run(&store, &task, 1_000, TaskRunStatus::Completed);
+        assert_eq!(store.list_task_runs(None, 0, 0).unwrap().len(), 1);
+        store.delete_task(&task.id).unwrap();
+        assert!(store.list_task_runs(None, 0, 0).unwrap().is_empty());
     }
 
     /// Deleting the checkout a task points at must not quietly rewrite the

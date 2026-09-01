@@ -3,7 +3,10 @@
 
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, AgentId, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::{
+    paths, AgentId, ClientRequest, EnterOutcome, RunArtifact, ServerEvent, Task, TaskId, TaskRun,
+    TaskRunId, PROTOCOL_VERSION,
+};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -489,6 +492,234 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
 /// the handshake, so `Shutdown` can never reach it — exactly the situation
 /// `nebula kill` exists to fix. Fall back to SIGTERM via the pidfile, guarded
 /// by the daemon's flock so a stale pid is never signalled.
+/// `nebula runs …` — read what unattended runs left behind, without opening
+/// the TUI. The daemon owns the records (and, over ssh, the disk they are
+/// on), so every one of these is a request rather than a file read.
+#[derive(Debug, Clone)]
+pub enum RunsOp {
+    /// The table: what ran, whether it worked, how much it changed.
+    List {
+        task: Option<String>,
+        since: Option<String>,
+        limit: u32,
+    },
+    /// The morning page, rendered daemon-side.
+    Digest { since: Option<String> },
+    /// One run's report, summary, or transcript. `id` None = the newest run
+    /// (of `task`, when given).
+    Show {
+        id: Option<String>,
+        task: Option<String>,
+        part: RunArtifact,
+    },
+}
+
+/// "90m", "12h", "3d", or a bare number of hours. The window a `--since`
+/// asks for, as an epoch-ms floor.
+pub fn parse_since(spec: &str, now: i64) -> Result<i64> {
+    let spec = spec.trim();
+    let (digits, unit) = match spec.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&spec[..spec.len() - 1], c),
+        _ => (spec, 'h'),
+    };
+    let n: i64 = digits
+        .parse()
+        .with_context(|| format!("'{spec}' is not a window like 12h, 90m or 3d"))?;
+    let ms = match unit {
+        'm' => n * 60_000,
+        'h' => n * 3_600_000,
+        'd' => n * 86_400_000,
+        other => bail!("'{other}' is not a unit — use m, h or d"),
+    };
+    Ok((now - ms).max(0))
+}
+
+/// The last six characters of a run id: what its directory is named after,
+/// and short enough to retype. `nebula runs show` matches on it.
+pub fn short_run_id(id: &TaskRunId) -> String {
+    let s = id.as_str();
+    s[s.len().saturating_sub(6)..].to_ascii_lowercase()
+}
+
+pub async fn run_runs_op(op: RunsOp) -> Result<()> {
+    let now = crate::app::now_ms();
+    let mut conn = connect_or_spawn().await?;
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    let tasks = loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot { tasks, .. }) => break tasks,
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before sending a snapshot"),
+        }
+    };
+    // Task names are what a person types; ids are what the protocol takes.
+    // A substring match, because "nightly" should find "nightly review".
+    let resolve = |name: &str| -> Result<TaskId> {
+        let hits: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.name.to_lowercase().contains(&name.to_lowercase()))
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(one.id.clone()),
+            [] => bail!("no task matching '{name}'"),
+            many => bail!(
+                "'{name}' matches {} tasks: {}",
+                many.len(),
+                many.iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    };
+
+    match op {
+        RunsOp::Digest { since } => {
+            let since_ms = match since.as_deref() {
+                Some(spec) => parse_since(spec, now)?,
+                None => now - 24 * 3_600_000,
+            };
+            let req_id = 1;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::GetTaskRunDigest { req_id, since_ms },
+            )
+            .await?;
+            loop {
+                match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+                    Some(ServerEvent::TaskRunDigest { req_id: r, text }) if r == req_id => {
+                        print!("{text}");
+                        return Ok(());
+                    }
+                    Some(ServerEvent::Error {
+                        req_id: Some(r),
+                        message,
+                    }) if r == req_id => bail!("{message}"),
+                    Some(_) => continue,
+                    None => bail!("daemon closed the connection before replying"),
+                }
+            }
+        }
+        RunsOp::List { task, since, limit } => {
+            let task = task.as_deref().map(resolve).transpose()?;
+            let since_ms = match since.as_deref() {
+                Some(spec) => parse_since(spec, now)?,
+                None => 0,
+            };
+            let runs = list_runs(&mut conn, task, since_ms, limit).await?;
+            if runs.is_empty() {
+                println!("no runs recorded yet");
+                return Ok(());
+            }
+            let name_w = runs
+                .iter()
+                .map(|r| r.task_name.chars().count())
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 24);
+            println!(
+                "{:<7} {:<10} {:<name_w$} {:<10} {:<16} OUTCOME",
+                "ID", "WHEN", "TASK", "STATUS", "CHANGED"
+            );
+            for run in &runs {
+                let changed = if run.has_changes() {
+                    format!(
+                        "{} +{} −{}",
+                        run.files_changed, run.insertions, run.deletions
+                    )
+                } else {
+                    "—".to_string()
+                };
+                let name: String = run.task_name.chars().take(name_w).collect();
+                println!(
+                    "{:<7} {:<10} {:<name_w$} {:<10} {:<16} {}",
+                    short_run_id(&run.id),
+                    crate::hosts::ago_label(now - run.started_at),
+                    name,
+                    run.status.as_str(),
+                    changed,
+                    run.outcome
+                );
+            }
+            println!(
+                "\n`nebula runs show <id>` for a run's report, `--transcript` for what it printed."
+            );
+            Ok(())
+        }
+        RunsOp::Show { id, task, part } => {
+            let task = task.as_deref().map(resolve).transpose()?;
+            let runs = list_runs(&mut conn, task, 0, 0).await?;
+            let run = match &id {
+                // Matched on the short id as printed, or on a full one.
+                Some(wanted) => runs
+                    .iter()
+                    .find(|r| {
+                        let w = wanted.to_ascii_lowercase();
+                        short_run_id(&r.id) == w || r.id.as_str().to_ascii_lowercase() == w
+                    })
+                    .with_context(|| format!("no run with id '{wanted}'"))?,
+                None => runs.first().context("no runs recorded yet")?,
+            };
+            let req_id = 3;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::GetTaskRunArtifact {
+                    req_id,
+                    id: run.id.clone(),
+                    part,
+                },
+            )
+            .await?;
+            loop {
+                match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+                    Some(ServerEvent::TaskRunText {
+                        req_id: r, text, ..
+                    }) if r == req_id => {
+                        print!("{text}");
+                        return Ok(());
+                    }
+                    Some(ServerEvent::Error {
+                        req_id: Some(r),
+                        message,
+                    }) if r == req_id => bail!("{message}"),
+                    Some(_) => continue,
+                    None => bail!("daemon closed the connection before replying"),
+                }
+            }
+        }
+    }
+}
+
+async fn list_runs(
+    conn: &mut Connection,
+    task: Option<TaskId>,
+    since_ms: i64,
+    limit: u32,
+) -> Result<Vec<TaskRun>> {
+    let req_id = 2;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::ListTaskRuns {
+            req_id,
+            task,
+            since_ms,
+            limit,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::TaskRuns { req_id: r, runs }) if r == req_id => return Ok(runs),
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before replying"),
+        }
+    }
+}
+
 pub async fn kill_daemon() -> Result<bool> {
     let sock = paths::socket_path();
     if let Ok(stream) = try_connect(&sock).await {
@@ -614,6 +845,36 @@ fn send_sigterm(pid: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `--since` is typed by somebody half awake; the shapes it takes have
+    /// to be the obvious ones, and a bare number means hours.
+    #[test]
+    fn a_since_window_parses_the_shapes_people_type() {
+        let now = 1_700_000_000_000;
+        assert_eq!(parse_since("90m", now).unwrap(), now - 5_400_000);
+        assert_eq!(parse_since("12h", now).unwrap(), now - 43_200_000);
+        assert_eq!(parse_since("3d", now).unwrap(), now - 259_200_000);
+        assert_eq!(parse_since(" 6 ", now).unwrap(), now - 21_600_000);
+        assert_eq!(
+            parse_since("99999d", now).unwrap(),
+            0,
+            "a window longer than the epoch is the epoch, not a negative time"
+        );
+        assert!(parse_since("last tuesday", now).is_err());
+        assert!(parse_since("5y", now).is_err());
+    }
+
+    /// The id printed in the table is the one the run's directory is named
+    /// after, so what you read on screen is what you find on disk.
+    #[test]
+    fn a_short_run_id_is_the_tail_of_the_real_one() {
+        assert_eq!(
+            short_run_id(&TaskRunId("01JQXYZABCDEFGHJKMNPQRSTV".into())),
+            "npqrstv"[1..].to_string(),
+            "the last six characters, lowercased"
+        );
+        assert_eq!(short_run_id(&TaskRunId("abc".into())), "abc");
+    }
     use super::*;
 
     // The whole point of the message: `nebula kill` is the fix for exactly
