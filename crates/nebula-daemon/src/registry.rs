@@ -3,6 +3,7 @@
 
 use crate::git;
 use crate::hooks::{self, HookEnv};
+use crate::pty::dialog::{self, StartupDialog};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec};
 use crate::report::{self, ReportInput};
 use crate::status::{AgentStatusMachine, Effect, HookEvent};
@@ -43,6 +44,10 @@ const TASK_PROMPT_DELAY_MS: u64 = 2_500;
 /// bracketed paste asynchronously, and a submit that arrives in the same
 /// read as the paste lands as a newline inside the text instead.
 const SUBMIT_GAP: Duration = Duration::from_millis(250);
+/// How long to give the CLI to redraw after its startup dialog is answered.
+/// The paste that follows must land in the input box, not in the frame the
+/// dialog was still occupying.
+const DIALOG_SETTLE: Duration = Duration::from_millis(750);
 /// Ceiling on how long a run may sit before its *first* turn even starts.
 /// Much shorter than the task's own watchdog, because this is a different
 /// failure: a turn that is running can legitimately take half an hour, but a
@@ -2265,10 +2270,18 @@ impl Daemon {
                 "run stalled past its watchdog"
             );
             let summary = if never_started {
+                // What the CLI is holding, in its own words where possible:
+                // "session exited (1)" sent one debugging session digging
+                // through a raw PTY transcript to find a modal.
+                let waiting_on = self
+                    .session(&SessionRef::Agent(agent.clone()))
+                    .and_then(|s| dialog::visible(&s.snapshot(None).1))
+                    .map(|d| d.describe().to_string())
+                    .unwrap_or_else(|| "something that is not a prompt box".into());
                 format!(
-                    "stalled: no turn started in {} — a checkout the CLI has not seen \
-                     before opens with a trust prompt that swallows the task's first prompt",
-                    mins_label(window)
+                    "stalled: no turn started in {} — the CLI is waiting at {}",
+                    mins_label(window),
+                    waiting_on
                 )
             } else {
                 format!(
@@ -2912,6 +2925,16 @@ impl Daemon {
                 daemon.task_loops.lock().unwrap().remove(&agent_id);
                 return;
             };
+            // Iteration 1 is the only one that can meet a startup dialog: it
+            // is the first thing the CLI draws, before it has an input box
+            // at all. Pasting into it would answer it — with "No, exit",
+            // which is what killed every unattended run before this.
+            if iteration == 1 && !daemon.clear_startup_dialog(&session, &agent_id).await {
+                if let Some(state) = daemon.task_loops.lock().unwrap().get_mut(&agent_id) {
+                    state.in_flight = false;
+                }
+                return;
+            }
             let mut paste = b"\x1b[200~".to_vec();
             paste.extend_from_slice(text.as_bytes());
             paste.extend_from_slice(b"\x1b[201~");
@@ -2936,6 +2959,50 @@ impl Daemon {
                 state.last_progress_at = epoch_ms();
             }
         });
+    }
+
+    /// Answer the dialog a freshly spawned CLI may be sitting on, so the
+    /// prompt that follows lands in an input box rather than on a modal.
+    /// Returns whether it is safe to type.
+    ///
+    /// Only the bypass-permissions warning is answered — `pty::dialog` has
+    /// the reasoning for leaving the trust prompt alone. Either way a dialog
+    /// still standing means *do not type*: the run then ends through the
+    /// watchdog, which names what the CLI is waiting on, and that is far
+    /// better than a paste whose Enter silently picks an option.
+    async fn clear_startup_dialog(&self, session: &Arc<PtySession>, agent: &AgentId) -> bool {
+        let (base, before) = session.snapshot(None);
+        let Some(open) = dialog::visible(&before) else {
+            return true;
+        };
+        if open != StartupDialog::BypassPermissions {
+            tracing::warn!(agent = %agent, dialog = ?open, "CLI is holding a dialog nebula will not answer");
+            return false;
+        }
+        tracing::info!(agent = %agent, "accepting the CLI's bypass-permissions warning");
+        // Everything the CLI says from here is its answer to these keys, so
+        // the verification below reads the delta and not the ring — the
+        // dialog's own bytes are still in the scrollback either way.
+        let mark = base + before.len() as u64;
+        if let Err(e) = session.write_input(dialog::ACCEPT_BYPASS_KEYS) {
+            tracing::warn!(agent = %agent, error = %e, "could not answer the bypass warning");
+            return false;
+        }
+        tokio::time::sleep(DIALOG_SETTLE).await;
+        let (_, after) = session.snapshot(Some(mark));
+        // Silence means the keys went nowhere: accepting redraws the whole
+        // screen, so a CLI that took them always says something back.
+        if after.is_empty() {
+            tracing::warn!(agent = %agent, "the bypass warning did not react to being answered");
+            return false;
+        }
+        match dialog::visible(&after) {
+            None => true,
+            Some(still) => {
+                tracing::warn!(agent = %agent, dialog = ?still, "the dialog is still up after being answered");
+                false
+            }
+        }
     }
 
     fn rebroadcast_task(self: &Arc<Self>, id: &TaskId) {
@@ -4821,11 +4888,14 @@ mod tests {
     }
 
     /// The overnight failure that actually happened when this was first run
-    /// for real: a checkout Claude Code had not seen before opened with its
-    /// trust dialog, which swallowed the pasted prompt. No hook ever fired,
-    /// so the session stayed `Fresh` and the run sat there. A first turn that
-    /// has not started is a different failure from a turn taking a long time,
-    /// and it is caught on a much shorter fuse — and named.
+    /// for real: Claude Code opened a modal instead of an input box — a trust
+    /// dialog in an unseen checkout, or the bypass-permissions warning an
+    /// unattended run always meets — and it swallowed the pasted prompt. No
+    /// hook ever fired, so the session stayed `Fresh` and the run sat there.
+    /// A first turn that has not started is a different failure from a turn
+    /// taking a long time: it is caught on a much shorter fuse, and the
+    /// outcome names whatever the CLI is actually holding (here nothing is
+    /// on the PTY to read, so it says so rather than guessing).
     #[tokio::test]
     async fn a_run_whose_first_turn_never_starts_is_caught_early_and_explained() {
         let daemon = test_daemon();
@@ -4879,9 +4949,56 @@ mod tests {
             "caught on the short fuse: {outcome}"
         );
         assert!(
-            outcome.contains("trust prompt"),
-            "and it names the likely cause: {outcome}"
+            outcome.contains("waiting at something that is not a prompt box"),
+            "and it says what it is stuck on: {outcome}"
         );
+    }
+
+    /// The dialog-clearing path against a real PTY: a child that opens with
+    /// the bypass warning is answered and the delivery is cleared to type.
+    /// `cat` stands in for the CLI redrawing after the keys land — what the
+    /// check actually requires is that the child says *something* back.
+    #[tokio::test]
+    async fn a_bypass_warning_is_answered_before_the_prompt_is_typed() {
+        let daemon = test_daemon();
+        let agent = AgentId("a1".into());
+        let sref = SessionRef::Agent(agent.clone());
+        let screen = "WARNING: Claude Code running in Bypass Permissions mode\n\
+                      In Bypass Permissions mode, Claude Code will not ask for approval\n\
+                      1. No, exit\n  2. Yes, I accept\n";
+        let session = PtySession::spawn(
+            sref,
+            SpawnSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), format!("printf %s '{screen}'; cat")],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+                transcript: None,
+            },
+        )
+        .expect("spawn a pty");
+
+        // The child has to have drawn before there is anything to detect.
+        for _ in 0..100 {
+            if dialog::visible(&session.snapshot(None).1).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            dialog::visible(&session.snapshot(None).1),
+            Some(StartupDialog::BypassPermissions),
+            "the fixture never reached the ring"
+        );
+
+        assert!(
+            daemon.clear_startup_dialog(&session, &agent).await,
+            "answered, so the prompt may be typed"
+        );
+        session.kill();
     }
 
     /// 0 means "wait forever" — the one setting that lets an overnight run

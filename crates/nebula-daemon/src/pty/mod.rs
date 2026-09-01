@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod dialog;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
