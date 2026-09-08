@@ -171,7 +171,7 @@ impl MenuAction {
                 effort,
                 ..
             } => {
-                if crate::config::model_choices(*kind).is_empty() {
+                if !crate::config::supports_model_choice(*kind) {
                     return None;
                 }
                 match (model, effort) {

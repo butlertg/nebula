@@ -2539,12 +2539,12 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     let (title, choices, configured) = match sub {
         SubmenuKind::Models => (
             format!("{} model", kind_label(*kind)),
-            crate::config::model_choices(*kind),
+            cfg.model_choices(*kind),
             cfg.default_model(*kind),
         ),
         SubmenuKind::Efforts => (
             format!("{} effort", kind_label(*kind)),
-            crate::config::effort_choices(*kind),
+            cfg.effort_choices(*kind),
             cfg.default_effort(*kind),
         ),
     };
@@ -2555,18 +2555,18 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
             label: if *choice == configured {
                 format!("{choice} ✓")
             } else {
-                (*choice).to_string()
+                choice.clone()
             },
             action: MenuAction::NewAgentOfKind {
                 worktree: worktree.clone(),
                 kind: *kind,
                 model: match sub {
-                    SubmenuKind::Models => Some((*choice).to_string()),
+                    SubmenuKind::Models => Some(choice.clone()),
                     SubmenuKind::Efforts => model.clone(),
                 },
                 effort: match sub {
                     SubmenuKind::Models => None,
-                    SubmenuKind::Efforts => Some((*choice).to_string()),
+                    SubmenuKind::Efforts => Some(choice.clone()),
                 },
                 cloud: *cloud,
             },
@@ -6955,14 +6955,12 @@ fn activate_task_field(app: &mut App, out: &mut Vec<ClientRequest>, delta: i32) 
             spec.effort = None;
         }
         TaskField::Model => {
-            spec.model = cycle_optional(crate::config::model_choices(task.kind), &task.model, delta)
+            let cfg = crate::config::Config::load();
+            spec.model = cycle_optional(&cfg.model_choices(task.kind), &task.model, delta)
         }
         TaskField::Effort => {
-            spec.effort = cycle_optional(
-                crate::config::effort_choices(task.kind),
-                &task.effort,
-                delta,
-            )
+            let cfg = crate::config::Config::load();
+            spec.effort = cycle_optional(&cfg.effort_choices(task.kind), &task.effort, delta)
         }
         TaskField::Iterations => {
             spec.iterations = cycle_choice(&TASK_ITERATION_CHOICES, task.iterations, delta)
@@ -7031,7 +7029,7 @@ fn cycle_choice<T: Copy + PartialEq>(choices: &[T], current: T, delta: i32) -> T
 /// pass the flag", so the mapping is simply index 0 ↔ None — and cycling
 /// always comes back around to it rather than trapping the user among the
 /// named values. An unrecognised stored value reads as index 0.
-fn cycle_optional(choices: &[&str], current: &Option<String>, delta: i32) -> Option<String> {
+fn cycle_optional(choices: &[String], current: &Option<String>, delta: i32) -> Option<String> {
     if choices.is_empty() {
         return None;
     }
@@ -7044,7 +7042,7 @@ fn cycle_optional(choices: &[&str], current: &Option<String>, delta: i32) -> Opt
     } as i32;
     let step = if delta == 0 { 1 } else { delta };
     let next = (at + step).rem_euclid(choices.len() as i32) as usize;
-    (next != 0).then(|| choices[next].to_string())
+    (next != 0).then(|| choices[next].clone())
 }
 
 /// Root → each of the project's non-main worktrees → its own worktree →
@@ -10305,7 +10303,7 @@ diff --git a/src/b.rs b/src/b.rs
                 panic!("expected model submenu, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Claude model"));
-            assert_eq!(menu.items.len(), crate::config::CLAUDE_MODELS.len());
+            assert_eq!(menu.items.len(), crate::config::DEFAULT_CLAUDE_MODELS.len());
             assert_eq!(menu.items[0].label, "default ✓");
             assert_eq!(menu.items[2].label, "opus");
             assert_eq!(menu.hover, 0);
@@ -10461,6 +10459,56 @@ diff --git a/src/b.rs b/src/b.rs
                     effort: Some(e),
                     ..
                 }) if m == "sonnet" && e == "max"
+            ));
+        })
+    }
+
+    #[test]
+    fn picker_offers_models_the_config_names_and_drops_the_ones_it_omits() {
+        // The end-to-end shape of a configurable model list: a model this
+        // build has never heard of is spawnable from the picker, and one
+        // the config left out is gone from it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"codex_models": ["gpt-6-astra", "gpt-5.6-sol"], "codex_model": "gpt-6-astra"}"#,
+        )
+        .unwrap();
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            // n → Codex row → its model submenu.
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected codex model submenu");
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["default", "gpt-6-astra ✓", "gpt-5.6-sol"],
+                "the configured list is the menu, with the configured model checked"
+            );
+            assert!(
+                !labels.iter().any(|l| l.starts_with("gpt-5.6-luna")),
+                "a built-in the config left out is not offered: {labels:?}"
+            );
+            assert_eq!(menu.hover, 1, "hover starts on the configured model");
+
+            // Enter on it carries the unknown-to-this-build model through.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Codex,
+                    model: Some(m),
+                    ..
+                }) if m == "gpt-6-astra"
             ));
         })
     }

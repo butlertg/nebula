@@ -28,36 +28,55 @@ pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
-/// Model/effort choices for the new-session submenus and the settings
-/// overlay. "default" everywhere means "don't pass the flag — let the CLI
-/// pick" and is what the daemon sees as None.
-pub const CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
-pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
-pub const CODEX_MODELS: &[&str] = &[
+/// Model/effort choices for the new-session submenus, the Automation
+/// pane's model and effort fields, and the settings overlay. "default"
+/// everywhere means "don't pass the flag — let the CLI pick" and is what
+/// the daemon sees as None.
+///
+/// The model lists here are only the built-in starting point. The
+/// `claude_models` / `codex_models` settings replace them wholesale, which
+/// is how a model a CLI gained after this build reaches the pickers
+/// without a new release — see [`Config::model_choices`]. Efforts are not
+/// configurable: both CLIs take a closed set that doesn't grow with the
+/// model vocabulary.
+pub const DEFAULT_CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
+pub const DEFAULT_CODEX_MODELS: &[&str] = &[
     "default",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
 ];
+pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
 pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
 
-/// Model choices for a session kind; empty = no model submenu (Cursor).
-pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
+/// The built-in model list for a kind; empty = that CLI has no model knob.
+pub fn default_models(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Claude => CLAUDE_MODELS,
-        AgentKind::Codex => CODEX_MODELS,
+        AgentKind::Claude => DEFAULT_CLAUDE_MODELS,
+        AgentKind::Codex => DEFAULT_CODEX_MODELS,
         AgentKind::Cursor => &[],
     }
 }
 
-/// Effort choices for a session kind; empty = no effort submenu (Cursor).
-pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
+/// The built-in effort list for a kind; empty = that CLI has no effort
+/// knob. Private because nothing overrides it — [`Config::effort_choices`]
+/// is the way in, so the two vocabularies read the same at the call sites.
+fn default_efforts(kind: AgentKind) -> &'static [&'static str] {
     match kind {
         AgentKind::Claude => CLAUDE_EFFORTS,
         AgentKind::Codex => CODEX_EFFORTS,
         AgentKind::Cursor => &[],
     }
+}
+
+/// Whether a kind has model and effort submenus at all. `cursor-agent`
+/// takes neither flag, so no config can give it one. Answering from the
+/// kind alone is deliberate: [`crate::app::MenuAction::submenu`] asks this
+/// once per row per frame to decide the `▸` marker, and it must not touch
+/// the config file to do it.
+pub fn supports_model_choice(kind: AgentKind) -> bool {
+    !default_models(kind).is_empty()
 }
 
 /// One setting row in the overlay; rows live inside a [`SettingsTab`].
@@ -376,6 +395,25 @@ pub struct Config {
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
+    /// The model lists the pickers offer, replacing the built-in
+    /// [`DEFAULT_CLAUDE_MODELS`] / [`DEFAULT_CODEX_MODELS`]. Entries reach
+    /// the CLI verbatim (`--model <entry>`), so naming one here is how a
+    /// model released after this build shows up in the `n` submenu, the
+    /// Automation pane and the settings overlay.
+    ///
+    /// "default" is always offered first whether or not it is listed —
+    /// it is the sentinel for "pass no flag", and a list without it would
+    /// strand anyone who had set one. Blank and duplicate entries drop
+    /// out, and a list that empties to nothing falls back to the built-in
+    /// one rather than to no choices at all. See
+    /// [`Config::model_choices`].
+    ///
+    /// Only written to the file when it differs from the built-in list,
+    /// the same rule `keybindings` follows: an install that never
+    /// customised it keeps inheriting new built-in models on upgrade
+    /// instead of pinning whatever shipped today.
+    pub claude_models: Vec<String>,
+    pub codex_models: Vec<String>,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -401,6 +439,8 @@ impl Default for Config {
             claude_effort: "default".into(),
             codex_model: "default".into(),
             codex_effort: "default".into(),
+            claude_models: owned(DEFAULT_CLAUDE_MODELS),
+            codex_models: owned(DEFAULT_CODEX_MODELS),
             keybindings: BTreeMap::new(),
         }
     }
@@ -501,6 +541,18 @@ impl Config {
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
+        put_list(
+            obj,
+            "claude_models",
+            &self.claude_models,
+            DEFAULT_CLAUDE_MODELS,
+        );
+        put_list(
+            obj,
+            "codex_models",
+            &self.codex_models,
+            DEFAULT_CODEX_MODELS,
+        );
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -549,6 +601,27 @@ impl Config {
             AgentKind::Cursor => return None,
         };
         non_default(value)
+    }
+
+    /// The model list the pickers offer for `kind`: `claude_models` /
+    /// `codex_models` when the config names them, the built-in list
+    /// otherwise. Always starts with "default" and is never empty for a
+    /// kind that has a model knob, so callers can rely on index 0 meaning
+    /// "pass no flag". Empty for Cursor, which has no `--model`.
+    pub fn model_choices(&self, kind: AgentKind) -> Vec<String> {
+        let configured = match kind {
+            AgentKind::Claude => &self.claude_models,
+            AgentKind::Codex => &self.codex_models,
+            AgentKind::Cursor => return Vec::new(),
+        };
+        normalize_choices(configured, default_models(kind))
+    }
+
+    /// The effort list for `kind`. Not configurable — see the note on
+    /// [`CLAUDE_EFFORTS`] — but shaped like [`Config::model_choices`] so
+    /// the pickers can treat the two vocabularies identically.
+    pub fn effort_choices(&self, kind: AgentKind) -> Vec<String> {
+        owned(default_efforts(kind))
     }
 
     /// Hotkeys as the event loop dispatches them: defaults with this
@@ -616,17 +689,23 @@ impl Config {
             SettingKind::ShowWorkspaces => {
                 self.show_workspaces = !self.show_workspaces;
             }
+            // Cycle the list the pickers show, not the built-in one, so a
+            // customised list is what the overlay walks.
             SettingKind::ClaudeModel => {
-                self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
+                let choices = self.model_choices(AgentKind::Claude);
+                self.claude_model = cycle_choice(&self.claude_model, &choices, step).to_string();
             }
             SettingKind::ClaudeEffort => {
-                self.claude_effort = cycle_choice(&self.claude_effort, CLAUDE_EFFORTS, step).into();
+                let choices = self.effort_choices(AgentKind::Claude);
+                self.claude_effort = cycle_choice(&self.claude_effort, &choices, step).to_string();
             }
             SettingKind::CodexModel => {
-                self.codex_model = cycle_choice(&self.codex_model, CODEX_MODELS, step).into();
+                let choices = self.model_choices(AgentKind::Codex);
+                self.codex_model = cycle_choice(&self.codex_model, &choices, step).to_string();
             }
             SettingKind::CodexEffort => {
-                self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
+                let choices = self.effort_choices(AgentKind::Codex);
+                self.codex_effort = cycle_choice(&self.codex_effort, &choices, step).to_string();
             }
         }
     }
@@ -657,13 +736,71 @@ fn on_off(v: bool) -> &'static str {
     }
 }
 
-fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -> &'a str {
+/// `&'static [&'static str]` for the fixed lists, `&[String]` for the
+/// configurable ones — generic so both read the same at the call sites.
+/// An unrecognised `current` reads as index 0, which for every list here
+/// is "default".
+fn cycle_choice<'a, S: AsRef<str>>(current: &str, choices: &'a [S], delta: i32) -> &'a str {
+    if choices.is_empty() {
+        return "";
+    }
     let n = choices.len() as i32;
     let pos = choices
         .iter()
-        .position(|c| c.eq_ignore_ascii_case(current.trim()))
+        .position(|c| c.as_ref().eq_ignore_ascii_case(current.trim()))
         .unwrap_or(0) as i32;
-    choices[(pos + delta).rem_euclid(n) as usize]
+    choices[(pos + delta).rem_euclid(n) as usize].as_ref()
+}
+
+fn owned(choices: &[&str]) -> Vec<String> {
+    choices.iter().map(|c| (*c).to_string()).collect()
+}
+
+/// A configured choice list folded into what the pickers can use: entries
+/// trimmed, blanks dropped, duplicates collapsed case-insensitively, and
+/// "default" pulled to the front because it is the sentinel every caller
+/// indexes for "pass no flag". A list that survives none of that falls
+/// back to `fallback`, so a typo'd or emptied setting degrades to the
+/// built-in models rather than to an empty menu.
+fn normalize_choices(configured: &[String], fallback: &[&str]) -> Vec<String> {
+    fn push(out: &mut Vec<String>, entry: &str) {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.eq_ignore_ascii_case("default") {
+            return;
+        }
+        if !out.iter().any(|c| c.eq_ignore_ascii_case(entry)) {
+            out.push(entry.to_string());
+        }
+    }
+    let mut out: Vec<String> = Vec::with_capacity(configured.len() + 1);
+    for entry in configured {
+        push(&mut out, entry);
+    }
+    if out.is_empty() {
+        for entry in fallback {
+            push(&mut out, entry);
+        }
+    }
+    out.insert(0, "default".to_string());
+    out
+}
+
+/// Write a choice list only when it differs from the built-in one, and
+/// drop the key when it matches. Same rule as `keybindings`: a config that
+/// never customised the list keeps inheriting new built-in models on
+/// upgrade instead of freezing today's set into the file.
+fn put_list(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    current: &[String],
+    default: &[&str],
+) {
+    let same = current.len() == default.len() && current.iter().zip(default).all(|(a, b)| a == b);
+    if same {
+        obj.remove(key);
+    } else {
+        obj.insert(key.to_string(), serde_json::json!(current));
+    }
 }
 
 fn load_from(path: &Path) -> Config {
@@ -1012,6 +1149,121 @@ mod tests {
         assert_eq!(reread.claude_effort, "default");
         assert_eq!(reread.codex_model, "default");
         assert_eq!(reread.codex_effort, "xhigh");
+    }
+
+    #[test]
+    fn configured_model_list_replaces_the_builtin_one() {
+        // The whole point: a model this build never heard of reaches the
+        // pickers from the config file alone.
+        let cfg: Config =
+            serde_json::from_str(r#"{"codex_models": ["gpt-6-astra", "gpt-5.6-sol"]}"#).unwrap();
+        assert_eq!(
+            cfg.model_choices(AgentKind::Codex),
+            vec!["default", "gpt-6-astra", "gpt-5.6-sol"],
+            "configured list wins, with the no-flag sentinel pulled to the front"
+        );
+        // Claude was not named, so it keeps the built-in list.
+        assert_eq!(
+            cfg.model_choices(AgentKind::Claude),
+            owned(DEFAULT_CLAUDE_MODELS)
+        );
+        // And a configured model that is in the list resolves as ever.
+        let mut cfg = cfg;
+        cfg.codex_model = "gpt-6-astra".into();
+        assert_eq!(
+            cfg.default_model(AgentKind::Codex).as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn model_list_normalizes_blanks_duplicates_and_the_default_row() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"claude_models": ["  opus  ", "", "OPUS", "default", "haiku"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.model_choices(AgentKind::Claude),
+            vec!["default", "opus", "haiku"],
+            "trimmed, de-duplicated case-insensitively, and 'default' listed once at the front"
+        );
+    }
+
+    #[test]
+    fn an_emptied_model_list_falls_back_instead_of_stranding_the_pickers() {
+        // An empty list — or one that normalizes away to nothing — must not
+        // leave the submenu with only "default" and no way back.
+        for raw in [r#"{"codex_models": []}"#, r#"{"codex_models": ["", "  "]}"#] {
+            let cfg: Config = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                cfg.model_choices(AgentKind::Codex),
+                owned(DEFAULT_CODEX_MODELS),
+                "{raw} should fall back to the built-in list"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_has_no_model_menu_whatever_the_config_says() {
+        let cfg: Config = serde_json::from_str(r#"{"codex_models": ["gpt-6-astra"]}"#).unwrap();
+        assert!(cfg.model_choices(AgentKind::Cursor).is_empty());
+        assert!(cfg.effort_choices(AgentKind::Cursor).is_empty());
+        assert!(!supports_model_choice(AgentKind::Cursor));
+        assert!(supports_model_choice(AgentKind::Claude));
+        assert!(supports_model_choice(AgentKind::Codex));
+    }
+
+    #[test]
+    fn the_settings_row_cycles_the_configured_list_not_the_builtin() {
+        let mut cfg: Config = serde_json::from_str(r#"{"codex_models": ["gpt-6-astra"]}"#).unwrap();
+        let (tab, row) = locate(SettingKind::CodexModel).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.codex_model, "gpt-6-astra");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.codex_model, "default", "two entries, so it wraps");
+        // A model dropped from the list is no longer reachable by cycling,
+        // which is what "replaces" has to mean for the overlay too.
+        cfg.codex_model = "gpt-5.5".into();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.codex_model, "gpt-6-astra",
+            "an off-list value reads as index 0 and steps forward from there"
+        );
+    }
+
+    #[test]
+    fn the_model_list_is_written_only_once_it_differs_from_the_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Untouched: the key stays out of the file, so a later release
+        // adding a built-in model reaches this install.
+        let mut cfg = Config::default();
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("claude_models").is_none());
+        assert!(saved.get("codex_models").is_none());
+
+        // Customised: written out, and it survives the round trip.
+        cfg.codex_models = vec!["default".into(), "gpt-6-astra".into()];
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["codex_models"][1], "gpt-6-astra");
+        assert_eq!(
+            load_from(&path).model_choices(AgentKind::Codex),
+            vec!["default", "gpt-6-astra"]
+        );
+
+        // Back to the built-in list: the key is dropped again rather than
+        // left behind pinning today's models forever.
+        let mut cfg = load_from(&path);
+        cfg.codex_models = owned(DEFAULT_CODEX_MODELS);
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("codex_models").is_none());
     }
 
     #[test]
