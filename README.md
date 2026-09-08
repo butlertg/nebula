@@ -239,6 +239,14 @@ The panels aren't the only view. With a worktree selected, from any panel:
   editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
   whether new sessions stop to ask for a name. `R` inside the overlay puts every setting — hotkeys
   included — back to its default, after a confirmation.
+- **The model lists are yours to set.** The models offered for a new session — in the `n` picker, the
+  Automation pane and the settings overlay — come from `"claude_models"` / `"codex_models"` in the same
+  file, and default to a built-in list when you don't name one. So a model your CLI gained after this
+  release is one line away rather than a nebula upgrade: `"codex_models": ["gpt-5.6-sol", "my-new-model"]`.
+  Entries reach the CLI verbatim as `--model <entry>`, so nebula never has to know the name. `default`
+  is always offered first — it means "pass no flag, let the CLI pick" — and the list is only written
+  back to the file once you change it, so installs that leave it alone keep inheriting new built-ins.
+  Reasoning efforts stay fixed: both CLIs take a closed set that doesn't grow with the model list.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
@@ -337,7 +345,8 @@ nebula upgrade            # install the latest release (--force on a dev build)
 ## Configuration
 
 Settings: `~/.local/share/nebula/config.json` (or the platform equivalent), beside the database —
-hand-editable, and what the `s` overlay writes.
+hand-editable, and what the `s` overlay writes. `"claude_models"` and `"codex_models"` are the model
+lists the pickers offer; omit them for the built-in defaults.
 
 Logs: `~/.local/state/nebula/daemon.log` and `tui.log` (`NEBULA_LOG=debug` for more). `NEBULA_EDITOR`
 overrides the configured editor. Overrides for tests/parallel instances: `NEBULA_RUNTIME_DIR`,

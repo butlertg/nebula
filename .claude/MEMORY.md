@@ -14,6 +14,46 @@ about what is worth recording.
 
 ## Entries
 
+### The Model Pick Lists Became A Setting — 2026-09-08
+
+**Asked:** "Is an update needed to show new model options? For instance, I assumed i could try Astra for
+Codex, but did not see it" — then, once the answer was "the list is a hardcoded const":
+**"make the model list configurable instead of hardcoded"**.
+
+**Did:** `CLAUDE_MODELS`/`CODEX_MODELS` → `DEFAULT_CLAUDE_MODELS`/`DEFAULT_CODEX_MODELS`, and two new
+config keys `claude_models`/`codex_models` (`Vec<String>`) that **replace** the built-in list wholesale.
+New `Config::model_choices(kind)` / `Config::effort_choices(kind)` return `Vec<String>`; the free
+`config::model_choices`/`effort_choices` are gone. `normalize_choices` trims, drops blanks, dedupes
+case-insensitively, forces "default" to index 0 (every caller indexes 0 for "pass no flag"), and falls
+back to the built-in list if the configured one empties out. `put_list` writes a list **only when it
+differs** from the built-in one and removes the key when it matches — the `keybindings` rule, so
+untouched installs keep inheriting new built-in models instead of pinning today's. Call sites updated:
+`app.rs:174` (Cursor gate), `event_loop.rs` `build_submenu` and `activate_task_field`, and
+`cycle_optional` now takes `&[String]`. Efforts stay fixed by decision — both CLIs take a closed set that
+doesn't grow with the model vocabulary. README documents both keys. 7 new tests; 702 passed / 0 failed
+across all 7 binaries, fmt clean, no new clippy warnings.
+
+**Gotchas:**
+- **The shared checkout was 5 commits behind `origin/main`, and the unpulled commits added two new
+  `model_choices` call sites** — the Automation pane's `activate_task_field` → `cycle_optional`
+  (`event_loop.rs:6958`), which does not exist at `5418ae4`. Changing the signature on the stale base
+  would have compiled locally and broken `origin/main`. This tree habitually lags (see the
+  behind-its-own-work entries); before changing any shared signature here, run
+  `git diff HEAD origin/main -- <file>` and look for **added** callers, not just conflicts.
+- **`MenuAction::submenu()` runs once per row per frame** to decide the `▸` marker, and its Cursor gate
+  was `model_choices(kind).is_empty()`. Making that config-driven would have put a `Config::load()` file
+  read in the render path. Split out `config::supports_model_choice(kind)`, which answers from the kind
+  alone — Cursor's CLI takes no `--model`, so no config can give it one.
+- **`let mut push = |e| out.push(…)` then `if out.is_empty()` is E0502** — the closure holds the mutable
+  borrow across the later read. A nested `fn push(out: &mut Vec<String>, entry: &str)` compiles; the
+  closure never will.
+- **`cycle_choice` had to go generic over `AsRef<str>`** to serve both `&'static [&'static str]` and
+  `&[String]`. It indexes with `rem_euclid(n)`, which **panics when `n == 0`** — unreachable while every
+  list was a non-empty const, reachable now, so it got an empty-slice guard returning `""`.
+- **A clippy warning that looks new may just have moved.** `field_reassign_with_default` reported at
+  `config.rs:1144` was the pre-existing one at `:1007`, pushed down by inserted tests. Confirmed by
+  `git stash push -- <files>`, re-running clippy, and `git stash pop` — cheaper than reading the lint.
+
 ### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
 
 **Asked:** "I want to ensure that I can have Claude work overnight & be constructive when Iam away. How
@@ -2103,8 +2143,10 @@ permissions always skipped for both (`89f9860`).
 
 **Gotchas:**
 - `claude` takes `--model <alias>` and `--effort <low|…|max>`; `codex` takes `-m/--model` but effort only
-  via `-c model_reasoning_effort=<…>`; `cursor-agent` has no model/effort knobs. Pick lists are hardcoded
-  in `crates/nebula-tui/src/config.rs` (`CLAUDE_MODELS`, `CODEX_MODELS`) — "default" always means
+  via `-c model_reasoning_effort=<…>`; `cursor-agent` has no model/effort knobs. Pick lists live in
+  `crates/nebula-tui/src/config.rs`, but they are **no longer hardcoded as of 2026-09-08**: the constants
+  were renamed `DEFAULT_CLAUDE_MODELS` / `DEFAULT_CODEX_MODELS` and the `claude_models` / `codex_models`
+  settings replace them — see the configurable-model-list entry at the top. "default" still always means
   "pass no flag".
 - Cursor has no PermissionRequest hook and nebula runs `cursor-agent --force`, so cursor agents report
   busy/idle but **never** needs-feedback. That is expected, not a bug.
