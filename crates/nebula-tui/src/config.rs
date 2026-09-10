@@ -40,13 +40,7 @@ pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 /// configurable: both CLIs take a closed set that doesn't grow with the
 /// model vocabulary.
 pub const DEFAULT_CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
-pub const DEFAULT_CODEX_MODELS: &[&str] = &[
-    "default",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-];
+pub const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
 pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
 pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
 

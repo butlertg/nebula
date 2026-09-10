@@ -14,7 +14,7 @@ about what is worth recording.
 
 ## Entries
 
-### The Model Pick Lists Became A Setting — 2026-09-08
+### The Model Pick Lists Became A Setting — 2026-09-08 (synced 2026-09-10)
 
 **Asked:** "Is an update needed to show new model options? For instance, I assumed i could try Astra for
 Codex, but did not see it" — then, once the answer was "the list is a hardcoded const":
@@ -32,6 +32,15 @@ untouched installs keep inheriting new built-in models instead of pinning today'
 `cycle_optional` now takes `&[String]`. Efforts stay fixed by decision — both CLIs take a closed set that
 doesn't grow with the model vocabulary. README documents both keys. 7 new tests; 702 passed / 0 failed
 across all 7 binaries, fmt clean, no new clippy warnings.
+
+**Did (2026-09-10 follow-up):** Answered the original Astra question and synced both lists to what
+`codex` actually offers. `gpt-5.6-sol` is gone from `DEFAULT_CODEX_MODELS` (`config.rs:43`, now
+`["default", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]`) and from the README example at `README.md:245`,
+which had been teaching a slug codex no longer lists. Tim's own `codex_models` was rewritten to
+`["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-6-astra"]` and his `codex_model` set to
+`"gpt-6-astra"`, so every Codex spawn — new, restart, resume, prewarm — carries `--model gpt-6-astra`,
+the invocation shape he confirmed works. Also fixed a stale doc comment at `registry.rs:3085`, which
+claimed codex gets `-m m` when the code has always emitted `--model`.
 
 **Gotchas:**
 - **The shared checkout was 5 commits behind `origin/main`, and the unpulled commits added two new
@@ -53,6 +62,39 @@ across all 7 binaries, fmt clean, no new clippy warnings.
 - **A clippy warning that looks new may just have moved.** `field_reassign_with_default` reported at
   `config.rs:1144` was the pre-existing one at `:1007`, pushed down by inserted tests. Confirmed by
   `git stash push -- <files>`, re-running clippy, and `git stash pop` — cheaper than reading the lint.
+- **`gpt-6-astra` works, but only as a launch flag — and the rollout 400s are a red herring.** Tim:
+  "the only way to fire up Codex with use on gpt-6-astra was to pass it via thecommandline as the
+  --model". Two rollouts do fail with `400 invalid_request_error: The 'gpt-6-astra' model is not
+  supported when using Codex with a ChatGPT account`
+  (`~/.codex/sessions/2026/09/08/rollout-…437.jsonl`, `…/2026/09/10/rollout-…30c.jsonl`) — but in both,
+  astra was the *session* model (`collaboration_mode.model`, `provenance`) rather than the launch
+  argument, so that error does **not** mean the account lacks access. Nebula already spawns the working
+  shape (`registry.rs:3274` → `--model <entry>`), so the picker path is fine. An earlier version of this
+  bullet called astra auth-gated and unusable; that was wrong.
+- **A model only reaches codex when the spec is non-`None`.** `codex_model: "default"` resolves to `None`
+  (`event_loop.rs:4152-4158`), no `--model` is passed, and codex falls back to `~/.codex/config.toml`.
+  So "I picked it in the config and it still ran the old model" means the spec was `default`, not that
+  the flag failed — set `"codex_model": "gpt-6-astra"` to make it the standing default.
+- **`~/.codex/models_cache.json` is the authoritative model list** — codex refetches it (it carries
+  `fetched_at` and an etag), each entry has a `slug` plus `visibility` (`list` vs `hide`). It is how to
+  answer "does this model exist for this account" without guessing: today it lists only `gpt-5.6-terra`,
+  `gpt-5.6-luna`, `gpt-5.5` (plus hidden `gpt-reserve`, `codex-auto-review`), with no astra and no gated
+  variant in `upgrade` / `availability_nux`. `gpt-5.6-sol`, in `DEFAULT_CODEX_MODELS` since the list
+  landed, is **not** in it — hence the sync.
+- **The running TUI dropped `codex_models` from config.json mid-task.** The key was present when read and
+  gone minutes later with nothing else changed, which is what a settings-overlay save or an `R` reset
+  produces via `put_list`'s "omit the key when it matches the built-in". Re-read the file immediately
+  before patching it by hand, and expect a hand-set model list to vanish if the user hits `R`.
+- **`cargo test --workspace` (fail-fast) failed `e2e_pty::workspace_scope_is_per_connection` again**, then
+  passed on the `--no-fail-fast` re-run — the same flake logged below. Use `--no-fail-fast` first so one
+  flaky e2e does not mask the other six binaries.
+- **`make install` fails out of the box on this machine: `PREFIX` defaults to `$(HOME)/.cargo/bin`
+  (`Makefile:14`), which does not exist** — `cp: /Users/timbutler/.cargo/bin/nebula.new: No such file or
+  directory`. The nebula on PATH is `~/.local/bin/nebula`, so the working invocation is
+  `make install PREFIX=$HOME/.local/bin`. Verify the install took with
+  `strings ~/.local/bin/nebula | grep gpt-5.6-sol` (0 hits = new list) rather than trusting the version
+  line, which does not change. The cutover, `nebula kill`, stops **all** sessions including the agent
+  running the install — never run it unprompted from inside a nebula session.
 
 ### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
 
