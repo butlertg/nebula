@@ -95,6 +95,16 @@ claimed codex gets `-m m` when the code has always emitted `--model`.
   `strings ~/.local/bin/nebula | grep gpt-5.6-sol` (0 hits = new list) rather than trusting the version
   line, which does not change. The cutover, `nebula kill`, stops **all** sessions including the agent
   running the install — never run it unprompted from inside a nebula session.
+- **`gh` targets the wrong repo from this checkout.** `origin` is `butlertg/nebula`, a **fork**, and
+  `upstream` is `AgentSystemLabs/nebula`; with no default set `gh` resolves to upstream, so a plain
+  `gh pr create` fails with the misleading `No commits between main and <branch>` — the branch is on the
+  fork, not upstream. PRs for this tree go to the fork's own main (as #1, #3, #4 did):
+  `gh pr create --repo butlertg/nebula --base main`.
+- **The fork's main is ~167 commits behind upstream, and the model-list code diverged.** Upstream calls
+  it `CODEX_MODELS` (built on a `DEFAULT_CHOICE` const, with a `claude_catalogue::models()` layer and a
+  `Pi` agent kind); this fork still has `DEFAULT_CODEX_MODELS`. Upstream **also** still carries
+  `gpt-5.6-sol`. Any fix meant for upstream has to be re-authored against its symbols — a branch off this
+  fork's main will not apply there.
 
 ### Overnight-Safe Tasks: Runs That End Themselves, Wrap Up, And Commit — 2026-08-28
 
