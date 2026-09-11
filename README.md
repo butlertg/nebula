@@ -242,7 +242,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
 - **The model lists are yours to set.** The models offered for a new session — in the `n` picker, the
   Automation pane and the settings overlay — come from `"claude_models"` / `"codex_models"` in the same
   file, and default to a built-in list when you don't name one. So a model your CLI gained after this
-  release is one line away rather than a nebula upgrade: `"codex_models": ["gpt-5.6-sol", "my-new-model"]`.
+  release is one line away rather than a nebula upgrade: `"codex_models": ["gpt-5.6-terra", "my-new-model"]`.
   Entries reach the CLI verbatim as `--model <entry>`, so nebula never has to know the name. `default`
   is always offered first — it means "pass no flag, let the CLI pick" — and the list is only written
   back to the file once you change it, so installs that leave it alone keep inheriting new built-ins.

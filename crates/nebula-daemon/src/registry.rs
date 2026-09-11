@@ -3082,7 +3082,7 @@ impl Daemon {
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
 /// appended after the resume args — same convention as Mission Control.
 /// Model/effort choices follow: `claude --model m --effort e`,
-/// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
+/// `codex --model m -c model_reasoning_effort=e` (cursor has neither knob).
 /// Claude then gets nebula's worktree guidance appended to its system
 /// prompt, and an `initial_prompt` — the relocation notice a `nebula
 /// worktree` respawn opens with — goes last, as Claude's positional prompt
