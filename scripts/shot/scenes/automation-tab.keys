@@ -1,0 +1,8 @@
+# The AUTOMATION TAB with one task defined: Shift+E flips the pane to it,
+# `n` asks for the task's name and then the prompt it sends every turn.
+E
+n
+nightly review
+Enter
+Run the test suite and fix whatever broke overnight
+Enter
