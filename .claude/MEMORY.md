@@ -14,6 +14,60 @@ about what is worth recording.
 
 ## Entries
 
+### Merging 167 Upstream Commits Into The Fork — 2026-09-14
+
+**Asked:** "Now taht codex model sync is in main, get main and merge in the commits that it is behind
+from upstream" — then, once the shape was clear, the choice that upstream's model-list layer wins over
+the fork's: **"Keep going to green"** on the four remaining conflicted files.
+
+**Did:** Merged `upstream/main` (AgentSystemLabs/nebula, 167 commits ahead) into this fork's main on
+branch `merge-upstream`. 10 conflicted files, 55 hunks, plus 14 staged deletions. The fork's Automation
+feature and `.claude/MEMORY.md` survive; the fork's `Config::model_choices` / `DEFAULT_*_MODELS` layer
+is gone, replaced by upstream's `claude_catalogue` + `config::model_choices(kind)`. New
+`crates/nebula-tui/src/codex_catalogue.rs` keeps `codex_models` working in upstream's shape, because
+**upstream has no `codex_models` setting at all** — its configurable list covers Claude only. 1088
+tests pass, fmt clean, clippy back to upstream's own 7 pre-existing warnings.
+
+**Gotchas:**
+- **Upstream deleted the whole agent-instruction layer** — `CLAUDE.md`, `AGENTS.md`, `.mcp.json` and the
+  diagram/nebula-memory/recall/release skills across `.claude`, `.agents` and `.cursor` (it keeps
+  user-facing `docs/` instead). They come back as 14 staged deletions that look like noise in
+  `git status`. Restore them with `git checkout HEAD -- <paths>`; upstream's new `pr-description` and
+  `pr-reviewer` skills are additive and worth keeping alongside.
+- **Both sides added migrations numbered 22 and 23, and `MIGRATIONS` is applied by index against
+  `PRAGMA user_version`.** This install's DB was already at 24, so the fork's task migrations had to
+  *stay* at 22/23 and upstream's three were renumbered to 24/25/26. Ordering them the other way would
+  have skipped `pr_url`, `claude_title` and `recent_prompts` on every existing fork install, forever.
+  Check `sqlite3 "$(nebula path or ~/Library/Application Support/dev.nebula.nebula)/nebula.db"
+  "PRAGMA user_version"` before deciding the order.
+- **Slicing a conflict by line number eats the closing token.** Taking `lines[235:275]` for migration 23
+  dropped its terminating `",` and the parser then reported nonsense a thousand lines away — `prefix
+  \`user_version\` is unknown`, `unknown start of token: \`. Same class of bug cut a test function's
+  closing brace in `app.rs` ("unclosed delimiter" pointing at the end of the file). When a conflict
+  splits a literal or a block, resolve by whole syntactic unit, not by slice.
+- **`e` collided.** Upstream binds it to AGENT PRESETS; the fork's Automation tab had it. The Automation
+  toggle moved to `shift+e` (`keymap.rs`), caught by `defaults_do_not_collide_within_a_scope` rather
+  than by anything at runtime.
+- **Upstream dropped `pinned` from Agent and Worktree.** The fork pinned a task's session so the idle
+  reaper would spare it between turns. The replacement is better: `reap_idle_sessions` now spares any
+  agent with a live entry in `task_loops`, which lasts exactly as long as the run does.
+- **Two tests, one temp file.** Both sides named their migration test DB `nebula-mig22-test-<pid>.db`.
+  In one tree that was unique; merged, they run in the same process and fight over the file — the
+  failure reads `SqliteFailure(..., "disk I/O error")`, not "file in use".
+- **`std::ptr::eq` cannot assert a const slice's identity.** `CODEX_MODELS` is a `const`, so each use
+  site may hold its own copy and `ptr::eq(leak(&same), CODEX_MODELS)` fails even when the early return
+  did its job. Assert contents instead.
+- **A blanket string replacement across a test file is a trap.** Sweeping `gpt-5.6-sol` → `gpt-5.6-terra`
+  corrupted `preset_editor_types_to_filter_choice_rows`, which drives the *cursor* catalogue with seeded
+  ids that merely look like codex slugs. Restored that test verbatim from upstream.
+- **Behaviour that moved, so tests had to:** `q` now opens a confirm dialog instead of setting
+  `should_quit`; Tab no longer wraps out of the pane (`next_visible_focus` stops at Terminal — ⇧Tab is
+  the way out); the pane header is a tab strip, so `TERMINAL · agent-1` is no longer one string.
+- **`picker_offers_models_the_config_names_and_drops_the_ones_it_omits` was deleted, not fixed.** The
+  catalogues are process-global and `Config::load` deliberately skips syncing them under `cfg(test)`,
+  so a picker-level test of `codex_models` cannot stand. Its assertions live in `codex_catalogue`'s own
+  unit tests now.
+
 ### The Model Pick Lists Became A Setting — 2026-09-08 (synced 2026-09-10)
 
 **Asked:** "Is an update needed to show new model options? For instance, I assumed i could try Astra for

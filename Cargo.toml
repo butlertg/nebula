@@ -11,7 +11,7 @@ exclude = ["vendor/vt100"]
 vt100 = { path = "vendor/vt100" }
 
 [workspace.package]
-version = "0.12.0"
+version = "0.26.0"
 edition = "2021"
 license = "MIT"
 
@@ -36,6 +36,15 @@ directories = "6"
 # the daemon's computed next-due stamp and needs no parser of its own.
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Dependencies at full optimisation in dev builds too. The terminal
+# emulation (vt100, tui-term, ratatui) is the TUI's hot path: unoptimised,
+# a 1 MB scrollback replay parses in 50–140 ms against under 15 ms, and
+# every session switch paid it — a `cargo run` build felt sluggish where
+# the release one didn't. Only the workspace crates stay at opt-level 0,
+# so incremental builds are as quick as before.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

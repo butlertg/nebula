@@ -29,8 +29,9 @@ pub struct VimTerm {
     pub rows: u16,
     /// "path:line" for the modal title.
     pub title: String,
-    /// Rendered inside the tree browser's preview pane instead of the
-    /// centered modal (set by the tree browser's Enter).
+    /// Rendered inside the open overlay's preview pane — the TREE BROWSER's,
+    /// or the FILE TABS' body — instead of the centered modal (set by that
+    /// overlay's Enter).
     pub embedded: bool,
     /// Inner rect from the last draw; `sync_vim_size` resizes to it.
     pub area: Rect,
@@ -92,7 +93,10 @@ impl VimTerm {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.cwd(cwd);
-        cmd.env("TERM", "xterm-256color");
+        // The modal is drawn on nebula's grid, the same truecolor terminal
+        // every session pane is (see `nebula_core::env::PANE_TERM`).
+        cmd.env("TERM", nebula_core::env::PANE_TERM);
+        cmd.env("COLORTERM", nebula_core::env::PANE_COLORTERM);
 
         let mut child = pair
             .slave

@@ -3,6 +3,7 @@
 //! across a daemon restart.
 
 use nebula_core::codec::{read_frame, write_frame};
+use nebula_core::env;
 use nebula_core::{
     AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, TaskSpec, TaskTarget,
     PROTOCOL_VERSION,
@@ -10,6 +11,15 @@ use nebula_core::{
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
+
+/// How long a daemon reply or broadcast may take to arrive.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Same, for events that wait on a PTY child (spawn, exit, hook round-trip).
+const SLOW_TIMEOUT: Duration = Duration::from_secs(10);
+/// Same, for chains of several respawns or a cloud-mirror follow.
+const SPAWN_CHAIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Sleep between polls of the filesystem or a counter.
+const POLL_STEP: Duration = Duration::from_millis(50);
 
 struct TestEnv {
     tmp: tempfile::TempDir,
@@ -27,6 +37,15 @@ impl TestEnv {
         self.runtime_dir.join("daemon.sock")
     }
 
+    /// The `nebula` binary under test, pointed at this env's runtime and
+    /// data dirs — the base every daemon spawn and one-shot CLI run shares.
+    fn cli(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.env(env::RUNTIME_DIR, &self.runtime_dir)
+            .env(env::DATA_DIR, self.tmp.path().join("data"));
+        cmd
+    }
+
     fn spawn_daemon(&self) -> DaemonProc {
         self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
     }
@@ -36,36 +55,36 @@ impl TestEnv {
     }
 
     fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> DaemonProc {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.args(["daemon", "--foreground"])
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
-            .env("SHELL", "/bin/sh")
-            .env("NEBULA_AGENT_CMD", agent_cmd)
-            .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        DaemonProc(cmd.spawn().unwrap())
+        self.spawn_daemon_in(Path::new("/bin/sh"), Some(agent_cmd), envs)
     }
 
     /// Daemon with no `NEBULA_AGENT_CMD` override, so agent spawns take the
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
     /// what the daemon can find on PATH.
     fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonProc {
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["daemon", "--foreground"])
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
+        self.spawn_daemon_in(shell, None, &[])
+    }
+
+    fn spawn_daemon_in(
+        &self,
+        shell: &Path,
+        agent_cmd: Option<&str>,
+        envs: &[(&str, &str)],
+    ) -> DaemonProc {
+        let mut cmd = self.cli();
+        cmd.args(["daemon", "--foreground"])
             .env("SHELL", shell)
-            .env_remove("NEBULA_AGENT_CMD")
+            .env(env::WORKTREE_SYNC_MS, "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        DaemonProc(child)
+            .stderr(std::process::Stdio::null());
+        match agent_cmd {
+            Some(agent_cmd) => cmd.env(env::AGENT_CMD, agent_cmd),
+            None => cmd.env_remove(env::AGENT_CMD),
+        };
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        DaemonProc(cmd.spawn().unwrap())
     }
 
     /// A `$SHELL` that answers `-l -i -c` but sees no agent CLI on PATH.
@@ -76,8 +95,7 @@ impl TestEnv {
             "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$4\"\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_executable(&path);
         path
     }
 
@@ -92,25 +110,7 @@ impl TestEnv {
     /// A committed git repo to act as the project.
     fn make_repo(&self) -> PathBuf {
         let repo = self.tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        git(&["init", "-b", "main"]);
-        git(&["config", "user.email", "test@nebula.dev"]);
-        git(&["config", "user.name", "nebula-test"]);
-        std::fs::write(repo.join("README.md"), "# test\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "init"]);
+        make_repo_at(&repo);
         repo
     }
 }
@@ -168,13 +168,11 @@ impl Drop for DaemonProc {
 }
 
 async fn connect(sock: &Path) -> UnixStream {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     loop {
         match UnixStream::connect(sock).await {
             Ok(s) => return s,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await
-            }
+            Err(_) if tokio::time::Instant::now() < deadline => tokio::time::sleep(POLL_STEP).await,
             Err(e) => panic!("daemon socket never appeared: {e}"),
         }
     }
@@ -248,14 +246,7 @@ async fn full_crud_attach_and_restart_persistence() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     match &events[0] {
         ServerEvent::Snapshot { projects, .. } => assert!(projects.is_empty()),
         other => panic!("expected snapshot first, got {other:?}"),
@@ -273,7 +264,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         find_ack(evs, 1).is_some()
             && evs.iter().any(|e| {
                 matches!(
@@ -315,10 +306,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -350,7 +338,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
         text.matches(marker).count() >= 2
     })
@@ -374,14 +362,12 @@ async fn full_crud_attach_and_restart_persistence() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     assert!(
         matches!(
             find_ack(&events, 3),
@@ -405,7 +391,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         find_ack(evs, 4).is_some()
             && evs.iter().any(|e| {
                 matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.branch == "feature-x")
@@ -442,10 +428,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
-        find_ack(evs, 5).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| find_ack(evs, 5).is_some()).await;
     assert!(
         matches!(find_ack(&events, 5), Some(ServerEvent::Ack { .. })),
         "DeleteWorktree failed: {events:#?}"
@@ -462,7 +445,7 @@ async fn full_crud_attach_and_restart_persistence() {
     write_frame(&mut c2, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -507,7 +490,7 @@ async fn full_crud_attach_and_restart_persistence() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         String::from_utf8_lossy(&collected_output(evs))
             .matches(marker2)
             .count()
@@ -544,10 +527,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 1).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Project(_)),
         ..
@@ -558,14 +538,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     // AddProject's worktree upsert goes to subscribers only; fetch it via the DB
     // snapshot path instead: create the terminal against the main worktree id
     // that Subscribe would report. Simplest: subscribe now.
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     let worktree_id = events
         .iter()
         .find_map(|e| match e {
@@ -584,10 +557,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -608,7 +578,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     .await
     .unwrap();
     // Attach reports the child's current (legacy) flags right away.
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
     })
@@ -628,7 +598,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         String::from_utf8_lossy(&collected_output(evs)).contains("REPLY:E[?0u")
     })
     .await;
@@ -643,7 +613,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 1, .. }))
     })
@@ -661,7 +631,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::KittyFlags { .. }))
     })
@@ -683,7 +653,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
     })
@@ -705,14 +675,7 @@ async fn hook_post_from_agent_pty_drives_status() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -725,7 +688,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -757,14 +720,12 @@ async fn hook_post_from_agent_pty_drives_status() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -809,15 +770,29 @@ async fn hook_post_from_agent_pty_drives_status() {
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: curl("UserPromptSubmit", r#"{"session_id":"sess-1"}"#).into_bytes(),
+            data: curl(
+                "UserPromptSubmit",
+                r#"{"session_id":"sess-1","prompt":"fix the  login\nredirect"}"#,
+            )
+            .into_bytes(),
         },
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
+        })
+    })
+    .await;
+    // …and the prompt itself lands on the row, condensed to one line, as
+    // the RECENT PROMPTS upsert that follows the status change.
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id
+                    && a.recent_prompts.iter().any(|p| p.text == "fix the login redirect"))
         })
     })
     .await;
@@ -836,7 +811,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback, .. }
                 if *agent == agent_id)
@@ -864,7 +839,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
                 if *agent == agent_id)
@@ -896,7 +871,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     write_frame(&mut c2, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -967,7 +942,7 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
@@ -985,7 +960,7 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
                 if *agent == agent_id)
@@ -1005,14 +980,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1025,7 +993,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1060,7 +1028,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     .unwrap();
     // The upsert broadcast and the Ack ride different channels — wait for
     // the upsert itself.
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
                 if w.branch == "feat")
@@ -1089,14 +1057,12 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -1139,7 +1105,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     .await
     .unwrap();
 
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.worktree_id == feat_worktree.id)
@@ -1158,26 +1124,20 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     wait_for_exit(&mut daemon);
 }
 
-/// The inverse of the cwd-rehome test: a *user* move of a live agent must
-/// relocate the process too. The PTY is killed and respawned in the target
-/// checkout — left running in the old one, its hooks would keep reporting
-/// the old cwd and the daemon would snap the row right back.
+/// CLAUDE TITLE SYNC end to end, with a /bin/sh standing in for claude:
+/// the row's name reaches the CLI as the `UserPromptSubmit` reply's
+/// `sessionTitle`, and a `/rename` inside the CLI — which fires no hook,
+/// only rewrites the window title and the `custom-title.json` beside the
+/// transcript the hooks named — retitles the row.
 #[tokio::test]
-async fn move_agent_respawns_live_session_in_target_worktree() {
+async fn claude_session_title_and_row_name_stay_tied() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let mut daemon = env.spawn_daemon();
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1190,7 +1150,188 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    // A name typed at creation: settled, so it is due a push into Claude.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "Typed In Nebula".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The transcript claude would report, in a dir this test controls.
+    let transcripts = env.tmp.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let transcript = transcripts.join("sess-1.jsonl");
+    let body = format!(
+        r#"{{"session_id":"sess-1","transcript_path":"{}"}}"#,
+        transcript.display()
+    );
+    // The marker is split in the typed line (`D""ONE`) so the shell's echo
+    // of the command can't satisfy the wait — only curl's finished reply.
+    let curl = |marker: &str| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{body}' \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\"; \
+             echo {marker}\n"
+        )
+    };
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("REPLY-D\"\"ONE").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    // nebula → Claude: the reply hands the CLI the row's name.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("REPLY-DONE")
+    })
+    .await;
+    let output = String::from_utf8_lossy(&collected_output(&events)).to_string();
+    assert!(
+        output.contains(r#""sessionTitle":"Typed In Nebula""#),
+        "reply carries the row name: {output}"
+    );
+
+    // Claude → nebula: `/rename` persists the title beside the transcript
+    // and rewrites the window title; no hook fires. Only the OSC bytes
+    // come from the PTY — the sidecar is claude's file, written here.
+    let sidecar_dir = transcripts.join("sess-1");
+    std::fs::create_dir_all(&sidecar_dir).unwrap();
+    std::fs::write(
+        sidecar_dir.join("custom-title.json"),
+        r#"{"customTitle":"Renamed In Claude"}"#,
+    )
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"printf '\\033]0;\xe2\x9c\xb3 Renamed In Claude\\007'\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.name == "Renamed In Claude")
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.name == "Renamed In Claude")
+        }),
+        "row retitled from claude's /rename: {events:#?}"
+    );
+
+    // Now the two agree: the next prompt's reply pushes nothing.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("REPLY-T\"\"WO").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("REPLY-TWO")
+    })
+    .await;
+    let output = String::from_utf8_lossy(&collected_output(&events)).to_string();
+    assert!(
+        !output.contains("sessionTitle"),
+        "no push once claude holds the name: {output}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The inverse of the cwd-rehome test: a *user* move of a live agent must
+/// relocate the process too. The PTY is killed and respawned in the target
+/// checkout — left running in the old one, its hooks would keep reporting
+/// the old cwd and the daemon would snap the row right back.
+#[tokio::test]
+async fn move_agent_respawns_live_session_in_target_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1222,7 +1363,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
                 if w.branch == "feat")
@@ -1250,14 +1391,12 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -1291,7 +1430,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         String::from_utf8_lossy(&collected_output(evs)).contains("/repo\r")
     })
     .await;
@@ -1307,7 +1446,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.worktree_id == feat_worktree.id && a.alive)
@@ -1344,10 +1483,113 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         String::from_utf8_lossy(&collected_output(evs)).contains("repo-worktrees/feat")
     })
     .await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A kill-and-respawn behind an attached client — Restart here, and the
+/// same path a `nebula worktree` relocation or a cloud re-entry takes —
+/// rebinds that client to the new PTY: a fresh Scrollback and the new
+/// process's output arrive on the attachment it already holds, with no
+/// second Attach. Before this the forward task died with the old PTY and
+/// the TUI's pane sat frozen until the user clicked away and back.
+#[tokio::test]
+async fn restart_rebinds_an_attached_client_to_the_new_pty() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    // Stand-in CLI: announce which boot this is, then park.
+    let counter = env.tmp.path().join("boots");
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(( $(cat '{c}' 2>/dev/null || echo 0) + 1 ))\necho $n > '{c}'\n\
+             echo \"booted $n\"\nexec sleep 600\n",
+            c = counter.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let sref = SessionRef::Agent(agent_id.clone());
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("booted 1")
+    })
+    .await;
+
+    // The daemon kills the PTY and spawns another under the same ref; the
+    // attachment above is all this client ever sends.
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 3,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        find_ack(evs, 3).is_some()
+            && String::from_utf8_lossy(&collected_output(evs)).contains("booted 2")
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })),
+        "restart failed: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
+        "the rebind replays the new PTY's ring: {events:#?}"
+    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -1379,14 +1621,7 @@ async fn codex_hooks_install_and_drive_status() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1399,7 +1634,7 @@ async fn codex_hooks_install_and_drive_status() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1431,14 +1666,12 @@ async fn codex_hooks_install_and_drive_status() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -1502,7 +1735,7 @@ async fn codex_hooks_install_and_drive_status() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
@@ -1520,7 +1753,7 @@ async fn codex_hooks_install_and_drive_status() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback, .. }
                 if *agent == agent_id)
@@ -1538,7 +1771,7 @@ async fn codex_hooks_install_and_drive_status() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
                 if *agent == agent_id)
@@ -1555,7 +1788,7 @@ async fn codex_hooks_install_and_drive_status() {
     write_frame(&mut c2, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -1597,10 +1830,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 1).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
     assert!(
         matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
         "AddProject failed: {events:#?}"
@@ -1628,7 +1858,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
     );
 
     // The auto-sync adopts it without any client request.
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| matches!(
             e,
             ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.branch == "agent-branch"
@@ -1655,7 +1885,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
         git_worktree(&["remove", "--force"]),
         "external git worktree remove failed"
     );
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1679,7 +1909,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
             .success(),
         "git checkout -b renamed-root failed"
     );
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1727,7 +1957,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         find_ack(evs, 1).is_some()
             && evs.iter().any(|e| {
                 matches!(
@@ -1759,10 +1989,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -1776,11 +2003,9 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     let script = env.tmp.path().join("stub-install.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let run_upgrade = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        env.cli()
             .args(["upgrade", "--force"])
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .env("NEBULA_INSTALL_URL", format!("file://{}", script.display()))
+            .env(env::INSTALL_URL, format!("file://{}", script.display()))
             .output()
             .unwrap()
     };
@@ -1824,7 +2049,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(
                 e,
@@ -1873,10 +2098,7 @@ async fn add_project_creates_missing_dir_and_inits() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 1).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 1).is_some()).await;
     assert!(
         matches!(
             find_ack(&events, 1),
@@ -1907,10 +2129,7 @@ async fn add_project_creates_missing_dir_and_inits() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     assert!(
         matches!(find_ack(&events, 2), Some(ServerEvent::Error { .. })),
         "expected not-a-git-repo error: {events:#?}"
@@ -1925,7 +2144,7 @@ async fn add_project_creates_missing_dir_and_inits() {
 /// Subscribe + AddProject boilerplate; returns the main worktree row.
 async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebula_core::Worktree {
     write_frame(c, &ClientRequest::Subscribe).await.unwrap();
-    read_events_until(c, Duration::from_secs(5), |evs| {
+    read_events_until(c, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -1941,7 +2160,7 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
     )
     .await
     .unwrap();
-    let events = read_events_until(c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(c, EVENT_TIMEOUT, |evs| {
         find_ack(evs, 1).is_some()
             && evs.iter().any(|e| {
                 matches!(
@@ -1991,11 +2210,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2028,14 +2243,12 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -2076,7 +2289,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         String::from_utf8_lossy(&collected_output(evs))
             .matches(marker)
             .count()
@@ -2091,7 +2304,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     write_frame(&mut c2, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -2121,11 +2334,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     let repo = env.make_repo();
     let script = env.tmp.path().join("dying-agent.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2157,14 +2366,12 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     assert!(
         matches!(
             find_ack(&events, 2),
@@ -2202,6 +2409,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
         // Cursor's binary is `cursor-agent`; the message must name that, not
         // the kind, or the user goes looking for the wrong thing to install.
         (12, AgentKind::Cursor, "cursor-agent"),
+        (13, AgentKind::Pi, "pi"),
     ] {
         write_frame(
             &mut c,
@@ -2214,11 +2422,12 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: None,
+                starting_prompt: None,
             },
         )
         .await
         .unwrap();
-        let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
             evs.iter().any(|e| {
                 matches!(e, ServerEvent::Error { req_id: Some(r), .. } if *r == req_id)
                     || matches!(e, ServerEvent::Ack { req_id: r, .. } if *r == req_id)
@@ -2242,14 +2451,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
     }
 
     // And no half-created rows left behind in the Sessions column.
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     let agents = events
         .iter()
         .find_map(|e| match e {
@@ -2276,8 +2478,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     std::fs::create_dir_all(&bin).unwrap();
     let stub = bin.join("claude");
     std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    make_executable(&stub);
 
     let shell = env.tmp.path().join("seeing-shell.sh");
     std::fs::write(
@@ -2288,7 +2489,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    make_executable(&shell);
 
     let mut daemon = env.spawn_daemon_with_shell(&shell);
     let mut c = connect(&env.sock()).await;
@@ -2306,11 +2507,12 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+    let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
         find_ack(evs, 7).is_some()
             || evs.iter().any(|e| {
                 matches!(
@@ -2375,14 +2577,12 @@ async fn create_agent_get_id(
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(c, Duration::from_secs(5), |evs| {
-        find_ack(evs, req_id).is_some()
-    })
-    .await;
+    let events = read_events_until(c, EVENT_TIMEOUT, |evs| find_ack(evs, req_id).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(id)),
         ..
@@ -2395,7 +2595,7 @@ async fn create_agent_get_id(
 
 /// Poll a pidfile the fake agent writes on boot.
 async fn read_pidfile(path: &Path) -> i32 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(pid) = s.trim().parse() {
@@ -2406,7 +2606,7 @@ async fn read_pidfile(path: &Path) -> i32 {
             tokio::time::Instant::now() < deadline,
             "pidfile {path:?} never appeared"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
 }
 
@@ -2428,11 +2628,7 @@ async fn archive_and_delete_kill_the_agent_process() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2457,7 +2653,7 @@ async fn archive_and_delete_kill_the_agent_process() {
     .unwrap();
     // The Ack and the EntityUpserted broadcast race on the client stream —
     // wait for both.
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         find_ack(evs, 4).is_some()
             && evs.iter().any(|e| {
                 matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
@@ -2478,7 +2674,7 @@ async fn archive_and_delete_kill_the_agent_process() {
         !archived.alive,
         "archived agent should not be alive: {archived:?}"
     );
-    wait_pid_dead(pid1, Duration::from_secs(5), "archived agent CLI").await;
+    wait_pid_dead(pid1, EVENT_TIMEOUT, "archived agent CLI").await;
     assert!(pid_alive(pid2), "the other agent must be untouched");
 
     // ---- delete kills the CLI too ----
@@ -2491,14 +2687,14 @@ async fn archive_and_delete_kill_the_agent_process() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         find_ack(evs, 5).is_some()
             && evs
                 .iter()
                 .any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Agent(id) } if *id == a2))
     })
     .await;
-    wait_pid_dead(pid2, Duration::from_secs(5), "deleted agent CLI").await;
+    wait_pid_dead(pid2, EVENT_TIMEOUT, "deleted agent CLI").await;
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -2530,11 +2726,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2552,14 +2744,12 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -2580,13 +2770,87 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     // SIGHUP alone can't clear these; the ~3s watchdog escalation must.
-    wait_pid_dead(shell_pid, Duration::from_secs(10), "HUP-immune agent CLI").await;
-    wait_pid_dead(child_pid, Duration::from_secs(10), "agent CLI's grandchild").await;
+    wait_pid_dead(shell_pid, SLOW_TIMEOUT, "HUP-immune agent CLI").await;
+    wait_pid_dead(child_pid, SLOW_TIMEOUT, "agent CLI's grandchild").await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The launch resolves the CLI through the login shell the way a typed
+/// command would, so a `claude` the rc files reroute — an alias, a function
+/// — is what runs, not the binary on PATH behind it. That shell then keeps
+/// the agent as a job in a process group of its own, so archiving has to
+/// reach past the shell: the polite SIGHUP takes the shell alone (a
+/// non-interactive one forwards nothing) and reparents the job to init, and
+/// only a sweep taken before the signal still knows which group to hang up
+/// — and, for one that shrugs that off too, to SIGKILL.
+#[tokio::test]
+async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let dir = env.tmp.path().to_path_buf();
+    // The rc file: job control on, and a `claude` function that records its
+    // argv and parks an HUP-immune job in a group of its own.
+    let rc = dir.join("rc.sh");
+    std::fs::write(
+        &rc,
+        format!(
+            concat!(
+                "set -m\n",
+                "claude() {{\n",
+                "  echo \"routed $*\" > '{d}/routed'\n",
+                "  sh -c 'trap \"\" HUP; echo $$ > \"{d}/job.pid\"; sleep 600' &\n",
+                "  wait\n",
+                "}}\n",
+            ),
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    // A `$SHELL` that sources it ahead of the `-c` string, as `-l -i` would
+    // source ~/.zshrc.
+    let shell = dir.join("routing-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/bash -c \". '{}'; $4\"\n",
+            rc.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&shell);
+    let mut daemon = env.spawn_daemon_with_shell(&shell);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "routed", 2).await;
+
+    // The function ran, with the CLI's argv, in place of any binary.
+    let job_pid = read_pidfile(&dir.join("job.pid")).await;
+    let routed = std::fs::read_to_string(dir.join("routed")).unwrap();
+    assert!(
+        routed.starts_with("routed --append-system-prompt "),
+        "{routed:?}"
+    );
+    assert!(pid_alive(job_pid), "the agent's job should be up");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 3,
+            id: agent_id,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+    // SIGHUP ends the shell and orphans the job; the watchdog's sweep must
+    // still clear it once the grace period is up.
+    wait_pid_dead(job_pid, SLOW_TIMEOUT, "agent job the shell left behind").await;
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -2618,14 +2882,12 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -2645,10 +2907,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -2669,14 +2928,12 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 4).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 4).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(archived_id)),
         ..
@@ -2694,10 +2951,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 5).is_some()
-    })
-    .await;
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 5).is_some()).await;
 
     // Restart: rows persist, every PTY is dead.
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -2708,7 +2962,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     write_frame(&mut c2, &ClientRequest::Subscribe)
         .await
         .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
@@ -2736,7 +2990,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c2, SLOW_TIMEOUT, |evs| {
         let agent_alive = evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.alive)
@@ -2772,7 +3026,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     env.write_config(r#"{"session_idle_timeout": "2s"}"#);
-    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let worktree = add_project_get_main_worktree(&mut c, &repo).await;
@@ -2788,14 +3042,12 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -2815,10 +3067,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -2827,51 +3076,6 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         panic!("CreateTerminal failed: {events:#?}");
     };
     let term_id = term_id.clone();
-
-    // A pinned agent: idle and unwatched like the idler, but marked "never
-    // kill" (schedules and background jobs are invisible to the status
-    // machine, so pinning is the user's protection).
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            req_id: 4,
-            worktree: worktree.id.clone(),
-            name: "keeper".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            cloud_prompt: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 4).is_some()
-    })
-    .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(pinned_id)),
-        ..
-    } = find_ack(&events, 4).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let pinned_id = pinned_id.clone();
-    write_frame(
-        &mut c,
-        &ClientRequest::SetAgentPinned {
-            req_id: 5,
-            id: pinned_id.clone(),
-            pinned: true,
-        },
-    )
-    .await
-    .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 5).is_some()
-    })
-    .await;
 
     // Give the terminal a running command, then stop looking at anything.
     let term_sref = SessionRef::Terminal(term_id.clone());
@@ -2905,28 +3109,21 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     .unwrap();
 
     // Unwatched: the idle agent is reaped after ~2s…
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && !a.alive)
         })
     })
     .await;
-    // …while the terminal's sleep and the keeper's pin keep them alive.
+    // …while the terminal's sleep keeps it alive.
     let term_reaped = |evs: &[ServerEvent]| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
                 if t.id == term_id && !t.alive)
         })
     };
-    let pinned_reaped = |evs: &[ServerEvent]| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == pinned_id && !a.alive)
-        })
-    };
     assert!(!term_reaped(&events), "busy terminal spared: {events:#?}");
-    assert!(!pinned_reaped(&events), "pinned agent spared: {events:#?}");
 
     // Attaching revives the agent; an attached session then idles forever.
     let agent_sref = SessionRef::Agent(agent_id.clone());
@@ -2941,7 +3138,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.alive)
@@ -2960,10 +3157,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 6).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 6).is_some()).await;
     assert!(
         !events.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
@@ -2975,26 +3169,20 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         !term_reaped(&events),
         "in-view terminal spared: {events:#?}"
     );
-    assert!(
-        !pinned_reaped(&events),
-        "pinned agent still spared: {events:#?}"
-    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }
 
 fn wait_for_exit(daemon: &mut DaemonProc) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {
         match daemon.try_wait().unwrap() {
             Some(status) => {
                 assert!(status.success(), "daemon exited with {status:?}");
                 return;
             }
-            None if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50))
-            }
+            None if std::time::Instant::now() < deadline => std::thread::sleep(POLL_STEP),
             None => {
                 let _ = daemon.kill();
                 panic!("daemon did not exit after Shutdown");
@@ -3006,7 +3194,7 @@ fn wait_for_exit(daemon: &mut DaemonProc) {
 /// Poll the env dump the fake agent CLI writes on boot, returning the
 /// NEBULA_* variables the real CLI's hooks (and `nebula rename`) would see.
 async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
             let map: std::collections::HashMap<String, String> = s
@@ -3014,7 +3202,7 @@ async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String>
                 .filter_map(|l| l.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            if map.contains_key("NEBULA_API_URL") && map.contains_key("NEBULA_API_TOKEN") {
+            if map.contains_key(env::API_URL) && map.contains_key(env::API_TOKEN) {
                 return map;
             }
         }
@@ -3022,7 +3210,7 @@ async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String>
             tokio::time::Instant::now() < deadline,
             "agent env dump {path:?} never appeared"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
 }
 
@@ -3077,11 +3265,7 @@ async fn auto_title_instruction_and_rename_flow() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3100,14 +3284,12 @@ async fn auto_title_instruction_and_rename_flow() {
             effort: None,
             auto_title: true,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -3118,13 +3300,13 @@ async fn auto_title_instruction_and_rename_flow() {
     let agent_id = agent_id.clone();
 
     let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
-    let port: u16 = agent_env["NEBULA_API_URL"]
+    let port: u16 = agent_env[env::API_URL]
         .rsplit(':')
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let token = agent_env[env::API_TOKEN].clone();
     let submit_path = format!(
         "/api/hooks/claude?agentId={}&hookEvent=UserPromptSubmit",
         agent_id.0
@@ -3136,16 +3318,11 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!(body, nebula_daemon::hooks::auto_title_injection());
 
     // The model obeys — `nebula rename` runs with the session's env.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["rename", "Fix", "Login", "Redirect"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["rename", "Fix", "Login", "Redirect"]);
     assert!(out.status.success(), "rename failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Fix Login Redirect"), "stdout: {stdout}");
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.name == "Fix Login Redirect")
@@ -3153,20 +3330,114 @@ async fn auto_title_instruction_and_rename_flow() {
     })
     .await;
 
-    // Titled now: the next prompt injects nothing.
+    // Titled now: the next prompt injects no instruction — instead the
+    // reply hands Claude the row's name as its own session title (CLAUDE
+    // TITLE SYNC), so `/resume` and `/rc` show what the row shows.
     let (status, body) = hook_post(port, &submit_path, &token).await;
-    assert_eq!((status, body.as_str()), (200, ""));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        nebula_daemon::hooks::user_prompt_reply(false, Some("Fix Login Redirect"))
+    );
+    assert!(
+        !body.contains("additionalContext"),
+        "no instruction: {body}"
+    );
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["rename", "Another", "Title"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["rename", "Another", "Title"]);
     assert!(out.status.success(), "declined rename must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already has a title"), "stdout: {stdout}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// `nebula open <file>…` from inside a session, end to end over real
+/// processes: the CLI (what the model runs) resolves the paths against its
+/// own cwd, the daemon checks the caller and fans the files out to every
+/// subscriber as one `FilesOpened` carrying the agent's checkout — and a
+/// path that does not exist, or is not a text file, fails in the CLI
+/// before anything is sent.
+#[tokio::test]
+async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "agent-1", 2).await;
+
+    let notes = repo.join("docs").join("notes.md");
+    std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    std::fs::write(&notes, "# notes\n").unwrap();
+    let main_rs = repo.join("main.rs");
+    std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+    // Relative paths resolve against the CLI's cwd — the agent's.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["open", "docs/notes.md", "main.rs"])
+        .current_dir(&repo)
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env(env::AGENT_ID, &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "open failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("opened 2 files"), "stdout: {stdout}");
+
+    let want: Vec<PathBuf> = [&notes, &main_rs]
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap())
+        .collect();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::FilesOpened { .. }))
+    })
+    .await;
+    let opened = events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::FilesOpened { .. }))
+        .unwrap();
+    let ServerEvent::FilesOpened { agent, root, paths } = opened else {
+        unreachable!()
+    };
+    assert_eq!(agent, &agent_id);
+    assert_eq!(root, &worktree.path, "the agent's checkout rides along");
+    assert_eq!(paths, &want, "absolute, in the order given");
+
+    // A missing file is the CLI's error, before the daemon hears anything.
+    let out = agent_cli(&env, &agent_id, &["open", "/nowhere/at/all.md"]);
+    assert!(!out.status.success(), "a missing file must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no such file"), "stderr: {stderr}");
+
+    // So is a binary file: a terminal has nothing to show for a PNG, and
+    // the model is told to name the path instead.
+    let png = repo.join("shot.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+    let out = agent_cli(&env, &agent_id, &["open", png.to_str().unwrap()]);
+    assert!(!out.status.success(), "a binary file must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a text file"), "stderr: {stderr}");
+
+    // Outside a session there is no row to open for.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["open", main_rs.to_str().unwrap()])
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env_remove(env::AGENT_ID)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "outside a session must fail: {out:?}"
+    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -3185,22 +3456,18 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     let env_dir = env.tmp.path().join("agent-env");
     std::fs::create_dir_all(&env_dir).unwrap();
     // Stand-in CLI: dump the NEBULA_* env its hooks would use, log where
-    // each boot runs, then park.
+    // each boot runs (to a file, and to its own screen), then park.
     let script = env.tmp.path().join("agent.sh");
     std::fs::write(
         &script,
         format!(
             "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
-             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\nexec sleep 600\n",
+             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\necho \"booted in $(pwd)\"\nexec sleep 600\n",
             d = env_dir.display()
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3218,14 +3485,12 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
     let ServerEvent::Ack {
         created: Some(EntityId::Agent(agent_id)),
         ..
@@ -3235,13 +3500,13 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     };
     let agent_id = agent_id.clone();
     let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
-    let port: u16 = agent_env["NEBULA_API_URL"]
+    let port: u16 = agent_env[env::API_URL]
         .rsplit(':')
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let token = agent_env[env::API_TOKEN].clone();
     let pwd_log = env_dir.join(format!("{}.pwd", agent_id.0));
     let boots = |path: &Path| -> Vec<String> {
         std::fs::read_to_string(path)
@@ -3250,23 +3515,37 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             .map(str::to_string)
             .collect()
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while boots(&pwd_log).len() < 1 {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    while boots(&pwd_log).is_empty() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "first boot never logged"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
+
+    // A client sits on the pane throughout — the TUI, showing the session
+    // that is about to run `nebula worktree`.
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("booted in")
+    })
+    .await;
 
     // The model obeys the guidance — `nebula worktree feat x` (the space
     // slugifies) with the session's env.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["worktree", "feat", "x"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
     assert!(out.status.success(), "nebula worktree failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3275,7 +3554,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     );
 
     // The row re-homes under the new checkout at once…
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.worktree_id != main_worktree.id)
@@ -3313,15 +3592,25 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
         assert_eq!(status, 200, "{event}");
     }
 
-    // The respawn: alive again under feat-x, and booted inside it.
-    read_events_until(&mut c, Duration::from_secs(10), |evs| {
-        evs.iter().any(|e| {
+    // The respawn: alive again under feat-x, booted inside it — and the
+    // attached client follows it there with no second Attach: the daemon
+    // rebinds the pane to the new PTY (a fresh Scrollback, then its output),
+    // so the TUI never sits frozen on the old process's last frame.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        let alive = evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.worktree_id == feat.id && a.alive)
-        })
+        });
+        alive && String::from_utf8_lossy(&collected_output(evs)).contains("repo-worktrees/feat-x")
     })
     .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
+        "the rebind replays the new PTY's ring: {events:#?}"
+    );
+    let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
     loop {
         let b = boots(&pwd_log);
         if b.len() >= 2 {
@@ -3336,16 +3625,11 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             tokio::time::Instant::now() < deadline,
             "respawn never booted in the worktree: {b:?}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
 
     // Already there now: a settled answer, and no second relocation.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["worktree", "feat-x"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["worktree", "feat-x"]);
     assert!(out.status.success(), "repeat must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3369,17 +3653,11 @@ async fn workspace_scope_is_per_connection() {
     let env = TestEnv::new();
     let mut daemon = env.spawn_daemon();
 
-    let subscribe = |sock: PathBuf| async move {
+    // Boot one client and report the workspace its snapshot lands it in.
+    let boot_client = |sock: PathBuf| async move {
         let mut c = connect(&sock).await;
         handshake(&mut c).await;
-        write_frame(&mut c, &ClientRequest::Subscribe)
-            .await
-            .unwrap();
-        let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-            evs.iter()
-                .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-        })
-        .await;
+        let events = subscribe(&mut c).await;
         let active = events
             .iter()
             .find_map(|e| match e {
@@ -3393,8 +3671,8 @@ async fn workspace_scope_is_per_connection() {
     };
 
     // Two instances, both booted into the default workspace.
-    let (mut a, a_boot) = subscribe(env.sock()).await;
-    let (mut b, b_boot) = subscribe(env.sock()).await;
+    let (mut a, a_boot) = boot_client(env.sock()).await;
+    let (mut b, b_boot) = boot_client(env.sock()).await;
     assert_eq!(a_boot.as_str(), "default");
     assert_eq!(b_boot.as_str(), "default");
 
@@ -3408,7 +3686,7 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut a, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut a, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 1, .. }))
     })
@@ -3432,7 +3710,7 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
-    read_events_until(&mut a, Duration::from_secs(5), |evs| {
+    read_events_until(&mut a, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 2, .. }))
     })
@@ -3451,9 +3729,21 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut a, Duration::from_secs(5), |evs| {
+    // Wait for the upsert itself, not just the Ack: the Ack is written from
+    // the request loop and the upsert from the broadcast forwarder, and the
+    // daemon promises no order between them (the TUI handles either).
+    let is_project_upsert = |e: &ServerEvent| {
+        matches!(
+            e,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(_)
+            }
+        )
+    };
+    let events = read_events_until(&mut a, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 3, .. }))
+            && evs.iter().any(is_project_upsert)
     })
     .await;
     let project_a = events
@@ -3485,9 +3775,19 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut b, Duration::from_secs(5), |evs| {
+    let repo_b_canon = repo_b.canonicalize().unwrap();
+    let is_repo_b_upsert = |e: &ServerEvent| {
+        matches!(
+            e,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p)
+            } if p.repo_path == repo_b_canon
+        )
+    };
+    let events = read_events_until(&mut b, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 4, .. }))
+            && evs.iter().any(is_repo_b_upsert)
     })
     .await;
     let project_b = events
@@ -3495,7 +3795,7 @@ async fn workspace_scope_is_per_connection() {
         .find_map(|e| match e {
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(p),
-            } if p.repo_path == repo_b.canonicalize().unwrap() => Some(p.clone()),
+            } if p.repo_path == repo_b_canon => Some(p.clone()),
             _ => None,
         })
         .expect("AddProject upserts the project");
@@ -3507,7 +3807,7 @@ async fn workspace_scope_is_per_connection() {
 
     // A third instance launched now boots into A's pick — the switch is
     // remembered as a default for new clients, just not pushed onto live ones.
-    let (_c, c_boot) = subscribe(env.sock()).await;
+    let (_c, c_boot) = boot_client(env.sock()).await;
     assert_eq!(
         c_boot, ws,
         "a fresh instance opens the last workspace opened"
@@ -3540,6 +3840,171 @@ fn make_repo_at(repo: &Path) {
     git(&["commit", "-m", "init"]);
 }
 
+/// Mark a freshly written stub script runnable.
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Subscribe a handshaken client and wait for its first `Snapshot`; returns
+/// everything received up to and including it.
+async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
+    write_frame(c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(c, EVENT_TIMEOUT, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await
+}
+
+/// `nebula spawn "<task>"` from inside a session, end to end over real
+/// processes: the CLI (what the model runs) makes the daemon start a second
+/// agent in the caller's worktree — booted at once, on the default name so
+/// AUTO-TITLE applies, matching the caller's harness unless `--kind` names
+/// another — while the caller's own process is left alone. The task itself
+/// reaches argv only outside `NEBULA_AGENT_CMD`, so it is covered by the
+/// registry's argv unit tests, not here.
+#[tokio::test]
+async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    // Stand-in CLI: record every boot by agent id, then park.
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\nexec sleep 600\n",
+            d = env_dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(caller)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let caller = caller.clone();
+    read_env_file(&env_dir.join(format!("{}.env", caller.0))).await;
+
+    // The model obeys the guidance — `nebula spawn fix the login redirect`
+    // (the words join) with the session's env.
+    let out = agent_cli(&env, &caller, &["spawn", "fix", "the", "login", "redirect"]);
+    assert!(out.status.success(), "nebula spawn failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("started a new session") && stdout.contains("carry on"),
+        "stdout: {stdout}"
+    );
+
+    // A second row, in the caller's worktree, on the default name, live.
+    let sibling_of = |evs: &[ServerEvent], kind: AgentKind| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id != caller
+                && a.worktree_id == main_worktree.id
+                && a.kind == kind
+                && a.alive =>
+            {
+                Some(a.clone())
+            }
+            _ => None,
+        })
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        sibling_of(evs, AgentKind::Claude).is_some()
+    })
+    .await;
+    let sibling = sibling_of(&events, AgentKind::Claude).unwrap();
+    assert_eq!(sibling.name, "agent-2", "the first free default name");
+    // …and its CLI really booted (the stub logged its own env).
+    let sibling_env = read_env_file(&env_dir.join(format!("{}.env", sibling.id.0))).await;
+    assert_eq!(sibling_env[env::AGENT_ID], sibling.id.0);
+    // The caller was never respawned: still its one boot.
+    assert_eq!(
+        std::fs::read_dir(&env_dir).unwrap().count(),
+        2,
+        "exactly two boots: the caller's and the sibling's"
+    );
+
+    // `--kind` picks another harness (the stub stands in for every CLI).
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--kind", "codex", "run the tests"],
+    );
+    assert!(out.status.success(), "nebula spawn --kind failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("new codex session"),
+        "stdout names the harness"
+    );
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        sibling_of(evs, AgentKind::Codex).is_some()
+    })
+    .await;
+    assert_eq!(
+        sibling_of(&events, AgentKind::Codex).unwrap().name,
+        "agent-3"
+    );
+
+    // A bad harness name and a blank task are the CLI's own refusals.
+    let out = agent_cli(&env, &caller, &["spawn", "--kind", "gemini", "x"]);
+    assert!(!out.status.success(), "unknown harness must fail: {out:?}");
+    let out = agent_cli(&env, &caller, &["spawn", "   "]);
+    assert!(!out.status.success(), "blank task must fail: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("task is empty"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = daemon.kill();
+}
+
+/// Run the `nebula` CLI the way a hook would inside an agent session: the
+/// test daemon's runtime dir plus the session's `NEBULA_AGENT_ID`.
+fn agent_cli(
+    env: &TestEnv,
+    agent_id: &nebula_core::AgentId,
+    args: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args)
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env(env::AGENT_ID, &agent_id.0)
+        .output()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn cli_add_project() {
     let env = TestEnv::new();
@@ -3547,24 +4012,10 @@ async fn cli_add_project() {
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
-    let run_cli = |args: &[&str], cwd: &Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(args)
-            .current_dir(cwd)
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .output()
-            .unwrap()
-    };
+    let run_cli =
+        |args: &[&str], cwd: &Path| env.cli().args(args).current_dir(cwd).output().unwrap();
 
     // `nebula add .` from inside the repo: cwd-relative resolution, project
     // named after the directory.
@@ -3573,7 +4024,7 @@ async fn cli_add_project() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("added project"), "stdout: {stdout}");
     let canon = repo.canonicalize().unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
                 if p.repo_path == canon && p.name == "repo")
@@ -3598,7 +4049,7 @@ async fn cli_add_project() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 91, .. }))
     })
@@ -3622,7 +4073,7 @@ async fn cli_add_project() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 92, .. }))
     })
@@ -3664,7 +4115,7 @@ async fn cli_add_project() {
     let out = run_cli(&[repo2.to_str().unwrap()], env.tmp.path());
     assert!(out.status.success(), "bare add failed: {out:?}");
     let canon2 = repo2.canonicalize().unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
                 if p.repo_path == canon2 && p.name == "repo2")
@@ -3690,13 +4141,281 @@ async fn cli_add_project() {
     wait_for_exit(&mut daemon);
 }
 
+/// A teleport is a snapshot of the cloud session, not a live link, so the
+/// row keeps re-teleporting to stay current — that is what makes a cloud
+/// agent's work show up in nebula at all. The follow ends the moment the
+/// pane is typed into: from then on it is the user's local session, and
+/// respawning it under them would eat their turn.
+#[tokio::test]
+async fn cloud_mirror_refreshes_until_the_pane_is_typed_into() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let state = env.tmp.path().join("mirror-stub");
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = env.tmp.path().join("mirror-stub.sh");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{state}/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{state}/runs"
+case "$n" in
+  1)
+    printf 'Created cloud session: Follow me\r\n'
+    printf 'Resume with: claude --teleport session_01SQugK2HDyk33coSrfqFJk4\r\n'
+    exit 0
+    ;;
+  2)
+    printf 'Error: Attaching to an existing cloud session is not enabled for your account.\r\n'
+    exit 1
+    ;;
+  *)
+    exec sleep 300
+    ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&stub);
+    let runs = || {
+        std::fs::read_to_string(state.join("runs"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "2")]);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 10,
+            worktree: main_worktree.id.clone(),
+            name: "cloud".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: Some("Follow me".into()),
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| find_ack(evs, 10).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 10).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // create, refused attach, teleport — then the follow keeps going: each
+    // tick kills the pane and teleports it again, pulling whatever the
+    // cloud session has done since.
+    let wait_for_runs = |target: u32| async move {
+        let deadline = tokio::time::Instant::now() + SPAWN_CHAIN_TIMEOUT;
+        while runs() < target && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(POLL_STEP).await;
+        }
+        runs()
+    };
+    assert!(
+        wait_for_runs(5).await >= 5,
+        "the mirror re-teleports on its own; runs stalled at {}",
+        runs()
+    );
+
+    // Attach and type: the pane is the user's from here.
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: SessionRef::Agent(agent_id.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: SessionRef::Agent(agent_id.clone()),
+            data: b"hello".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // The badge clears when the follow gives up, so wait on that rather
+    // than on a sleep — then hold still and confirm the runs stop climbing.
+    let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a)
+                } if a.id == agent_id && !a.cloud_mirroring
+            )
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && !a.cloud_mirroring
+        )),
+        "the row should stop advertising a follow it has given up: {events:#?}"
+    );
+    let settled = runs();
+    tokio::time::sleep(EVENT_TIMEOUT).await;
+    assert_eq!(
+        runs(),
+        settled,
+        "an adopted pane must not be teleported over"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The mirror must not be able to loop forever. If the pane it last
+/// spawned is gone — the idle reaper took it because nobody has looked at
+/// this row in a long time, or the teleport itself died — following stops
+/// instead of respawning a session every tick, which would make cloud rows
+/// the one kind nebula can never reap.
+#[tokio::test]
+async fn cloud_mirror_gives_up_when_its_pane_stops_coming_back() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let state = env.tmp.path().join("dying-stub");
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = env.tmp.path().join("dying-stub.sh");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{state}/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{state}/runs"
+case "$n" in
+  1)
+    printf 'Created cloud session: Follow me\r\n'
+    printf 'Resume with: claude --teleport session_01SQugK2HDyk33coSrfqFJk4\r\n'
+    exit 0
+    ;;
+  2)
+    printf 'Error: Attaching to an existing cloud session is not enabled for your account.\r\n'
+    exit 1
+    ;;
+  3)
+    exec sleep 300
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&stub);
+    let runs = || {
+        std::fs::read_to_string(state.join("runs"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "2")]);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 10,
+            worktree: main_worktree.id.clone(),
+            name: "cloud".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: Some("Follow me".into()),
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| find_ack(evs, 10).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 10).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // create, refused attach, teleport — then one tick teleports again
+    // (run 4) and that child dies at once.
+    let deadline = tokio::time::Instant::now() + SPAWN_CHAIN_TIMEOUT;
+    while runs() < 4 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL_STEP).await;
+    }
+    assert!(runs() >= 4, "the mirror never got a tick in: {}", runs());
+
+    // The tick after that finds no pane and gives up. Watch for the badge
+    // going quiet *after* it was lit — a row's upserts start out unmirrored,
+    // and a spawn's upsert reaches the client before its child runs a line.
+    let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
+        let is = |e: &ServerEvent, want: bool| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a)
+                } if a.id == agent_id && a.cloud_mirroring == want
+            )
+        };
+        let lit = evs.iter().position(|e| is(e, true));
+        let quiet = evs.iter().rposition(|e| is(e, false));
+        matches!((lit, quiet), (Some(lit), Some(quiet)) if quiet > lit)
+    })
+    .await;
+    let settled = runs();
+    assert!(
+        !events.is_empty(),
+        "the mirror should have stopped advertising itself"
+    );
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(runs(), settled, "no endless respawn loop");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// A Claude Cloud row on an account without the live-attach rollout:
-/// `claude --cloud <task>` prints the session id and exits, the daemon
-/// captures the id off the PTY, and a Restart re-enters the session —
-/// the attach is refused (read off the output, not inferred from the exit),
-/// so the row is teleported instead, inside a `cloud-<id>` worktree of its
-/// own rather than on top of the user's main checkout. The stub stands in
-/// for all three CLI invocations in turn.
+/// `claude --cloud <task>` prints the session id and exits, and the daemon
+/// captures the id off the PTY and re-enters the session *on its own* —
+/// nobody has to ask, because the alternative is a dead pane whose last
+/// line tells the user to go watch their agent somewhere else. The attach
+/// is refused (read off the output, not inferred from the exit), so the row
+/// is teleported instead, inside a `cloud-<id>` worktree of its own rather
+/// than on top of the user's main checkout. The stub stands in for all
+/// three CLI invocations in turn.
 #[tokio::test]
 async fn cloud_row_captures_its_session_id_and_reenters_it() {
     let env = TestEnv::new();
@@ -3732,16 +4451,17 @@ esac
         ),
     )
     .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&stub);
     let runs = || {
         std::fs::read_to_string(state.join("runs"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };
-    let mut daemon = env.spawn_daemon_with_agent_cmd(stub.to_str().unwrap());
+    // A cadence long enough that no mirror tick lands inside the test: the
+    // run counts here are about the re-entry chain, not the refresh loop
+    // (which `cloud_mirror_refreshes_until_the_pane_is_typed_into` covers).
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "600")]);
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -3760,11 +4480,12 @@ esac
             effort: None,
             auto_title: false,
             cloud_prompt: Some("Hello world".into()),
+            starting_prompt: None,
         },
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
         find_ack(evs, 10).is_some()
             && evs.iter().any(|e| {
                 matches!(
@@ -3784,22 +4505,11 @@ esac
         panic!("CreateAgent failed: {events:#?}");
     };
     let agent_id = agent_id.clone();
-    assert_eq!(runs(), "1");
 
-    // Restart on a Cloud row with no local session re-enters the cloud
-    // session: attach (refused by the stub) then teleport, in a worktree of
-    // the row's own. Wait for the stub's third run and the row's respawn.
-    write_frame(
-        &mut c,
-        &ClientRequest::RestartAgent {
-            req_id: 11,
-            id: agent_id.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    // Two live respawns of the row: the attach, then the teleport after it.
-    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+    // Nothing more is asked of the daemon: capturing the id is what starts
+    // the re-entry. Two further respawns of the row follow — the attach,
+    // refused, and then the teleport.
+    let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
         let live_spawns = evs
             .iter()
             .filter(|e| {
@@ -3816,15 +4526,11 @@ esac
     .await;
     // The spawn upsert goes out before the child has run a line; give the
     // stub a moment to record itself.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
     while runs() != "3" && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
     assert_eq!(runs(), "3", "create, refused attach, teleport");
-    assert!(
-        matches!(find_ack(&events, 11), Some(ServerEvent::Ack { .. })),
-        "RestartAgent failed: {events:#?}"
-    );
     let cloud_worktree = events
         .iter()
         .find_map(|e| match e {
@@ -3852,6 +4558,10 @@ esac
     );
     assert_eq!(row.cloud_session_id.as_deref(), Some(CLOUD_ID));
     assert!(row.alive);
+    assert!(
+        row.cloud_mirroring,
+        "the teleported pane follows the cloud session from here"
+    );
 
     // The create ran in the main checkout; the attach and the teleport both
     // ran in the new worktree — the user's checkout never switched branch.
@@ -3874,11 +4584,41 @@ esac
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&main_branch.stdout).trim(), "main");
 
-    // A row that has never seen the attach refusal is left alone by a kill:
-    // shutting down must not spawn a fourth run.
+    // Restarting a row that is mirroring re-enters the cloud session rather
+    // than resuming the local session the teleport left behind — and it
+    // goes straight to the teleport, because this daemon has already seen
+    // the attach refused once. One new run, not two.
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 11,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SPAWN_CHAIN_TIMEOUT, |evs| {
+        find_ack(evs, 11).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 11), Some(ServerEvent::Ack { .. })),
+        "RestartAgent failed: {events:#?}"
+    );
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    while runs() != "4" && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL_STEP).await;
+    }
+    assert_eq!(
+        runs(),
+        "4",
+        "one re-entry, and it skipped the refused attach"
+    );
+
+    // Shutting down must not spawn anything further.
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
-    assert_eq!(runs(), "3");
+    assert_eq!(runs(), "4");
 }
 
 /// An agent loop, end to end: one run delivers its prompt once per turn for
@@ -4000,7 +4740,6 @@ async fn a_task_loop_prompts_its_session_once_per_turn_and_then_stops() {
             find_agent(&more).expect("the run's agent upsert")
         }
     };
-    assert!(agent.pinned, "a task's session is pinned: {agent:?}");
     assert_eq!(agent.worktree_id, main_worktree.id, "ran in the root");
 
     let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent.id.0))).await;
@@ -4228,7 +4967,7 @@ async fn a_cron_task_starts_its_own_session() {
     assert!(
         events.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.name == "ticker" && a.pinned)
+                if a.name == "ticker")
         }),
         "the scheduler spawned the run: {events:#?}"
     );

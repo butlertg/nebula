@@ -1,5 +1,5 @@
-//! View layer: draws the three panels + terminal pane + footer, and records
-//! hit regions for mouse interaction.
+//! View layer: draws the visible panels + terminal pane + footer, and
+//! records hit regions for mouse interaction.
 
 use crate::app::{
     App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, PaneMode, SessionRow, TaskField,
@@ -18,6 +18,119 @@ use ratatui::Frame;
 /// Outer size of the editor modal, as (width, height) percent of the frame.
 /// Shared with the event loop's pre-draw PTY size guess.
 pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
+/// Outer size of the two split modals (diff, tree), percent of the frame.
+const SPLIT_MODAL_PCT: (u16, u16) = (92, 90);
+/// Outer size of the find-in-files modal, percent of the frame.
+const GREP_MODAL_PCT: (u16, u16) = (88, 76);
+/// Fixed (width, height) of the jump palette.
+const PALETTE_SIZE: (u16, u16) = (64, 18);
+/// Fixed (width, height) of the find-file modal.
+const FILES_SIZE: (u16, u16) = (72, 20);
+/// Fixed (width, height) of the multi-line task prompt.
+const TASK_PROMPT_SIZE: (u16, u16) = (76, 14);
+
+/// The key hints on a task box's bottom border, widest that fits inside
+/// `width` (the block's, so two columns go to its edges). The QUICK PROMPT
+/// has three more keys to advertise than the cloud and preset boxes —
+/// `Tab` retargets the harness, `⇧Tab` picks an AGENT PRESET, `^N` flips
+/// the launch into a fresh worktree — and a hint wider than the border is
+/// silently chopped, hence the tiers and the test that measures them.
+fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
+    if matches!(kind, crate::app::PromptKind::QuickPrompt(_)) {
+        return if width >= 75 {
+            " Enter launch · ^J newline · Tab agent · ⇧Tab preset · ^N worktree · Esc "
+        } else if width >= 61 {
+            " Enter launch · ^J newline · Tab agent · ⇧Tab preset · Esc "
+        } else if width >= 44 {
+            " ↵ launch · Tab agent · ⇧Tab preset · Esc "
+        } else if width >= 22 {
+            " Esc · ^J · Tab · ↵ "
+        } else {
+            " Esc · ^J · ↵ "
+        };
+    }
+    if width >= 57 {
+        " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
+    } else if width >= 42 {
+        // Not 36: at 36–41 columns this line was two characters wider than
+        // the border and lost its tail.
+        " Enter launch · ^J newline · Esc cancel "
+    } else {
+        " Esc · ^J · Enter "
+    }
+}
+
+/// The QUICK PROMPT's target row, the first inside its frame. Off — the
+/// launch lands in the selected checkout — it is a quiet `worktree: feat`
+/// with the `[ ] new worktree ^N` toggle pinned right. On, it is the
+/// loudest row in the box: a filled NEW WORKTREE chip, the branch Enter
+/// will cut beside it in bold, and the toggle ticked, all in the green
+/// the frame has turned. The right half is dropped whole before the left
+/// is cut short.
+fn quick_target_line(
+    app: &App,
+    launch: &crate::quick_prompt::QuickLaunch,
+    width: u16,
+    th: Theme,
+) -> Line<'static> {
+    let branch =
+        crate::quick_prompt::target_branch(app, launch).unwrap_or_else(|| "(worktree gone)".into());
+    let (left, right) = if launch.is_new_worktree() {
+        let chip = Style::default()
+            .fg(th.on_accent)
+            .bg(th.ok)
+            .add_modifier(Modifier::BOLD);
+        let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
+        (
+            vec![
+                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(format!(" {branch}"), on),
+            ],
+            vec![
+                Span::styled("[✓] new worktree", on),
+                Span::styled(" ^N ", Style::default().fg(th.dim)),
+            ],
+        )
+    } else {
+        let dim = Style::default().fg(th.dim);
+        (
+            vec![
+                Span::styled("worktree: ", dim),
+                Span::styled(branch, Style::default().fg(th.muted)),
+            ],
+            vec![
+                Span::styled("[ ] new worktree", dim),
+                Span::styled(" ^N ", dim),
+            ],
+        )
+    };
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let right_w: usize = right.iter().map(|s| s.width()).sum();
+    let mut spans = left;
+    if usize::from(width) > left_w + right_w {
+        spans.push(Span::raw(" ".repeat(usize::from(width) - left_w - right_w)));
+        spans.extend(right);
+    }
+    Line::from(spans)
+}
+/// Width of a one-line prompt, and of the wider one carrying a directory
+/// listing under its input.
+const PROMPT_W: u16 = 56;
+const PATH_PROMPT_W: u16 = 72;
+/// Narrowest a confirm dialog gets, so a short question still reads as one.
+const CONFIRM_MIN_W: u16 = 52;
+/// Widths of the modals whose height follows their content.
+const HELP_W: u16 = 92;
+const SETTINGS_W: u16 = 84;
+const MEMORY_W: u16 = 74;
+const HOSTS_W: u16 = 64;
+/// Layout floor for a split modal's right pane. Deliberately below
+/// `MIN_DIFF_PANE_W`: the file list is clamped to keep that minimum first,
+/// so on a tiny screen this lets the layout squeeze the diff/preview pane
+/// rather than the list.
+const SPLIT_PANE_LAYOUT_MIN: u16 = 20;
+/// What every filtered list says when nothing survives the filter.
+const NO_MATCHES: &str = "no matches";
 
 /// Columns the tree-browser preview must keep for the file text itself
 /// before a line-number gutter is worth drawing.
@@ -33,7 +146,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus_tint && app.focus == Focus::Terminal {
+        if app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -65,13 +178,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Min(0),
     ])
     .areas(body);
-    let [projects_a, worktrees_a, sessions_a, term_a] = Layout::horizontal([
-        Constraint::Length(app.panel_widths[0]),
-        Constraint::Length(app.panel_widths[1]),
-        Constraint::Length(app.panel_widths[2]),
-        Constraint::Min(20),
-    ])
-    .areas(panels_a);
+    let visible_panels = app.visible_panel_indices();
+    let constraints = visible_panels
+        .iter()
+        .map(|idx| Constraint::Length(app.panel_widths[*idx]))
+        .chain(std::iter::once(Constraint::Min(crate::app::MIN_TERM_W)));
+    let areas = panels_a.layout_vec(&Layout::horizontal(constraints));
+    let mut panel_areas: [Option<Rect>; 3] = [None; 3];
+    for (idx, area) in visible_panels.iter().copied().zip(areas.iter().copied()) {
+        panel_areas[idx] = Some(area);
+    }
+    let term_a = areas[visible_panels.len()];
 
     // Splitter grab zones: the two touching border cells at each panel
     // boundary. Registered first so they win `hit_at`'s first-match scan —
@@ -92,25 +209,32 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_workspaces {
         draw_workspaces_bar(f, app, workspaces_a);
     }
-    draw_projects(f, app, projects_a);
-    draw_worktrees(f, app, worktrees_a);
-    draw_sessions(f, app, sessions_a);
+    if let Some(area) = panel_areas[0] {
+        draw_projects(f, app, area);
+    }
+    if let Some(area) = panel_areas[1] {
+        draw_worktrees(f, app, area);
+    }
+    draw_sessions(
+        f,
+        app,
+        panel_areas[2].expect("Sessions panel is always visible"),
+    );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (opt-in, `focus_tint` setting): the focused panel's whole
-    // background picks up a faint accent tint. The sidebar columns stop
-    // one cell short of their right rule so the tint stays inside the
-    // panel.
-    if app.focus_tint {
-        let tinted = match app.focus {
-            // The bar's last row is its rule, which belongs to the boundary
-            // rather than to the bar — leave it untinted.
-            Focus::Workspaces => shrink_b(workspaces_a),
-            Focus::Projects => shrink_r(projects_a),
-            Focus::Worktrees => shrink_r(worktrees_a),
-            Focus::Sessions => shrink_r(sessions_a),
-            Focus::Terminal => term_a,
-        };
+    // Focus cue (always on): the focused panel's whole background picks
+    // up a faint accent tint. The sidebar columns stop one cell short of
+    // their right rule so the tint stays inside the panel.
+    let tinted = match app.focus {
+        // The bar's last row is its rule, which belongs to the boundary
+        // rather than to the bar — leave it untinted.
+        Focus::Workspaces => Some(shrink_b(workspaces_a)),
+        Focus::Projects => panel_areas[0].map(shrink_r),
+        Focus::Worktrees => panel_areas[1].map(shrink_r),
+        Focus::Sessions => panel_areas[2].map(shrink_r),
+        Focus::Terminal => Some(term_a),
+    };
+    if let Some(tinted) = tinted {
         draw_focus_tint(f.buffer_mut(), tinted, app.theme);
     }
     draw_footer(f, app, footer);
@@ -127,8 +251,12 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
         return;
     };
     if vim.embedded {
-        if let Some(Overlay::Tree(view)) = &app.overlay {
-            let inner = view.preview_area;
+        let pane = match &app.overlay {
+            Some(Overlay::Tree(view)) => Some(view.preview_area),
+            Some(Overlay::FileTabs(view)) => Some(view.body_area),
+            _ => None,
+        };
+        if let Some(inner) = pane {
             if inner.width < 2 || inner.height < 2 {
                 return; // pane not drawn yet
             }
@@ -142,8 +270,8 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
             }
             return;
         }
-        // Tree overlay gone under an embedded editor — fall through to the
-        // modal so the session is never invisible.
+        // The owning overlay gone under an embedded editor — fall through
+        // to the modal so the session is never invisible.
     }
     let area = centered_rect_pct(f.area(), VIM_MODAL_PCT.0, VIM_MODAL_PCT.1);
     f.render_widget(Clear, area);
@@ -181,8 +309,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
     };
     match overlay {
         Overlay::Menu(menu) => {
-            let title_width = menu
-                .title
+            // A type-ahead submenu shows its query in the title: `Cursor
+            // model ⌕ opus`, the bare ⌕ while nothing is typed yet.
+            let title_text = menu.title.as_deref().map(|t| match &menu.filter {
+                Some(f) if !f.query.is_empty() => format!("{t} ⌕ {}", f.query),
+                Some(_) => format!("{t} ⌕"),
+                None => t.to_string(),
+            });
+            let title_width = title_text
                 .as_deref()
                 .map(|t| t.chars().count() + 2)
                 .unwrap_or(0);
@@ -199,6 +333,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // border; the modal widens to fit.
             let hint = if menu.is_workspace_picker() {
                 Some(" n: new  r: rename  d: delete ")
+            } else if menu.filter.is_some() {
+                Some(" type to filter  ↑↓: move  Backspace  Esc: back ")
             } else {
                 menu.hovered_claude_cloud().map(|cloud| {
                     if cloud {
@@ -235,7 +371,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent));
-            if let Some(title) = &menu.title {
+            if let Some(title) = &title_text {
                 block = block.title(Span::styled(
                     format!(" {title} "),
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -276,7 +412,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // lines — size the dialog to fit them.
             let msg_lines: Vec<&str> = confirm.message.lines().collect();
             let longest = msg_lines.iter().map(|l| l.chars().count()).max();
-            let width = (longest.unwrap_or(0) as u16 + 4).max(52);
+            let width = (longest.unwrap_or(0) as u16 + 4).max(CONFIRM_MIN_W);
             let height = msg_lines.len() as u16 + 4;
             let area = centered_rect(f.area(), width, height);
             f.render_widget(Clear, area);
@@ -301,32 +437,50 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
             ]));
             f.render_widget(Paragraph::new(lines), inner);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Confirm(c)) = &mut app.overlay {
+                c.area = area;
+            }
         }
         Overlay::Prompt(prompt) if prompt.is_multiline() => {
-            let area = centered_rect(f.area(), 76, 14);
-            f.render_widget(Clear, area);
-            let hint = if area.width >= 64 {
-                " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
-            } else if area.width >= 36 {
-                " Enter launch · ^J newline · Esc cancel "
-            } else {
-                " Esc · ^J · Enter "
+            // The QUICK PROMPT carries one row the other task boxes do not
+            // — where the launch lands — and takes it in height rather
+            // than out of the editor. Its frame turns green while Enter
+            // will cut a fresh worktree first, so the state reads from
+            // across the room, before the row or the title does.
+            let quick = match &prompt.kind {
+                crate::app::PromptKind::QuickPrompt(launch) => Some(launch),
+                _ => None,
             };
+            let new_worktree = quick.is_some_and(|launch| launch.is_new_worktree());
+            let frame = if new_worktree { th.ok } else { th.accent };
+            let height = TASK_PROMPT_SIZE.1 + u16::from(quick.is_some());
+            let area = centered_rect(f.area(), TASK_PROMPT_SIZE.0, height);
+            f.render_widget(Clear, area);
+            let hint = task_prompt_hint(&prompt.kind, area.width);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
+                .border_style(Style::default().fg(frame))
                 .title(Span::styled(
                     format!(" {} ", prompt.title),
-                    Style::default().fg(th.accent),
+                    Style::default().fg(frame),
                 ))
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
-            let label_rows = usize::from(inner.height >= 4);
+            // The QUICK PROMPT's target row above the label: the toggle
+            // and its state in one glance, whichever way it stands.
+            let target_rows = u16::from(quick.is_some() && inner.height >= 5);
+            if let (1, Some(launch)) = (target_rows, quick) {
+                let row = row_rect(inner, 0).expect("a five-row inner area has a target row");
+                f.render_widget(quick_target_line(app, launch, row.width, th), row);
+            }
+            let label_rows = u16::from(inner.height.saturating_sub(target_rows) >= 4);
             if label_rows == 1 {
-                let row = row_rect(inner, 0).expect("a four-row inner area has a label row");
+                let row = row_rect(inner, usize::from(target_rows))
+                    .expect("a four-row inner area has a label row");
                 f.render_widget(
                     Paragraph::new(Span::styled(prompt.label, Style::default().fg(th.dim))),
                     row,
@@ -336,11 +490,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // A bordered, multi-row task editor. Its own wrapping helper
             // keeps words intact and follows the caret once the task grows
             // beyond the visible rows.
+            let head_rows = target_rows + label_rows;
             let editor_area = Rect {
                 x: inner.x,
-                y: inner.y.saturating_add(label_rows as u16),
+                y: inner.y.saturating_add(head_rows),
                 width: inner.width,
-                height: inner.height.saturating_sub(label_rows as u16),
+                height: inner.height.saturating_sub(head_rows),
             };
             let editor_inner = if editor_area.height >= 3 && editor_area.width >= 4 {
                 let editor_block = Block::default()
@@ -360,13 +515,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let start = caret_row.saturating_sub(visible / 2).min(max_start);
             let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
             f.render_widget(Paragraph::new(shown), editor_inner);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+                p.area = area;
+            }
         }
         Overlay::Prompt(prompt) => {
             // Path prompts get a wide dialog with the live directory
             // listing between the input and the hint; the dialog grows to
             // fit the listing (at least one row, for the empty message).
             let is_path = prompt.completes_paths();
-            let width = if is_path { 72 } else { 56 };
+            let width = if is_path { PATH_PROMPT_W } else { PROMPT_W };
             let list_h = if is_path {
                 prompt.dirs.len().clamp(1, 8) as u16
             } else {
@@ -471,9 +630,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     r,
                 );
             }
-            // Record the listing rect for click hit-testing.
+            // Record the listing and dialog rects for click hit-testing.
             if let Some(Overlay::Prompt(p)) = &mut app.overlay {
                 p.list_area = list_area;
+                p.area = area;
             }
         }
         Overlay::AutomationHelp => {
@@ -589,7 +749,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 footer,
             );
         }
-        Overlay::Help => {
+        Overlay::Help(_) => {
             // Grouped keymap in two columns: reads by task instead of one
             // giant list, and at ~24 rows it fits a stock terminal window
             // (the old single list clipped its tail on short screens).
@@ -609,12 +769,22 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "NAVIGATE & SEARCH",
                     &[
-                        (Act(&[FocusNext, FocusPrev]), "cycle focus between panels"),
-                        (Act(&[FocusLeft, FocusRight]), "move focus left / right"),
-                        (Act(&[MoveDown, MoveUp]), "move selection"),
+                        (
+                            Act(&[FocusNext, FocusPrev]),
+                            "walk panels (fwd locks input)",
+                        ),
+                        (
+                            Act(&[FocusLeft, FocusRight]),
+                            "focus left / right (2×: jump)",
+                        ),
+                        (Act(&[MoveDown, MoveUp]), "move selection (2×: bar)"),
                         (Act(&[Activate]), "drill in / attach session"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
+                        (
+                            Act(&[NextAttention, PrevAttention]),
+                            "next/prev session needing you",
+                        ),
                         (Act(&[FindFile]), "find file (^y copies path)"),
                         (Act(&[Grep]), "find in files (git grep)"),
                         (Act(&[TreeBrowser]), "file tree browser"),
@@ -624,17 +794,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "PROJECTS",
                     &[
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
-                        (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
+                        (Act(&[Rename]), "rename row (folder keeps its name)"),
                         (Act(&[Delete]), "remove from list"),
                     ],
                 ),
                 (
                     "WORKTREES",
                     &[
-                        (Act(&[New]), "new worktree"),
+                        (Act(&[New]), "new worktree (PR row: Claude)"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
-                        (Act(&[Pin]), "pin / unpin"),
+                        (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -653,11 +823,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "SESSIONS",
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
+                        (Act(&[AgentPresets]), "agent presets: launch with a task"),
                         (Act(&[NewTerminal]), "new shell terminal"),
-                        (Act(&[NewLink]), "attach a link (PR, doc, ticket)"),
                         (Act(&[Activate]), "attach session / open link"),
                         (Act(&[Rename]), "rename agent / edit link URL"),
-                        (Act(&[Pin]), "pin / unpin"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
                             "archive / unarchive / show",
@@ -679,6 +848,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
                         (Lit("drag border"), "resize panels"),
+                        (Lit("click outside"), "dismiss any modal (= Esc)"),
                     ],
                 ),
                 (
@@ -687,6 +857,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (
                             Act(&[Workspaces, ToggleWorkspaces]),
                             "workspace switcher / workspaces bar",
+                        ),
+                        (
+                            Act(&[ToggleProjects, ToggleWorktrees]),
+                            "show / hide Projects / Worktrees",
                         ),
                         (Lit("⌘1-9 / 1-9"), "open that workspace tab"),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
@@ -719,7 +893,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     + sections.len().saturating_sub(1) as u16
             };
             let height = rows(LEFT).max(rows(RIGHT)) + 2;
-            let area = centered_rect(f.area(), 92, height);
+            let area = centered_rect(f.area(), HELP_W, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -760,6 +934,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             f.render_widget(Paragraph::new(column(LEFT, left_a.width)), left_a);
             f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Help(h)) = &mut app.overlay {
+                h.area = area;
+            }
         }
         Overlay::Settings(view) => {
             // A tab strip over a scrolling list. Splitting the settings by
@@ -774,54 +952,21 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             const CHROME: u16 = 2 + 4;
             let want = rows.len() as u16 + CHROME + 2;
             let height = want.min(f.area().height.saturating_sub(2)).max(CHROME + 3);
-            let area = centered_rect(f.area(), 84, height);
-            f.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " Settings ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let area = centered_rect(f.area(), SETTINGS_W, height);
+            let inner = render_modal_frame(f, area, " Settings ", th);
 
             let dim = Style::default().fg(th.dim);
             let capturing = view.capturing();
 
             // ---- tab strip ----
-            let mut strip: Vec<Span> = Vec::new();
-            let mut hits: Vec<(u16, u16)> = Vec::new();
-            let mut x = inner.x;
-            for (i, t) in crate::config::SETTINGS_TABS.iter().enumerate() {
-                strip.push(Span::raw(" "));
-                x += 1;
-                let label = format!(" {} ", t.title);
-                let mut style = Style::default().fg(th.dim);
-                if i == tab {
-                    style = Style::default()
-                        .fg(th.accent)
-                        .bg(th.sel_bg)
-                        .add_modifier(Modifier::BOLD);
-                    // Cursor parked on the strip: brighten the active tab
-                    // so ←/→ visibly belong to it.
-                    if view.on_tabs {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                }
-                let w = label.chars().count() as u16;
-                hits.push((x, x + w));
-                x += w;
-                strip.push(Span::styled(label, style));
-            }
-            let mut lines: Vec<Line> = vec![
-                Line::from(strip),
-                Line::from(Span::styled(
-                    "─".repeat(inner.width as usize),
-                    Style::default().fg(th.muted),
-                )),
-            ];
+            let (strip, hits) = tab_strip(
+                inner.x,
+                crate::config::SETTINGS_TABS.iter().map(|t| t.title),
+                tab,
+                view.on_tabs,
+                th,
+            );
+            let mut lines: Vec<Line> = vec![Line::from(strip), strip_rule(inner.width, th)];
 
             // ---- body ----
             let body_h = inner.height.saturating_sub(CHROME).max(1) as usize;
@@ -965,21 +1110,28 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Metrics(view) => {
-            // One row per live session (biggest first), then nebula's own
-            // two processes; above them, a rollup per agent kind so "how
-            // much is claude using?" reads off in one line.
+            // One row per live session (biggest first); then the prewarm
+            // pool's spares — CLIs booted ahead of a new-agent request,
+            // with no row of their own — grouped under one header so they
+            // can't pass for sessions; then nebula's own two processes.
+            // Above them, a rollup per agent kind so "how much is claude
+            // using?" reads off in one line.
             struct Row {
                 name: String,
                 context: String,
-                pid: u32,
+                /// None = a group header, which is no one process.
+                pid: Option<u32>,
                 procs: u32,
                 bytes: u64,
-                /// None = one of nebula's own processes (not openable).
+                /// None = not openable: nebula's own processes, a group
+                /// header, or a pool spare (nothing to open until a
+                /// CreateAgent adopts it).
                 sref: Option<SessionRef>,
             }
             let mut rows: Vec<Row> = Vec::new();
+            let mut spares: Vec<Row> = Vec::new();
             // kind label → (session count, procs, bytes); BTreeMap for a
-            // stable claude / codex / cursor / shells order.
+            // stable claude / codex / cursor / shells / warm order.
             let mut kinds: std::collections::BTreeMap<&'static str, (u32, u32, u64)> =
                 std::collections::BTreeMap::new();
             let mut sessions_total: u64 = 0;
@@ -1005,6 +1157,29 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             if let Some(snap) = &view.snapshot {
                 for m in &snap.sessions {
+                    // A pool spare: name it by what it booted as and where
+                    // it waits, and keep it out of the live-session rows.
+                    if let (SessionRef::Agent(_), Some(home)) = (&m.session, &m.prewarm) {
+                        let model = home
+                            .model
+                            .as_deref()
+                            .map(|model| format!(" · {model}"))
+                            .unwrap_or_default();
+                        let entry = kinds.entry("warm").or_default();
+                        entry.0 += 1;
+                        entry.1 += m.procs;
+                        entry.2 += m.rss_bytes;
+                        sessions_total += m.rss_bytes;
+                        spares.push(Row {
+                            name: format!("{}{model}", home.kind.as_str()),
+                            context: wt_context(&home.worktree),
+                            pid: Some(m.pid),
+                            procs: m.procs,
+                            bytes: m.rss_bytes,
+                            sref: None,
+                        });
+                        continue;
+                    }
                     let (name, context, kind) = match &m.session {
                         SessionRef::Agent(id) => {
                             let agent = app.tree.agents.iter().find(|a| &a.id == id);
@@ -1035,17 +1210,36 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     rows.push(Row {
                         name,
                         context,
-                        pid: m.pid,
+                        pid: Some(m.pid),
                         procs: m.procs,
                         bytes: m.rss_bytes,
                         sref: Some(m.session.clone()),
                     });
                 }
                 rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                // The spares hang off one header row as a small tree:
+                // the header carries their sum, each leaf its own reading.
+                if !spares.is_empty() {
+                    spares.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                    let count = spares.len();
+                    rows.push(Row {
+                        name: format!("warm spares ({count})"),
+                        context: String::new(),
+                        pid: None,
+                        procs: spares.iter().map(|r| r.procs).sum(),
+                        bytes: spares.iter().map(|r| r.bytes).sum(),
+                        sref: None,
+                    });
+                    for (i, mut spare) in spares.into_iter().enumerate() {
+                        let branch = if i + 1 == count { "└ " } else { "├ " };
+                        spare.name = format!("{branch}{}", spare.name);
+                        rows.push(spare);
+                    }
+                }
                 rows.push(Row {
                     name: "nebula daemon".into(),
                     context: String::new(),
-                    pid: snap.daemon_pid,
+                    pid: Some(snap.daemon_pid),
                     procs: 1,
                     bytes: snap.daemon_rss_bytes,
                     sref: None,
@@ -1053,7 +1247,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 rows.push(Row {
                     name: "nebula ui (this window)".into(),
                     context: String::new(),
-                    pid: std::process::id(),
+                    pid: Some(std::process::id()),
                     procs: 1,
                     bytes: view.client_rss_bytes,
                     sref: None,
@@ -1081,13 +1275,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(snap) = &view.snapshot {
                 // Rollup: one line per agent kind, then nebula, then total.
                 for (kind, (n, procs, bytes)) in &kinds {
-                    let unit = if *kind == "shells" {
-                        "terminal"
-                    } else {
-                        "session"
+                    let unit = match *kind {
+                        "shells" => "terminal",
+                        "warm" => "spare",
+                        _ => "session",
                     };
-                    let detail =
+                    let mut detail =
                         format!("{n} {unit}{} · {procs} proc{}", plural(*n), plural(*procs));
+                    if *kind == "warm" {
+                        detail.push_str(" · pre-booted for new agents");
+                    }
                     lines.push(Line::from(vec![
                         Span::styled(format!(" {kind:<8} "), header),
                         Span::styled(format!("{detail:<42}"), dim),
@@ -1156,7 +1353,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             sel(name_style),
                         ),
                         Span::styled(format!("{:<15} ", truncate(&row.context, 15)), sel(dim)),
-                        Span::styled(format!("{:>6} {:>5} ", row.pid, row.procs), sel(dim)),
+                        Span::styled(
+                            format!(
+                                "{:>6} {:>5} ",
+                                row.pid.map(|p| p.to_string()).unwrap_or_default(),
+                                row.procs
+                            ),
+                            sel(dim),
+                        ),
                         Span::styled(format!("{:>9}", fmt_mem(row.bytes)), sel(mem_style)),
                     ]));
                 }
@@ -1171,18 +1375,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
 
             let height = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
-            let area = centered_rect(f.area(), 74, height);
-            f.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " Memory ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let area = centered_rect(f.area(), MEMORY_W, height);
+            let inner = render_modal_frame(f, area, " Memory ", th);
             f.render_widget(Paragraph::new(lines), inner);
             if let Some(Overlay::Metrics(v)) = &mut app.overlay {
                 v.area = area;
@@ -1198,16 +1392,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Diff(view) => {
-            let area = centered_rect_pct(f.area(), 92, 90);
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the file list keeps
-            // its minimum and Min(20) squeezes the diff pane instead.
+            // its minimum and SPLIT_PANE_LAYOUT_MIN squeezes the diff pane
+            // instead.
             let files_w = view
                 .files_width
                 .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
                 .max(crate::app::MIN_DIFF_FILES_W);
-            let [files_a, diff_a] =
-                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
+            let [files_a, diff_a] = Layout::horizontal([
+                Constraint::Length(files_w),
+                Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
+            ])
+            .areas(area);
 
             // Left: changed-file list; a stateless follow-window keeps the
             // selected row visible.
@@ -1228,19 +1426,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
-            let list_inner = Rect {
-                y: files_inner.y + 1,
-                height: files_inner.height.saturating_sub(1),
-                ..files_inner
-            };
+            let list_inner = below_first_row(files_inner);
 
             if view.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
             for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
@@ -1337,8 +1526,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Palette(palette) => {
-            let area = centered_rect(f.area(), 64, 18);
-            f.render_widget(Clear, area);
+            let area = centered_rect(f.area(), PALETTE_SIZE.0, PALETTE_SIZE.1);
             let title = if palette.query.is_empty() {
                 " Jump to ".to_string()
             } else {
@@ -1348,35 +1536,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     palette.items.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&palette.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             if palette.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = palette.window_start(list_inner.height as usize);
             for (row, (i, m)) in palette.matches.iter().enumerate().skip(start).enumerate() {
@@ -1424,19 +1594,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 };
                 let budget = (list_inner.width as usize).saturating_sub(4);
                 let shown = truncate(&item.text, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < item.text.chars().count() {
-                    let keep = m
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &m.positions[..keep]
-                } else {
-                    &m.positions[..]
-                };
+                let positions = visible_positions(&m.positions, &shown, &item.text);
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
                 spans.extend(path_highlight_spans(
                     &shown,
@@ -1457,8 +1615,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Files(finder) => {
-            let area = centered_rect(f.area(), 72, 20);
-            f.render_widget(Clear, area);
+            let area = centered_rect(f.area(), FILES_SIZE.0, FILES_SIZE.1);
             let title = if finder.query.is_empty() {
                 format!(" Find file — {} ({}) ", finder.branch, finder.files.len())
             } else {
@@ -1469,35 +1626,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     finder.files.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&finder.query, "type to filter…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             if finder.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = finder.window_start(list_inner.height as usize);
             for (row, (i, m)) in finder.matches.iter().enumerate().skip(start).enumerate() {
@@ -1507,19 +1646,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let path = &finder.files[m.file];
                 let budget = (list_inner.width as usize).saturating_sub(2);
                 let shown = truncate(path, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < path.chars().count() {
-                    let keep = m
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &m.positions[..keep]
-                } else {
-                    &m.positions[..]
-                };
+                let positions = visible_positions(&m.positions, &shown, path);
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(fuzzy_highlight_spans(&shown, positions, th));
                 render_row(f, row_area, spans, i == finder.selected, true, th);
@@ -1533,8 +1660,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Grep(view) => {
-            let area = centered_rect_pct(f.area(), 88, 76);
-            f.render_widget(Clear, area);
+            let area = centered_rect_pct(f.area(), GREP_MODAL_PCT.0, GREP_MODAL_PCT.1);
             let title = if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
                 format!(" Find in files — {} ", view.branch)
             } else if view.truncated {
@@ -1550,27 +1676,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     view.hits.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-live grep query.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&view.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             // Placeholder row: error, too-short query, or an empty result.
             let placeholder = if let Some(err) = &view.error {
@@ -1584,7 +1697,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Style::default().fg(th.dim),
                 ))
             } else if view.hits.is_empty() {
-                Some(Span::styled("no matches", Style::default().fg(th.dim)))
+                Some(Span::styled(NO_MATCHES, Style::default().fg(th.dim)))
             } else {
                 None
             };
@@ -1629,35 +1742,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let height = (list_rows as u16)
                 .saturating_add(2)
                 .clamp(5, f.area().height.max(5));
-            let area = centered_rect(f.area(), 64, height);
+            let area = centered_rect(f.area(), HOSTS_W, height);
             f.render_widget(Clear, area);
             let hint = if adding {
                 " type user@host [dir]  Enter: connect  Esc: cancel "
             } else {
                 " Enter: connect  a: new host  d: remove  Esc: close "
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " SSH Hosts ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ))
+            let block = modal_block(" SSH Hosts ", th)
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
             if total == 0 && !adding {
-                if let Some(row_area) = row_rect(inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no hosts yet — a connects to a new one",
-                            Style::default().fg(th.dim),
-                        )),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, inner, "no hosts yet — a connects to a new one", th);
             }
             // Follow-window keeps the cursor visible; while adding, pin the
             // window to the tail so the input row is always on screen.
@@ -1713,17 +1811,100 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.selected = selected;
             }
         }
+        Overlay::AgentPresets(view) => crate::preset_overlays::draw_list(f, app, &view, th),
+        Overlay::AgentPresetEditor(editor) => {
+            crate::preset_overlays::draw_editor(f, app, &editor, th)
+        }
+        Overlay::FileTabs(view) => {
+            // The TREE BROWSER's footprint: the editor Enter opens wants the
+            // room, and the preview is a whole file.
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
+            let title = format!(" Open files ({}) ", view.tabs.len());
+            let inner = render_modal_frame(f, area, title, th);
+
+            // ---- tab strip and its rule ----
+            let (strip, hits) = tab_strip(
+                inner.x,
+                view.tabs.iter().map(|t| t.label.as_str()),
+                view.tab,
+                view.on_tabs,
+                th,
+            );
+            let head = Rect {
+                height: inner.height.min(2),
+                ..inner
+            };
+            f.render_widget(
+                Paragraph::new(vec![Line::from(strip), strip_rule(inner.width, th)]),
+                head,
+            );
+
+            // ---- body: the preview, or the embedded editor draw_vim paints
+            // over it after us ----
+            let body = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(2),
+                width: inner.width,
+                height: inner.height.saturating_sub(3),
+            };
+            let max_scroll = view
+                .preview_line_count
+                .saturating_sub(body.height as usize)
+                .min(u16::MAX as usize) as u16;
+            let scroll = view.scroll.min(max_scroll);
+            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            if !editing && body.height > 0 {
+                let lines = preview_window(
+                    &view.preview_lines,
+                    view.preview_line_count,
+                    view.preview_is_file,
+                    scroll,
+                    body,
+                    th,
+                );
+                f.render_widget(Paragraph::new(lines), body);
+            }
+
+            // ---- keys hint on the last row ----
+            if let Some(hint_area) = row_rect(inner, inner.height.saturating_sub(1) as usize) {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        truncate(
+                            &format!(" {}", file_tabs_keys_hint(&view, editing)),
+                            inner.width as usize,
+                        ),
+                        Style::default().fg(th.dim),
+                    )),
+                    hint_area,
+                );
+            }
+
+            // Write-back (draw works on a clone): hit rects for the mouse,
+            // the pane for the embedded editor, the page size for paging,
+            // the scroll re-clamped so resizes never strand the view.
+            if let Some(Overlay::FileTabs(v)) = &mut app.overlay {
+                v.area = area;
+                v.tab_hits = hits;
+                v.body_area = body;
+                v.view_height = body.height;
+                v.scroll = scroll;
+            }
+        }
         Overlay::Tree(view) => {
-            let area = centered_rect_pct(f.area(), 92, 90);
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the tree keeps its
-            // minimum and Min(20) squeezes the preview pane instead.
+            // minimum and SPLIT_PANE_LAYOUT_MIN squeezes the preview pane
+            // instead.
             let files_w = view
                 .files_width
                 .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
                 .max(crate::app::MIN_DIFF_FILES_W);
-            let [tree_a, preview_a] =
-                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
+            let [tree_a, preview_a] = Layout::horizontal([
+                Constraint::Length(files_w),
+                Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
+            ])
+            .areas(area);
 
             // Left: the file tree; a stateless follow-window keeps the
             // selected row visible.
@@ -1744,19 +1925,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
-            let list_inner = Rect {
-                y: tree_inner.y + 1,
-                height: tree_inner.height.saturating_sub(1),
-                ..tree_inner
-            };
+            let list_inner = below_first_row(tree_inner);
 
             if view.rows.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
             for (row, (i, r)) in view.rows.iter().enumerate().skip(start).enumerate() {
@@ -1775,19 +1947,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 };
                 let budget = (list_inner.width as usize).saturating_sub(indent.chars().count() + 3);
                 let shown = truncate(&node.name, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < node.name.chars().count() {
-                    let keep = r
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &r.positions[..keep]
-                } else {
-                    &r.positions[..]
-                };
+                let positions = visible_positions(&r.positions, &shown, &node.name);
                 let mut spans = vec![
                     Span::raw(format!(" {indent}")),
                     Span::styled(marker, Style::default().fg(th.accent)),
@@ -1833,29 +1993,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // directory listings and placeholders have no lines to
                 // number. Dropped entirely when the pane is too narrow to
                 // leave room for the code itself.
-                let num_w = view.preview_line_count.to_string().len().max(2);
-                let gutter = view.preview_is_file
-                    && (preview_inner.width as usize) > num_w + 1 + MIN_PREVIEW_TEXT_W;
-                let lines: Vec<Line> = view
-                    .preview_lines
-                    .iter()
-                    .enumerate()
-                    .skip(scroll as usize)
-                    .take(preview_inner.height as usize)
-                    .map(|(i, runs)| {
-                        let mut spans = Vec::with_capacity(runs.len() + 1);
-                        if gutter {
-                            spans.push(Span::styled(
-                                format!("{:>num_w$} ", i + 1),
-                                Style::default().fg(th.edge),
-                            ));
-                        }
-                        spans.extend(runs.iter().map(|(kind, text)| {
-                            Span::styled(text.clone(), token_style(*kind, th))
-                        }));
-                        Line::from(spans)
-                    })
-                    .collect();
+                let lines = preview_window(
+                    &view.preview_lines,
+                    view.preview_line_count,
+                    view.preview_is_file,
+                    scroll,
+                    preview_inner,
+                    th,
+                );
                 f.render_widget(Paragraph::new(lines), preview_inner);
             }
 
@@ -1887,6 +2032,106 @@ fn key_hint(app: &App, action: crate::keymap::Action) -> String {
 /// what the cursor is on, because the three places it can be — the tab
 /// strip, a value row, a hotkey row — take genuinely different keys, and a
 /// single union of all of them would read as noise.
+/// The FILE TABS' bottom-row hint: what the keys do from where the cursor
+/// is — the strip, the preview, or the editor drawn over it.
+fn file_tabs_keys_hint(view: &crate::file_tabs::FileTabsView, editing: bool) -> String {
+    let editor = editor_name(&view.editor);
+    if editing {
+        format!(
+            "{editor} has the keys  Ctrl+q: back to the tabs (kills {editor}; :q keeps the file)"
+        )
+    } else if view.on_tabs {
+        format!(
+            "←/→ or Tab: switch  1-9: jump  ↓: preview  Enter: edit in {editor}  Esc / Ctrl+q: close"
+        )
+    } else {
+        format!(
+            "j/k: scroll  Ctrl+d/u: half page  ↑ off the top: tabs  Enter: edit in {editor}  \
+             Esc / Ctrl+q: back to the tabs"
+        )
+    }
+}
+
+/// The tab strip the SETTINGS OVERLAY and the FILE TABS share: labels laid
+/// out left to right from `x`, the active one lit — and reversed while the
+/// cursor is parked on the strip, so ←/→ visibly belong to it — returning
+/// the spans and each label's screen x-range for click hit-testing.
+fn tab_strip<'a>(
+    x: u16,
+    labels: impl Iterator<Item = &'a str>,
+    active: usize,
+    on_tabs: bool,
+    th: Theme,
+) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    let mut strip: Vec<Span> = Vec::new();
+    let mut hits: Vec<(u16, u16)> = Vec::new();
+    let mut x = x;
+    for (i, t) in labels.enumerate() {
+        strip.push(Span::raw(" "));
+        x += 1;
+        let label = format!(" {t} ");
+        let mut style = Style::default().fg(th.dim);
+        if i == active {
+            style = Style::default()
+                .fg(th.accent)
+                .bg(th.sel_bg)
+                .add_modifier(Modifier::BOLD);
+            if on_tabs {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        let w = label.chars().count() as u16;
+        hits.push((x, x + w));
+        x += w;
+        strip.push(Span::styled(label, style));
+    }
+    (strip, hits)
+}
+
+/// The rule under a tab strip, the modal's inner width.
+fn strip_rule(width: u16, th: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width as usize),
+        Style::default().fg(th.muted),
+    ))
+}
+
+/// The highlighted preview the TREE BROWSER and the FILE TABS draw: the
+/// visible window of `lines` from `scroll`, with a line-number gutter when
+/// the text is a real file and the pane is wide enough to spare it and
+/// still leave room for the code itself.
+fn preview_window(
+    lines: &[Vec<(crate::syntax::TokenKind, String)>],
+    line_count: usize,
+    is_file: bool,
+    scroll: u16,
+    inner: Rect,
+    th: Theme,
+) -> Vec<Line<'static>> {
+    let num_w = line_count.to_string().len().max(2);
+    let gutter = is_file && (inner.width as usize) > num_w + 1 + MIN_PREVIEW_TEXT_W;
+    lines
+        .iter()
+        .enumerate()
+        .skip(scroll as usize)
+        .take(inner.height as usize)
+        .map(|(i, runs)| {
+            let mut spans = Vec::with_capacity(runs.len() + 1);
+            if gutter {
+                spans.push(Span::styled(
+                    format!("{:>num_w$} ", i + 1),
+                    Style::default().fg(th.edge),
+                ));
+            }
+            spans.extend(
+                runs.iter()
+                    .map(|(kind, text)| Span::styled(text.clone(), token_style(*kind, th))),
+            );
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     if view.capturing() {
         return "press the key you want   Esc: cancel";
@@ -1900,10 +2145,13 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     if view.is_hotkeys() {
         return "Enter: rebind  a: add  ⌫: default  x: unbind  R: reset all  Tab: next  ↑: tabs";
     }
+    if crate::config::setting_at(view.tab, view.selected).is_some_and(|s| s.kind.is_text()) {
+        return "↑/↓: move  Enter: type a value (empty = default)  R: reset all  Tab: next tab";
+    }
     "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
 }
 
-fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(frame.width);
     let height = height.min(frame.height);
     Rect {
@@ -1917,6 +2165,30 @@ fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
 /// A centered rect sized as a percentage of the frame.
 fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
+}
+
+/// A modal's inner rect minus its first row — the list under an always-on
+/// filter input, which every fuzzy overlay lays out the same way.
+fn below_first_row(inner: Rect) -> Rect {
+    Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    }
+}
+
+/// The match positions that still point at real characters once `full`
+/// was truncated to `shown`: truncation puts `…` at the last char of
+/// `shown`, and a match landing on that index must not light the ellipsis.
+/// Untruncated text keeps every position.
+fn visible_positions<'a>(positions: &'a [usize], shown: &str, full: &str) -> &'a [usize] {
+    let shown_len = shown.chars().count();
+    if shown_len < full.chars().count() {
+        let keep = positions.iter().take_while(|&&p| p + 1 < shown_len).count();
+        &positions[..keep]
+    } else {
+        positions
+    }
 }
 
 /// A sidebar column's rect minus its right rule column.
@@ -1975,6 +2247,61 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
             }
         }
     }
+}
+
+/// The frame every accent modal shares — rounded accent border, bold accent
+/// title — so the overlays can't drift apart one border style at a time.
+pub(crate) fn modal_block<'a>(title: impl Into<std::borrow::Cow<'a, str>>, th: Theme) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// Clear `area` and draw a [`modal_block`] over it, returning the inner
+/// rect the modal's content goes in.
+fn render_modal_frame<'a>(
+    f: &mut Frame,
+    area: Rect,
+    title: impl Into<std::borrow::Cow<'a, str>>,
+    th: Theme,
+) -> Rect {
+    f.render_widget(Clear, area);
+    let block = modal_block(title, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// A dim one-line placeholder on the first row of an otherwise empty list,
+/// when the list has a first row at all.
+pub(crate) fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Theme) {
+    if let Some(row_area) = row_rect(list_inner, 0) {
+        f.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(th.dim))),
+            row_area,
+        );
+    }
+}
+
+/// An empty panel's one-line nudge: accent keys and dim prose alternating,
+/// the first key sitting in the row gutter so it lines up with row text.
+fn hint_line(pairs: &[(&str, &str)], th: Theme) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (i, (key, prose)) in pairs.iter().enumerate() {
+        let key = if i == 0 {
+            format!("{ROW_GUTTER}{key}")
+        } else {
+            key.to_string()
+        };
+        spans.push(Span::styled(key, Style::default().fg(th.accent)));
+        spans.push(Span::styled(prose.to_string(), Style::default().fg(th.dim)));
+    }
+    Line::from(spans)
 }
 
 /// Bordered panel frame: rounded corners everywhere for a softer, modern
@@ -2085,14 +2412,21 @@ fn status_name_spans(
     }
 }
 
-/// Columns a session name must keep before the "23m ago" label is worth
+/// Columns a row's name must keep before the "23m ago" label is worth
 /// the space it costs. Below this the label drops and the name gets it all.
-const MIN_SESSION_NAME_W: usize = 8;
+const MIN_NAME_W: usize = 8;
 
-/// " 23m ago" for the sessions list, or empty for a session that has never
-/// run. Reads the raw status stamp rather than the sort key, so a session
-/// that has been working for an hour says "1h ago" — when you last spoke to
-/// it — instead of a permanent "just now".
+/// " 23m ago" for a list row, or empty for one that has never run. Reads
+/// the raw status stamp rather than the sort key, so a session that has
+/// been working for an hour says "1h ago" — when you last spoke to it —
+/// instead of a permanent "just now". Worktree and project rows pass the
+/// newest stamp under them and read the same way.
+/// The trailing badge of a QUICK PROMPT stand-in row, in the slot the
+/// ago label (worktree) or the harness name (session) takes on a real
+/// row.
+pub(crate) const PENDING_WORKTREE_BADGE: &str = " creating";
+pub(crate) const PENDING_SESSION_BADGE: &str = " starting";
+
 fn ago_badge(status_changed_at: i64) -> String {
     if status_changed_at <= 0 {
         return String::new();
@@ -2103,20 +2437,95 @@ fn ago_badge(status_changed_at: i64) -> String {
     }
 }
 
+/// Fit an ago label into `free` columns beside a name: the label and the
+/// columns the name keeps. A narrow panel spends its columns on the name —
+/// the label drops out entirely rather than squeezing the title to nothing.
+fn fit_ago(ago: String, free: usize) -> (String, usize) {
+    match free.checked_sub(ago.chars().count()) {
+        Some(rest) if rest >= MIN_NAME_W => (ago, rest),
+        _ => (String::new(), free),
+    }
+}
+
 /// The dot. `unseen` splits the finished state in two: violet while a
 /// finished turn is still unread — the one state that wants a human — and
 /// green once the cursor has been on it, which is a result filed away, not
 /// a job. Every other status ignores the flag.
 fn status_dot(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Span<'static> {
-    let finished = if unseen { th.done } else { th.ok };
+    let glyph = match status {
+        Some(AgentStatus::Disconnected) | None => "○ ",
+        Some(_) => "● ",
+    };
+    Span::styled(glyph, Style::default().fg(status_color(status, unseen, th)))
+}
+
+/// The STATUS DOT's color on its own, for the marks that answer to it:
+/// the selection rail of a PILL ROW, the `▌` of a PROJECT button and the
+/// TAB UNDERLINE all take the row's dot color, so the cursor carries the
+/// row's status rather than the theme accent.
+fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
     match status {
-        Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
-        Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(th.warn)),
-        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(finished)),
-        Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(th.err)),
-        Some(AgentStatus::Terminated) => Span::styled("● ", Style::default().fg(th.special)),
-        Some(AgentStatus::Disconnected) => Span::styled("○ ", Style::default().fg(th.dim)),
-        None => Span::styled("○ ", Style::default().fg(th.dim)),
+        Some(AgentStatus::Fresh) => th.dim,
+        Some(AgentStatus::Running) => th.warn,
+        Some(AgentStatus::Finished) if unseen => th.done,
+        Some(AgentStatus::Finished) => th.ok,
+        Some(AgentStatus::NeedsFeedback) => th.err,
+        Some(AgentStatus::Terminated) => th.special,
+        Some(AgentStatus::Disconnected) | None => th.dim,
+    }
+}
+
+/// What a checkout row is colored on. Every other status-bearing row
+/// answers to its sessions alone; a checkout whose pull request has merged
+/// wears the merge instead (`App::worktree_wears_merge` decides — a live
+/// session still wins): purple dot, purple rail, and the branch name
+/// sweeping on the merged ramp the way a running row's sweeps yellow. The
+/// motion means what running's does — look here — but what it says is:
+/// this one landed, archive or delete it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    /// The sessions' rolled-up status, `None` for a checkout with none.
+    Sessions(Option<AgentStatus>),
+    /// The checkout's pull request has merged.
+    Merged,
+}
+
+impl RowState {
+    /// The STATUS DOT: [`status_dot`], or a solid purple one.
+    fn dot(self, unseen: bool, th: Theme) -> Span<'static> {
+        match self {
+            RowState::Sessions(status) => status_dot(status, unseen, th),
+            RowState::Merged => Span::styled("● ", Style::default().fg(th.merged)),
+        }
+    }
+
+    /// The dot's color on its own, for the selection rail.
+    fn color(self, unseen: bool, th: Theme) -> Color {
+        match self {
+            RowState::Sessions(status) => status_color(status, unseen, th),
+            RowState::Merged => th.merged,
+        }
+    }
+
+    /// The sweep the name rides: [`sweep_ramp`]'s, or the merged ramp —
+    /// and nothing with animations off, same as every other sweep.
+    fn ramp(self, th: Theme, enabled: bool) -> Option<[Color; 3]> {
+        match self {
+            RowState::Sessions(status) => sweep_ramp(status, th, enabled),
+            RowState::Merged => enabled.then_some(th.merged_sweep),
+        }
+    }
+}
+
+/// The selection mark's color on a focused selection: the row's `mark`
+/// (its STATUS DOT color, or the accent for a row that has no dot),
+/// lifted from dim to muted the way a dim dot is lifted on the fill — a
+/// FRESH row's mark is gray, but not the gray of an unfocused panel.
+fn selection_mark(mark: Color, th: Theme) -> Color {
+    if mark == th.dim {
+        th.muted
+    } else {
+        mark
     }
 }
 
@@ -2137,7 +2546,9 @@ fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
 /// selection in the focused panel; every other row gets a plain 1-cell
 /// gutter so text stays aligned. Dim spans (idle dots, archived names)
 /// would sink into the selection fill, so they get lifted to muted there.
-fn render_row(
+/// These rows (overlay lists) carry no STATUS DOT, so the mark is the
+/// accent.
+pub(crate) fn render_row(
     f: &mut Frame,
     area: Rect,
     spans: Vec<Span>,
@@ -2145,25 +2556,30 @@ fn render_row(
     focused: bool,
     th: Theme,
 ) {
-    render_button(f, area, spans, selected, focused, th, 0);
+    render_button(f, area, vec![spans], selected, focused, th, 0, th.accent);
 }
 
 /// Render one list entry as a button `area.height` rows tall: the
 /// selection fill covers the whole rect, the `▌` marker runs down its
-/// left edge, and the text sits on `text_row` (0-based, inside the rect).
-/// Dim spans (idle dots, archived names) would sink into the selection
-/// fill, so they get lifted to muted there.
-fn render_button(
+/// left edge in `mark` (the row's STATUS DOT color — see
+/// `selection_mark`), and `text` takes consecutive rows starting at
+/// `text_row` (0-based, inside the rect). A second entry is a terminal's
+/// answer to a smaller line under the first, so the caller must size
+/// `area` for it. Dim spans (idle dots, archived names, subtitles) would
+/// sink into the selection fill, so they get lifted to muted there.
+#[allow(clippy::too_many_arguments)]
+fn render_button<'a>(
     f: &mut Frame,
     area: Rect,
-    mut spans: Vec<Span>,
+    mut text: Vec<Vec<Span<'a>>>,
     selected: bool,
     focused: bool,
     th: Theme,
     text_row: u16,
+    mark: Color,
 ) {
     if selected {
-        for s in &mut spans {
+        for s in text.iter_mut().flatten() {
             if s.style.fg == Some(th.dim) {
                 s.style.fg = Some(th.muted);
             }
@@ -2171,24 +2587,23 @@ fn render_button(
     }
     let marker = || {
         if selected && focused {
-            Span::styled("▌", Style::default().fg(th.accent))
+            Span::styled("▌", Style::default().fg(selection_mark(mark, th)))
         } else if selected {
             Span::styled("▌", Style::default().fg(th.dim))
         } else {
             Span::raw(" ")
         }
     };
-    let mut text_spans = Some(spans);
     let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
     for r in 0..area.height {
-        if r == text_row {
-            if let Some(mut spans) = text_spans.take() {
-                spans.insert(0, marker());
-                lines.push(Line::from(spans));
-                continue;
-            }
+        let mut spans = vec![marker()];
+        if let Some(row) = r
+            .checked_sub(text_row)
+            .and_then(|i| text.get_mut(i as usize))
+        {
+            spans.append(row);
         }
-        lines.push(Line::from(marker()));
+        lines.push(Line::from(spans));
     }
     f.render_widget(
         Paragraph::new(lines).style(row_bar(selected, focused, th)),
@@ -2263,15 +2678,50 @@ const PILL_HALF: (char, char) = ('▄', '▀');
 /// into a black notch at each of the pill's left corners.
 const PILL_RAIL: &str = "█";
 
+/// The fill and rail of a selected pill, `(fill, rail)`: in the focused
+/// panel the raised `sel_bg` with the row's `mark` on the rail (see
+/// `selection_mark`); elsewhere the barely-raised `sel_bg_dim` under a
+/// dim rail, so an unfocused cursor reads as a place, not a signal.
+fn pill_bar(focused: bool, mark: Color, th: Theme) -> (Color, Color) {
+    if focused {
+        (th.sel_bg, selection_mark(mark, th))
+    } else {
+        (th.sel_bg_dim, th.dim)
+    }
+}
+
 /// Render one list entry into a 3-row cell starting at `top`: half-block
 /// pad, text, half-block pad. The name sits on the middle row so it
 /// stays vertically centered in the ~2-row pill. The pads run the full
 /// width so the fill has no dark notch beside the status dot, and the
 /// `PILL_RAIL` column carries the pad's own half-block in the rail color
 /// so the rail spans the pill's full visual height without stranding a
-/// bare-background quarter at either left corner. Dim spans get lifted
-/// to muted on the fill, same as `render_button`.
+/// bare-background quarter at either left corner. On a focused selection
+/// the rail is `mark` — the row's STATUS DOT color, or the accent for a
+/// row without one (see `selection_mark`). Dim spans get lifted to muted
+/// on the fill, same as `render_button`.
+#[allow(clippy::too_many_arguments)]
 fn render_pill(
+    f: &mut Frame,
+    inner: Rect,
+    top: isize,
+    spans: Vec<Span>,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+    mark: Color,
+) {
+    render_pill_body(f, inner, top, spans, selected, focused, th, mark, 0);
+}
+
+/// [`render_pill`] for a pill with `body` rows of its own between its
+/// text row and its bottom pad — a session's RECENT PROMPTS lines. The
+/// pads wrap the whole: pad, text, body, pad, so a selected row and what
+/// hangs under its name are one rounded slab on one fill rather than a
+/// pill with rows beneath it. The body rows themselves are the caller's
+/// to draw (see `draw_prompt_lines`, which takes the same `pill_bar`).
+#[allow(clippy::too_many_arguments)]
+fn render_pill_body(
     f: &mut Frame,
     inner: Rect,
     top: isize,
@@ -2279,18 +2729,11 @@ fn render_pill(
     selected: bool,
     focused: bool,
     th: Theme,
+    mark: Color,
+    body: usize,
 ) {
-    let Some(text_area) = row_rect_at(inner, top + 1) else {
-        return;
-    };
+    let (fill, rail) = pill_bar(focused, mark, th);
     if selected {
-        for s in &mut spans {
-            if s.style.fg == Some(th.dim) {
-                s.style.fg = Some(th.muted);
-            }
-        }
-        let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
-        let rail = if focused { th.accent } else { th.dim };
         let mut pad = |glyph: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
@@ -2310,12 +2753,18 @@ fn render_pill(
             }
         };
         pad(PILL_HALF.0, top);
-        pad(PILL_HALF.1, top + 2);
+        pad(PILL_HALF.1, top + 2 + body as isize);
     }
-    let marker = if selected && focused {
-        Span::styled(PILL_RAIL, Style::default().fg(th.accent))
-    } else if selected {
-        Span::styled(PILL_RAIL, Style::default().fg(th.dim))
+    let Some(text_area) = row_rect_at(inner, top + 1) else {
+        return;
+    };
+    let marker = if selected {
+        for s in &mut spans {
+            if s.style.fg == Some(th.dim) {
+                s.style.fg = Some(th.muted);
+            }
+        }
+        Span::styled(PILL_RAIL, Style::default().fg(rail))
     } else {
         Span::raw(" ")
     };
@@ -2431,7 +2880,10 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let (phase, anim) = (app.sweep_phase(), app.animations);
-    let tabs: Vec<(Vec<Span<'static>>, u16)> = rows
+    // Each tab: its spans, their width, and the rollup dot's color — the
+    // TAB UNDERLINE takes it, so the open tab's underline says what the
+    // dot says.
+    let tabs: Vec<(Vec<Span<'static>>, u16, Color)> = rows
         .iter()
         .enumerate()
         .map(|(i, (name, roll, done))| {
@@ -2471,7 +2923,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .map(|s| s.content.chars().count())
                 .sum::<usize>() as u16;
-            (spans, w)
+            (spans, w, status_color(*roll, *done > 0, th))
         })
         .collect();
 
@@ -2482,7 +2934,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let right = (area.x + area.width).saturating_sub(1);
     let budget = right.saturating_sub(tabs_x);
     let active_i = active.unwrap_or(0);
-    let stride = |t: &(Vec<Span<'static>>, u16)| t.1 + TAB_SEP;
+    let stride = |t: &(Vec<Span<'static>>, u16, Color)| t.1 + TAB_SEP;
     let mut start = 0usize;
     while start < active_i && tabs[start..=active_i].iter().map(stride).sum::<u16>() > budget {
         start += 1;
@@ -2490,7 +2942,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut x = tabs_x;
     let mut drawn = start;
-    for (i, (spans, w)) in tabs.iter().enumerate().skip(start) {
+    for (i, (spans, w, mark)) in tabs.iter().enumerate().skip(start) {
         if x + w > right {
             break;
         }
@@ -2524,11 +2976,19 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         );
         if selected {
             // The bottom border stays under the open tab — it just turns
-            // into that tab's underline: heavy and accent-colored, so the
-            // tab-to-content join reads as a join rather than a hole.
+            // into that tab's underline, so the tab-to-content join reads
+            // as a join rather than a hole. It is a half block, not a
+            // heavy rule: a line glyph draws at the cell's midline, which
+            // leaves a strip of unpainted background between the tab's
+            // fill and the underline and reads as a gap. `▀` paints from
+            // the cell's top edge, flush against the block above it. Its
+            // color is the tab's rollup STATUS DOT — yellow while anything
+            // under the workspace runs, violet while a finish is UNSEEN —
+            // not the theme accent.
+            let underline = selection_mark(*mark, th);
             for cx in x..x + w {
                 if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
-                    cell.set_symbol("━").set_fg(th.accent);
+                    cell.set_symbol("▀").set_fg(underline);
                 }
             }
         }
@@ -2571,12 +3031,18 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Per-row display data of the Projects panel, pre-collected to end the
-/// tree borrow: name, rollup, unwatched-finish count.
-type ProjectRowData = (String, Option<AgentStatus>, usize);
+/// tree borrow: name, the folder name to show under it (Some only once the
+/// row has been renamed away from it), rollup, unwatched-finish count,
+/// last-turn stamp.
+type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
-/// unwatched-finish count.
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize);
+/// unwatched-finish count, last-turn stamp.
+/// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
+/// count, recency stamp, whether it is a QUICK PROMPT stand-in the
+/// DAEMON has not cut yet, and whether it wears its merged pull request
+/// (`App::worktree_wears_merge`).
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool, bool);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -2590,7 +3056,19 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Projects;
     let count = Some(app.tree.visible_project_count()).filter(|n| *n > 0);
-    let inner = draw_column(f, area, "PROJECTS", count, focused, th);
+    // With the Workspaces bar hidden nothing else on screen names the open
+    // workspace, so this header takes the job — the column only ever lists
+    // that workspace's projects anyway. Upper-cased to stay in the header
+    // voice the other columns speak in, and trimmed to what's left of the
+    // row once the gutter, the ` · n` count and the column rule are paid for.
+    let title = if app.show_workspaces {
+        "PROJECTS".to_string()
+    } else {
+        let room = (area.width as usize)
+            .saturating_sub(ROW_GUTTER.len() + 1 + count.map_or(0, |n| 3 + n.to_string().len()));
+        truncate(&app.tree.active_workspace_name().to_uppercase(), room)
+    };
+    let inner = draw_column(f, area, &title, count, focused, th);
 
     if !app.tree.has_visible_projects() {
         f.render_widget(
@@ -2599,10 +3077,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{ROW_GUTTER}no projects yet"),
                     Style::default().fg(th.dim),
                 )),
-                Line::from(vec![
-                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                    Span::styled(" adds one", Style::default().fg(th.dim)),
-                ]),
+                hint_line(&[("n", " adds one")], th),
             ]),
             inner,
         );
@@ -2617,41 +3092,79 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             let p = &app.tree.projects[i];
             (
                 p.name.clone(),
+                p.folder_subtitle(),
                 app.project_rollup(&p.id),
                 app.project_unseen(&p.id),
+                app.project_recency(&p.id).stamped,
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, roll, unseen)) in rows.iter().enumerate() {
-        let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
+    for (row_idx, (text, folder, roll, unseen, stamped)) in rows.iter().enumerate() {
+        // A renamed row grows by the one line its folder name takes, so the
+        // pads above and below stay a row each either way.
+        let height = PROJECT_BTN_H + folder.is_some() as u16;
+        let Some(row_area) = rows_rect(inner, screen_row, height) else {
             break;
         };
         // Same badge as worktree rows: sessions that finished unwatched
         // anywhere under the project.
         let (badges, badge_len) = row_badges(*unseen, th);
+        // How long since anything under the project last did something,
+        // dim after the name. The column is sorted on this stamp, so the
+        // label is what makes the order legible.
+        let free = (inner.width as usize).saturating_sub(3 + badge_len);
+        let (ago, name_max) = fit_ago(ago_badge(*stamped), free);
         // Bold name: the top of the tree reads "biggest".
         let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
         spans.extend(status_name_spans(
-            truncate(text, (inner.width as usize).saturating_sub(3 + badge_len)),
+            truncate(text, name_max),
             Style::default().add_modifier(Modifier::BOLD),
             sweep_ramp(*roll, th, app.animations),
             app.sweep_phase(),
         ));
+        if !ago.is_empty() {
+            spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+        }
         for (text, style) in badges {
             spans.push(Span::styled(text, style));
+        }
+        // Renaming a project is a label change, never a move on disk, so the
+        // folder keeps its name on the row underneath — as a child of the
+        // label, not a second label. A terminal cell has exactly one font
+        // size (Kitty's OSC 66 can render half-size text, but neither
+        // WezTerm nor Ghostty implements it), so "smaller" is spelled with
+        // the three signals that do work everywhere: the name above is
+        // BOLD at full strength, this line is the dimmest color the theme
+        // has *plus* DIM (SGR 2, faint, which blends fg toward bg), and a
+        // `└ ` hangs it off the name — the same tree glyph the metrics
+        // modal uses. The glyph lands under the name's first letter, so
+        // the folder text itself sits two columns further in.
+        let mut text = vec![spans];
+        if let Some(folder) = folder {
+            text.push(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "└ {}",
+                        truncate(folder, (inner.width as usize).saturating_sub(5))
+                    ),
+                    Style::default().fg(th.dim).add_modifier(Modifier::DIM),
+                ),
+            ]);
         }
         render_button(
             f,
             row_area,
-            spans,
+            text,
             row_idx == app.sel_project,
             focused,
             th,
             PROJECT_BTN_H / 2,
+            status_color(*roll, *unseen > 0, th),
         );
         app.hits.push((row_area, HitTarget::Project(row_idx)));
-        screen_row += PROJECT_BTN_H as usize;
+        screen_row += height as usize;
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
 }
@@ -2660,7 +3173,9 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 /// rows share a single virtual-row layout, computed unbounded by the panel
 /// height, so a project with a long open-PR list scrolls as one column.
 enum WorktreeEntry {
-    Header(String),
+    /// The OPEN PRS group header — the panel's one group header, in
+    /// whichever form the fold is in. A click target.
+    PrHeader(String),
     /// Index into `visible_worktree_rows()`.
     Row(usize),
 }
@@ -2695,17 +3210,20 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 w.is_main,
                 app.worktree_rollup(&w.id),
                 app.worktree_unseen(&w.id),
+                app.worktree_recency(&w.id).stamped,
+                app.is_placeholder_worktree(&w.id),
+                app.worktree_wears_merge(&w.id),
             )
         })
         .collect();
     let prs = app.visible_open_prs().to_vec();
-    if worktrees.is_empty() && prs.is_empty() {
+    // The header counts the whole list even while the group is folded and
+    // `prs` — the rows actually on screen — is empty.
+    let pr_total = app.all_open_prs().len();
+    if worktrees.is_empty() && pr_total == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                    Span::styled(" starts a worktree", Style::default().fg(th.dim)),
-                ])),
+                Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
                 inner,
             );
         }
@@ -2713,10 +3231,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Group headers only appear once something is pinned; otherwise the
-    // list stays flat (same idiom as the sessions panel).
-    let (pinned_count, _) = app.worktree_group_counts();
-    let grouped = pinned_count > 0;
     let dim = Style::default().fg(th.dim);
 
     // ---- lay the column out in virtual rows ----
@@ -2728,39 +3242,36 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if *vrow > 0 {
             *vrow += 1;
         }
-        let e = WorktreeEntry::Header(text);
+        let e = WorktreeEntry::PrHeader(text);
         let h = e.height();
         layout.push((*vrow, e));
         *vrow += h;
     };
-    if grouped {
-        header(&mut layout, &mut vrow, "PINNED".into());
-    }
     for i in 0..worktrees.len() {
-        if grouped && i == pinned_count {
-            header(&mut layout, &mut vrow, "UNPINNED".into());
-        }
         layout.push((vrow, WorktreeEntry::Row(i)));
         vrow += PILL_H as usize;
         // An extra quiet row separates the main checkout from the true
-        // worktrees below; group headers take over once something is
-        // pinned.
-        if !grouped && worktrees[i].1 && worktrees.len() > 1 {
+        // worktrees below.
+        if worktrees[i].1 && worktrees.len() > 1 {
             vrow += 1;
         }
     }
-    if !prs.is_empty() {
+    if pr_total > 0 {
         // A list cut off at the fetch cap says so rather than passing
         // itself off as the whole set.
-        let more = if prs.len() >= crate::pull_request::LIST_LIMIT {
+        let more = if pr_total >= crate::pull_request::LIST_LIMIT {
             "+"
         } else {
             ""
         };
+        // The disclosure triangle is the state: ▾ over the rows, ▸ when a
+        // click (or ↓ off the last checkout) would open them. Folded, the
+        // header is the whole group and its count says what it hides.
+        let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
         header(
             &mut layout,
             &mut vrow,
-            format!("OPEN PRS · {}{more}", prs.len()),
+            format!("{fold} OPEN PRS · {pr_total}{more}"),
         );
         for i in 0..prs.len() {
             layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
@@ -2786,7 +3297,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
             let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
-                Some((h, WorktreeEntry::Header(_))) => *h,
+                Some((h, WorktreeEntry::PrHeader(_))) => *h,
                 _ => *top,
             };
             let bottom = top + entry.height();
@@ -2804,53 +3315,99 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ---- draw ----
     // The main checkout renders as `branch ⌂ root` (dim badge — the branch
-    // is live, the badge marks root-ness).
+    // is live, the badge marks root-ness). When the ago label leaves no
+    // room for the word, the glyph alone still marks the row: at the
+    // default column width `main ⌂ 23m ago` is what fits.
     const ROOT_BADGE: &str = " ⌂ root";
-    for (top, entry) in &layout {
+    const ROOT_GLYPH: &str = " ⌂";
+    for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
             break;
         }
+        let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
         match entry {
-            WorktreeEntry::Header(text) => {
+            WorktreeEntry::PrHeader(text) => {
+                // Both forms are click targets: a click folds or unfolds
+                // the group, like the ARCHIVED header in Sessions.
                 if let Some(r) = row_rect_at(inner, y) {
                     f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
+                    app.hits.push((r, HitTarget::OpenPrsHeader));
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped, pending, merged) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
-                let ramp = sweep_ramp(*roll, th, app.animations);
+                // A stand-in checkout (QUICK PROMPT, git still cutting
+                // it) reads as not-there-yet: hollow dot, no sweep, and
+                // the word where the ago label would sit. A checkout
+                // whose pull request has merged wears that instead of
+                // its sessions' status (`RowState`).
+                let state = match (*pending, *merged) {
+                    (true, _) => RowState::Sessions(None),
+                    (false, true) => RowState::Merged,
+                    (false, false) => RowState::Sessions(*roll),
+                };
+                let ramp = state.ramp(th, app.animations);
                 // 3, not 2: the dot's two cells plus the pill marker
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
                 let free = (inner.width as usize).saturating_sub(3 + badge_len);
-                // The root badge then yields to a branch it would push into
-                // an ellipsis: in a narrow column `main 1 done` beats
-                // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
-                // thing on the row, the branch is the row's identity.
-                let root = *is_main
-                    && branch.chars().count() <= free.saturating_sub(ROOT_BADGE.chars().count());
-                let max = if root {
-                    free - ROOT_BADGE.chars().count()
+                // How long since a session in this checkout last did
+                // something — the stamp the group is sorted on, so the
+                // label is what makes the order legible. It yields to the
+                // branch name first (same rule as the session rows)...
+                let ago = if *pending {
+                    PENDING_WORKTREE_BADGE.to_string()
                 } else {
-                    free
+                    ago_badge(*stamped)
                 };
-                let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
+                let (ago, free) = fit_ago(ago, free);
+                // ...and the root badge then yields to a branch it would push
+                // into an ellipsis: in a narrow column `main 1 done` beats
+                // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
+                // thing on the row, the branch is the row's identity. It
+                // shrinks to the bare glyph before it goes.
+                let fits = |badge: &str| {
+                    branch.chars().count() <= free.saturating_sub(badge.chars().count())
+                };
+                let root = if !*is_main {
+                    None
+                } else if fits(ROOT_BADGE) {
+                    Some(ROOT_BADGE)
+                } else if fits(ROOT_GLYPH) {
+                    Some(ROOT_GLYPH)
+                } else {
+                    None
+                };
+                let max = free - root.map_or(0, |r| r.chars().count());
+                let mut spans = vec![state.dot(*unseen > 0, th)];
                 spans.extend(status_name_spans(
                     truncate(branch, max),
                     Style::default(),
                     ramp,
                     app.sweep_phase(),
                 ));
-                if root {
-                    spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
+                if let Some(root) = root {
+                    spans.push(Span::styled(root, Style::default().fg(th.dim)));
+                }
+                if !ago.is_empty() {
+                    spans.push(Span::styled(ago, Style::default().fg(th.dim)));
                 }
                 for (text, style) in badges {
                     spans.push(Span::styled(text, style));
                 }
-                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
-                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                render_pill(
+                    f,
+                    inner,
+                    y,
+                    spans,
+                    *i == app.sel_worktree,
+                    focused,
+                    th,
+                    state.color(*unseen > 0, th),
+                );
+                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
             }
@@ -2859,24 +3416,27 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // the arrow says "leaves nebula". The group header already
                 // says these are open, so only a draft earns a badge; in a
                 // column this narrow the width is better spent on the title.
+                // A draft is also dimmed end to end (`pr_row::look`) and
+                // sits below every finished pull request, so it reads as
+                // "not ready" from across the room.
                 let pr = &prs[*i - worktrees.len()];
-                let badge = pr.is_draft.then(|| format!(" {}", pr.badge()));
-                let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
-                let label_max = (inner.width as usize)
-                    .saturating_sub(3)
-                    .saturating_sub(badge_len);
-                let mut spans = vec![
-                    Span::styled("↗ ", Style::default().fg(th.accent)),
-                    Span::styled(
-                        truncate(&pr.label(), label_max),
-                        Style::default().fg(th.muted),
-                    ),
-                ];
-                if let Some(badge) = badge {
-                    spans.push(Span::styled(badge, Style::default().fg(th.dim)));
-                }
-                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
-                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                let look = crate::pr_row::look(pr.standing(), th);
+                let badge = pr
+                    .is_draft
+                    .then(|| (format!(" {}", pr.badge()), look.badge));
+                let spans = crate::pr_row::spans(look, &pr.label(), inner.width as usize, badge);
+                // No STATUS DOT on a pull request, so the rail is the look's.
+                render_pill(
+                    f,
+                    inner,
+                    y,
+                    spans,
+                    *i == app.sel_worktree,
+                    focused,
+                    th,
+                    look.rail,
+                );
+                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
             }
@@ -2894,18 +3454,95 @@ enum SessionEntry {
     Header(String),
     /// The ARCHIVED group header, in whichever form the toggle is in.
     ArchivedHeader(String),
-    /// Index into `visible_session_rows()`.
-    Row(usize),
+    /// Index into `visible_session_rows()`, plus how many RECENT PROMPTS
+    /// lines hang under its pill (see [`session_prompt_lines`]).
+    Row {
+        index: usize,
+        prompts: usize,
+    },
 }
 
 impl SessionEntry {
     /// Rows the entry occupies: a header one, a pill its 3-row cell (they
-    /// stack on a `PILL_H` stride, so neighboring pads overlap).
+    /// stack on a `PILL_H` stride, so neighboring pads overlap) plus any
+    /// prompt lines inside it.
     fn height(&self) -> usize {
         match self {
-            SessionEntry::Row(_) => PILL_H as usize + 1,
+            SessionEntry::Row { prompts, .. } => PILL_H as usize + 1 + prompts,
             _ => 1,
         }
+    }
+}
+
+/// How many RECENT PROMPTS lines a row carries under its pill: the
+/// `recent_prompts` setting, capped at what the session has. None for a
+/// terminal or a link (they take no prompts), an archived session (its
+/// history is over, and the group is for scanning names) or a QUICK
+/// PROMPT stand-in (its row has not been created yet).
+fn session_prompt_lines(app: &App, row: &SessionRow) -> usize {
+    match row {
+        SessionRow::Agent(a) if !a.archived && !app.is_placeholder_agent(&a.id) => {
+            app.recent_prompts.min(a.recent_prompts.len())
+        }
+        _ => 0,
+    }
+}
+
+/// What a prompt line opens with, after the pill's rail column: a column
+/// to land under the name (past the status dot), and a bullet so the
+/// lines read as a list hanging off the row rather than as more rows.
+const PROMPT_INDENT: &str = " · ";
+
+/// The RECENT PROMPTS under a session's name, from `first_row`: the
+/// newest `count` of `prompts`, oldest first so the bottom line is the
+/// latest thing asked, each clipped to fit with its ago label pinned
+/// right. Dim, with the newest lifted to muted so the eye lands on it —
+/// these are context for the row, not rows of their own.
+///
+/// On the selected row `bar` is the pill's `(fill, rail)` from
+/// `pill_bar`: the lines sit on that fill and carry the rail down their
+/// first column, so the pill and its history are one slab and the list
+/// reads as part of the session the cursor is on. Dim lifts to muted on
+/// the fill there, the way the pill's own dim spans do.
+fn draw_prompt_lines(
+    f: &mut Frame,
+    inner: Rect,
+    first_row: isize,
+    prompts: &[nebula_core::PromptEntry],
+    count: usize,
+    bar: Option<(Color, Color)>,
+    th: Theme,
+) {
+    let skip = prompts.len().saturating_sub(count);
+    let free = (inner.width as usize).saturating_sub(1 + PROMPT_INDENT.chars().count());
+    let lift = |color: Color| match bar {
+        Some(_) if color == th.dim => th.muted,
+        _ => color,
+    };
+    let base = bar.map_or_else(Style::default, |(fill, _)| Style::default().bg(fill));
+    let marker = match bar {
+        Some((_, rail)) => Span::styled(PILL_RAIL, Style::default().fg(rail)),
+        None => Span::raw(" "),
+    };
+    for (i, entry) in prompts.iter().skip(skip).enumerate() {
+        let Some(area) = row_rect_at(inner, first_row + i as isize) else {
+            continue;
+        };
+        let newest = skip + i + 1 == prompts.len();
+        let text_color = lift(if newest { th.muted } else { th.dim });
+        let (ago, text_max) = fit_ago(ago_badge(entry.submitted_at), free);
+        let text = truncate(&entry.text, text_max);
+        let mut spans = vec![
+            marker.clone(),
+            Span::styled(PROMPT_INDENT, Style::default().fg(lift(th.dim))),
+            Span::styled(text.clone(), Style::default().fg(text_color)),
+        ];
+        if !ago.is_empty() {
+            let gap = text_max.saturating_sub(text.chars().count());
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(ago, Style::default().fg(lift(th.dim))));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
     }
 }
 
@@ -2925,17 +3562,11 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.visible_session_rows();
     if rows.is_empty() && app.selected_worktree().is_some() {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                Span::styled(" agent · ", Style::default().fg(th.dim)),
-                Span::styled("t", Style::default().fg(th.accent)),
-                Span::styled(" terminal", Style::default().fg(th.dim)),
-            ])),
+            Paragraph::new(hint_line(&[("n", " agent · "), ("t", " terminal")], th)),
             inner,
         );
     }
-    let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
-    let active_count = pinned_count + recent_count + unpinned_count;
+    let (active_count, archived_count) = app.session_group_counts();
     let terminal_count = rows
         .iter()
         .filter(|r| matches!(r, SessionRow::Terminal(_)))
@@ -2958,44 +3589,23 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let push_rows =
         |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, start: usize, len: usize| {
-            for i in start..(start + len).min(rows.len()) {
-                layout.push((*vrow, SessionEntry::Row(i)));
+            let end = (start + len).min(rows.len());
+            for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+                let prompts = session_prompt_lines(app, row);
+                layout.push((*vrow, SessionEntry::Row { index: i, prompts }));
+                // Pills stack on a `PILL_H` stride, sharing their pads;
+                // one with prompt lines inside it grows by them and keeps
+                // its bottom pad, so the next pill starts below that.
                 *vrow += PILL_H as usize;
+                if prompts > 0 {
+                    *vrow += 1 + prompts;
+                }
             }
         };
 
-    // Group headers only appear once something is pinned or recent;
-    // otherwise the list stays flat with no group header.
-    let grouped = pinned_count > 0 || recent_count > 0;
-    if pinned_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("PINNED".into()),
-        );
-        push_rows(&mut layout, &mut vrow, 0, pinned_count);
-    }
-    if recent_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("RECENT".into()),
-        );
-        push_rows(&mut layout, &mut vrow, pinned_count, recent_count);
-    }
-    if grouped && unpinned_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("UNPINNED".into()),
-        );
-    }
-    push_rows(
-        &mut layout,
-        &mut vrow,
-        pinned_count + recent_count,
-        unpinned_count,
-    );
+    // The live agents are one flat list with no header of its own — the
+    // headers below name what *isn't* an agent.
+    push_rows(&mut layout, &mut vrow, 0, active_count);
     if terminal_count > 0 {
         header(
             &mut layout,
@@ -3005,7 +3615,14 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         push_rows(&mut layout, &mut vrow, active_count, terminal_count);
     }
     if link_count > 0 {
-        header(&mut layout, &mut vrow, SessionEntry::Header("LINKS".into()));
+        // Not "OPEN PRS": the branch's pull request stays on its row after
+        // it is merged or closed (`pull_request::PullRequest`), so the
+        // header names the thing, not a state it may have left.
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("PULL REQUESTS".into()),
+        );
         push_rows(
             &mut layout,
             &mut vrow,
@@ -3015,9 +3632,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if archived_count > 0 {
         let text = if app.show_archived {
-            format!(" ARCHIVED · {archived_count} (A hides)")
+            format!(" ARCHIVED · {archived_count}")
         } else {
-            format!(" … {archived_count} archived (A shows)")
+            format!(" … {archived_count} archived")
         };
         header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
         if app.show_archived {
@@ -3039,10 +3656,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let anchor = (app.sel_worktree, app.sel_session);
     if app.sessions_anchor != Some(anchor) {
         app.sessions_anchor = Some(anchor);
-        if let Some(pos) = layout
-            .iter()
-            .position(|(_, e)| matches!(e, SessionEntry::Row(i) if *i == app.sel_session))
-        {
+        if let Some(pos) = layout.iter().position(
+            |(_, e)| matches!(e, SessionEntry::Row { index, .. } if *index == app.sel_session),
+        ) {
             let (top, entry) = &layout[pos];
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
@@ -3064,11 +3680,12 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let scroll = app.sessions_scroll as isize;
 
     // ---- draw ----
-    for (top, entry) in &layout {
+    for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
             break;
         }
+        let next_top = layout.get(pos + 1).map(|(t, _)| *t);
         match entry {
             SessionEntry::Header(text) => {
                 if let Some(r) = row_rect_at(inner, y) {
@@ -3083,7 +3700,20 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     app.hits.push((r, HitTarget::ArchivedHeader));
                 }
             }
-            SessionEntry::Row(i) => draw_session_row(f, app, inner, y, *i, &rows[*i], focused),
+            SessionEntry::Row { index, prompts } => {
+                let hit_h = row_hit_height(*top, next_top, *prompts);
+                draw_session_row(
+                    f,
+                    app,
+                    inner,
+                    y,
+                    hit_h,
+                    *index,
+                    *prompts,
+                    &rows[*index],
+                    focused,
+                )
+            }
         }
     }
 
@@ -3091,21 +3721,34 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
 }
 
+/// `hit_h` is the row's click target height (see [`row_hit_height`]);
+/// `prompts` how many RECENT PROMPTS lines to hang under the pill.
+#[allow(clippy::too_many_arguments)]
 fn draw_session_row(
     f: &mut Frame,
     app: &mut App,
     inner: Rect,
     top: isize,
+    hit_h: u16,
     index: usize,
+    prompts: usize,
     row: &SessionRow,
     focused: bool,
 ) {
     let th = app.theme;
     let width = inner.width;
-    let spans = match row {
+    // Each arm yields its spans and the rail color: the STATUS DOT's on an
+    // agent row, the accent on the rows that have no dot.
+    let (spans, mark) = match row {
         SessionRow::Agent(a) => {
+            // A stand-in session (QUICK PROMPT, its create still in
+            // flight) reads as not-there-yet: hollow dot, no sweep, and
+            // the word in the badge slot the harness would take.
+            let pending = app.is_placeholder_agent(&a.id);
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
+            } else if pending {
+                status_dot(None, false, th)
             } else {
                 status_dot(Some(a.status), a.unseen && !a.archived, th)
             };
@@ -3124,8 +3767,19 @@ fn draw_session_row(
             // goes loud (as a link row's unread count does): these rows
             // are what the parent rows' counts are counting, so each one
             // says so until the cursor lands on it.
-            let (badge, badge_style) = if a.unseen && !a.archived {
+            let (badge, badge_style) = if pending {
+                (
+                    PENDING_SESSION_BADGE.to_string(),
+                    Style::default().fg(th.dim),
+                )
+            } else if a.unseen && !a.archived {
                 (" done".to_string(), Style::default().fg(th.done))
+            } else if a.cloud_mirroring && !a.archived {
+                // Following the cloud session: the pane is re-pulled on a
+                // timer, so what it shows is the cloud agent's own work.
+                // Worth saying loudly — otherwise a pane that changes on
+                // its own looks like a glitch.
+                (" cloud ↻".to_string(), Style::default().fg(th.accent))
             } else if a.cloud_session_id.is_some() {
                 // A Claude Cloud row: the harness that matters is the cloud
                 // sandbox, and the badge is how the user tells this row
@@ -3137,18 +3791,20 @@ fn draw_session_row(
             // How long since this session last did anything, sat between
             // the name and the harness. The list is sorted on this stamp,
             // so the label is what makes the order legible.
-            let ago = ago_badge(a.status_changed_at);
+            // A stand-in carries the DAEMON's create stamp so it sorts
+            // where the real row will, but "just now" beside "starting"
+            // would say it has done something.
+            let ago = if pending {
+                String::new()
+            } else {
+                ago_badge(a.status_changed_at)
+            };
             // 3 = the pill's selection marker plus the status dot, both of
             // which render ahead of the name.
             let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
-            // A narrow panel spends its columns on the name: the ago label
-            // drops out entirely rather than squeezing the title to nothing.
-            let (ago, name_max) = match free.checked_sub(ago.chars().count()) {
-                Some(rest) if rest >= MIN_SESSION_NAME_W => (ago, rest),
-                _ => (String::new(), free),
-            };
+            let (ago, name_max) = fit_ago(ago, free);
             // Archived rows stay quiet even if their last status was live.
-            let ramp = if a.archived {
+            let ramp = if a.archived || pending {
                 None
             } else {
                 sweep_ramp(Some(a.status), th, app.animations)
@@ -3164,73 +3820,88 @@ fn draw_session_row(
                 spans.push(Span::styled(ago, Style::default().fg(th.dim)));
             }
             spans.push(Span::styled(badge, badge_style));
-            spans
+            let mark = if a.archived || pending {
+                th.dim
+            } else {
+                status_color(Some(a.status), a.unseen, th)
+            };
+            (spans, mark)
         }
         SessionRow::Terminal(t) => {
             // Shell prompt glyph instead of a status dot; dim once the
             // shell has exited (re-attach respawns it).
             let glyph_color = if t.alive { th.ok } else { th.dim };
-            vec![
+            let spans = vec![
                 Span::styled("❯ ", Style::default().fg(glyph_color)),
                 Span::styled(
                     truncate(&t.name, width.saturating_sub(3) as usize),
                     Style::default().fg(th.muted),
                 ),
-            ]
+            ];
+            (spans, th.accent)
         }
         SessionRow::Link(l) => {
             // Same shape as an agent row — glyph, name, trailing badge — so
             // the column reads as one list. The arrow says "leaves nebula";
-            // a pull request earns the accent, everything else is as quiet
-            // as a terminal row.
+            // an open pull request earns the accent (a draft the dim, end
+            // to end, like its row in the PROJECT OPEN PRS GROUP; a merged
+            // or closed one the PR PREVIEW's state color), and a bare saved
+            // link is as quiet as a terminal row.
             //
-            // The badge slot is normally the dim state word, but comments
-            // that landed since the row was last opened take it over and go
-            // loud: an unread count is the one thing here worth walking
-            // over to look at, and the state is already in the glyph.
+            // The badge slot is normally the state word in the look's badge
+            // color, but comments that landed since the row was last opened
+            // take it over and go loud: an unread count is the one thing
+            // here worth walking over to look at, and the state is already
+            // in the glyph.
             let pr = l.pull_request();
             let unseen = l.unseen_comments(&app.pr_seen);
+            let look = match pr {
+                Some(pr) => crate::pr_row::look(pr.standing(), th),
+                None => crate::pr_row::Look {
+                    glyph: th.muted,
+                    label: th.muted,
+                    rail: th.accent,
+                    badge: th.dim,
+                },
+            };
             let badge = match pr {
                 Some(_) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
-                Some(pr) => Some((format!(" {}", pr.badge()), th.dim)),
+                Some(pr) => Some((format!(" {}", pr.badge()), look.badge)),
                 None => None,
             };
-            let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
-            let glyph_color = match pr {
-                Some(pr) if pr.is_open() => th.accent,
-                Some(_) => th.dim,
-                None => th.muted,
-            };
-            let label_max = (width.saturating_sub(3) as usize).saturating_sub(badge_len);
-            let mut spans = vec![
-                Span::styled("↗ ", Style::default().fg(glyph_color)),
-                Span::styled(
-                    truncate(&l.label(), label_max),
-                    Style::default().fg(th.muted),
-                ),
-            ];
-            if let Some((badge, color)) = badge {
-                spans.push(Span::styled(badge, Style::default().fg(color)));
-            }
-            spans
+            let spans = crate::pr_row::spans(look, &l.label(), width as usize, badge);
+            (spans, look.rail)
         }
     };
-    render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
-    if let Some(hit) = rows_rect_at(inner, top, PILL_H) {
+    let selected = index == app.sel_session;
+    render_pill_body(f, inner, top, spans, selected, focused, th, mark, prompts);
+    if prompts > 0 {
+        if let SessionRow::Agent(a) = row {
+            // Inside the pill, straight under the name: its bottom pad
+            // closes under the last line, so a selected row's history
+            // sits on the row's own fill and reads as part of the session
+            // the cursor is on, not as rows of its own beneath it.
+            let bar = selected.then(|| pill_bar(focused, mark, th));
+            let first_row = top + PILL_H as isize;
+            draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, bar, th);
+        }
+    }
+    if let Some(hit) = rows_rect_at(inner, top, hit_h) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
 }
 
 /// The pull-request reading pane. Replaces the session view while the
-/// Worktrees cursor rests on an open-PR row: headline, description, then
-/// the conversation, scrolled by `pr_preview_scroll`.
+/// Worktrees cursor rests on an open-PR row, or the focused Sessions cursor
+/// on the PR ROW (`App::previewed_pr`): headline, description, then the
+/// conversation, scrolled by `pr_preview_scroll`.
 ///
 /// The line count is written back to `app.pr_preview_lines` so the scroll
 /// handlers know how far down they may go — the pane is the only thing that
 /// knows how wide the prose wrapped.
 fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let th = app.theme;
-    let Some(pr) = app.selected_worktree_pr().cloned() else {
+    let Some(pr) = app.previewed_pr() else {
         return;
     };
     let detail = app.pr_detail.get(&pr.url).cloned();
@@ -3275,7 +3946,7 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         let row = |text: &str, style: Style| Line::from(Span::styled(format!(" {text}"), style));
         let mut lines = vec![Line::from("")];
         lines.extend(
-            crate::pr_preview::wrap(&pr.label(), w)
+            crate::pr_preview::wrap(&pr.label, w)
                 .iter()
                 .map(|t| row(t, Style::default().fg(th.muted))),
         );
@@ -3815,10 +4486,12 @@ fn task_field_value(task: &Task, field: TaskField, th: Theme, width: usize) -> (
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
-    // The Worktrees cursor is resting on an open pull request: the pane
-    // reads it. The attachment underneath stays live — walking down into
-    // the OPEN PRS group and back must not churn detach/attach.
-    if app.selected_worktree_pr().is_some() {
+    // A cursor is resting on an open pull request — the Worktrees cursor
+    // on a PROJECT OPEN PRS GROUP row, or the focused Sessions cursor on
+    // the PR ROW: the pane reads it. The attachment underneath stays live —
+    // walking down into either pull-request group and back must not churn
+    // detach/attach.
+    if app.previewed_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
         return;
     }
@@ -3846,6 +4519,15 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             format!("scroll {}", t.scroll),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
         )),
+        // Nothing has come off the PTY yet and nothing will for a while:
+        // the session was reaped while the user was elsewhere and its CLI
+        // is booting. Say so — the blank grid on its own reads as a hang.
+        // (A live session's replay lands within a frame; that blank is
+        // not worth a word that would only flash.)
+        Some(t) if t.booting => Some(Span::styled(
+            "starting…".to_string(),
+            Style::default().fg(th.dim),
+        )),
         Some(_) if app.term_locked => Some(Span::styled(
             "INPUT".to_string(),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -3863,6 +4545,26 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::TerminalPane));
 
     let links = match &app.term {
+        // Booting: the grid is empty because the CLI hasn't painted yet, so
+        // there is nothing to render and nothing to scan for links. A word
+        // in the middle of the pane beats an unexplained void.
+        Some(term) if term.booting && !term.exited => {
+            let msg = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "starting session…",
+                    Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "booting — the screen appears as soon as it paints",
+                    Style::default().fg(th.dim),
+                )),
+            ])
+            .centered();
+            f.render_widget(msg, inner);
+            (Vec::new(), Vec::new())
+        }
         Some(term) => {
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);
@@ -4069,6 +4771,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+u: clear filter  Esc: clear/close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(Overlay::FileTabs(view)) = &app.overlay {
+        Span::styled(
+            file_tabs_keys_hint(view, app.vim.as_ref().is_some_and(|v| v.embedded)),
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Tree(_))) {
         Span::styled(
             "type: filter  ↑/↓: move  ←/→: fold  Enter: open/edit  ⇧↑/↓: scroll  Ctrl+u: clear filter  Esc: clear/close",
@@ -4107,6 +4814,16 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             } else {
                 "↑/↓: select  Enter: connect (restarts nebula over ssh)  a: new  d: remove  Esc: close"
             },
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
+        Span::styled(
+            "↑/↓: select  Enter: launch with a task  a: new  e: edit  d: delete  Esc: close",
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))) {
+        Span::styled(
+            "Tab/↑↓: next field  ←/→: cycle  Shift+Enter/^J: newline  Enter: save  Esc: back to list",
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
@@ -4174,7 +4891,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // The cursor here is the open workspace, so ←/→ already
             // switches; the verbs are the switcher's, plus the way out.
             Focus::Workspaces => format!(
-                "←/→ or 1-9: switch  {}: projects  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
+                "←/→ or 1-9: switch  {}: panels  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::Rename),
@@ -4183,12 +4900,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Projects => format!(
-                "{}/{}: add  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::AddProject),
+                k(Action::Rename),
                 k(Action::Delete),
-                k(Action::MoveProjectDown),
-                k(Action::MoveProjectUp),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
@@ -4196,40 +4912,57 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                "{}: new session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: menu  {}: help",
+                k(Action::New),
                 k(Action::Activate),
                 k(Action::GitDiff),
+                k(Action::RefreshPullRequests),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::NewTerminal),
-                k(Action::Pin),
                 k(Action::Delete),
+                k(Action::RefreshPullRequests),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
-            // A link row answers to a different set of verbs than a
-            // session does, so the hint follows the cursor into the group.
+            // A discovered pull request opens, reads in the pane and shows
+            // its diff; it has no stored row to edit or delete, and the
+            // refresh key re-asks GitHub for it. Previously saved rows
+            // retain the edit and delete verbs.
+            Focus::Sessions
+                if app
+                    .selected_link()
+                    .is_some_and(|row| row.id().is_none()) =>
+            {
+                format!(
+                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: menu  {}: help",
+                    k(Action::Activate),
+                    k(Action::GitDiff),
+                    k(Action::RefreshPullRequests),
+                    k(Action::ContextMenu),
+                    k(Action::Help)
+                )
+            }
             Focus::Sessions if app.selected_link().is_some() => format!(
-                "{}: open in browser  {}: add link  {}: edit URL  {}: delete  {}: menu  {}: help",
+                "{}: open in browser  {}: edit URL  {}: delete  {}: menu  {}: help",
                 k(Action::Activate),
-                k(Action::NewLink),
                 k(Action::Rename),
                 k(Action::Delete),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: terminal  {}: link  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
                 k(Action::Activate),
                 k(Action::New),
+                k(Action::AgentPresets),
                 k(Action::NewTerminal),
-                k(Action::NewLink),
                 k(Action::Rename),
                 k(Action::Archive),
                 k(Action::Delete),
@@ -4237,6 +4970,25 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
         };
+        let mut text = text;
+        if !app.term_locked {
+            let mut restore = Vec::new();
+            let hint = |action, panel: &str| {
+                app.keymap.first(action).map_or_else(
+                    || format!("{}: show {panel} in settings", k(Action::Settings)),
+                    |chord| format!("{}: show {panel}", chord.display()),
+                )
+            };
+            if app.hide_projects {
+                restore.push(hint(Action::ToggleProjects, "projects"));
+            }
+            if app.hide_worktrees {
+                restore.push(hint(Action::ToggleWorktrees, "worktrees"));
+            }
+            if !restore.is_empty() {
+                text = format!("{}  {text}", restore.join("  "));
+            }
+        }
         Span::styled(text, Style::default().fg(th.dim))
     };
     // Quiet footer: context on the left, live stats on the right. The
@@ -4301,17 +5053,27 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     // clipped *flash* loses the end of a sentence, so the nameplate steps
     // aside for one that would not otherwise fit.
     let plate = format!("nebula v{}", env!("CARGO_PKG_VERSION"));
-    let plate_w = plate.chars().count() + "  ·  ".chars().count();
+    // A newer published release rides the nameplate as `⇡ v0.22.0`, in the
+    // heads-up color: the version is already what this span says, so "and
+    // a newer one exists" belongs beside it rather than anywhere else on
+    // the bar. It is part of the plate for the yield below — a flash that
+    // would be clipped drops both.
+    let update = app.update_available.as_ref().map(|v| format!(" ⇡ v{v}"));
+    let plate_w = plate.chars().count()
+        + update.as_ref().map_or(0, |u| u.chars().count())
+        + "  ·  ".chars().count();
     let body_w: usize = spans.iter().map(|s| s.width()).sum();
     if app.flash.is_none() || body_w + plate_w <= left.width as usize {
-        spans.splice(
-            1..1,
-            [
-                Span::styled(plate, Style::default().fg(th.dim)),
-                Span::styled("  ·  ", Style::default().fg(th.dim)),
-            ],
-        );
-        workspace_idx += 2;
+        let mut plate_spans = vec![Span::styled(plate, Style::default().fg(th.dim))];
+        if let Some(update) = update {
+            plate_spans.push(Span::styled(
+                update,
+                Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+            ));
+        }
+        plate_spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+        workspace_idx += plate_spans.len();
+        spans.splice(1..1, plate_spans);
     }
     // Where the workspace nameplate landed: everything ahead of it on the
     // bar is fixed-width chrome, so its cells are a prefix sum. Clipped
@@ -4345,18 +5107,26 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
 /// process subtree). None until the first metrics reply arrives.
 fn footer_usage(app: &App) -> Option<String> {
     let m = app.last_metrics.as_ref()?;
+    // Prewarm-pool spares are agent CLIs but not agents anyone opened;
+    // they get their own count so the agent figure matches the sidebar.
+    let spares = m.sessions.iter().filter(|s| s.prewarm.is_some()).count();
     let agents = m
         .sessions
         .iter()
-        .filter(|s| matches!(s.session, SessionRef::Agent(_)))
+        .filter(|s| matches!(s.session, SessionRef::Agent(_)) && s.prewarm.is_none())
         .count();
-    let terms = m.sessions.len() - agents;
+    let terms = m.sessions.len() - agents - spares;
     let total = m.daemon_rss_bytes
         + app.client_rss_bytes
         + m.sessions.iter().map(|s| s.rss_bytes).sum::<u64>();
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let warm = if spares > 0 {
+        format!(" · {spares} warm")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "{agents} agent{} · {terms} term{} · {}",
+        "{agents} agent{} · {terms} term{}{warm} · {}",
         plural(agents),
         plural(terms),
         fmt_mem(total)
@@ -4461,7 +5231,7 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
 /// always break; soft breaks prefer the last whitespace that fits. The
 /// returned row index is where the caret rendered, so the caller can keep
 /// that row inside its fixed-height viewport.
-fn multiline_input_lines(
+pub(crate) fn multiline_input_lines(
     input: &TextInput,
     width: usize,
     cursor: Color,
@@ -4559,7 +5329,12 @@ fn multiline_input_lines(
 ///
 /// `cursor` colors the caret block; pass `th.dim` to park it (the prompt
 /// does that while a listing row, not the text, holds Enter).
-fn input_spans(input: &TextInput, budget: usize, cursor: Color, th: Theme) -> Vec<Span<'static>> {
+pub(crate) fn input_spans(
+    input: &TextInput,
+    budget: usize,
+    cursor: Color,
+    th: Theme,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = input.chars().collect();
     let caret = input.cursor_chars();
     let budget = budget.max(1);
@@ -4621,7 +5396,7 @@ fn search_line(input: &TextInput, placeholder: &str, area: Rect, th: Theme) -> L
 }
 
 /// The i-th single-height row inside `inner`, or None when it overflows.
-fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
+pub(crate) fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
     rows_rect(inner, i, 1)
 }
 
@@ -4639,6 +5414,27 @@ fn rows_rect_at(inner: Rect, i: isize, height: u16) -> Option<Rect> {
         return None;
     }
     rows_rect(inner, i.max(0) as usize, visible as u16)
+}
+
+/// Rows a pill's click target spans. A pill is a 3-row cell stacked on
+/// a `PILL_H` stride, so its bottom pad is usually the next pill's top
+/// pad; that shared row goes to the lower pill (whose selection fill
+/// owns the cell's bottom half), and the upper one's target stops at
+/// `PILL_H`. A pill with nothing stacked under it — the root checkout
+/// over its quiet row, the last of a group, the last of the list — keeps
+/// its bottom pad, or the lower half of the pill would be a click on the
+/// panel background.
+fn pill_hit_height(top: usize, next_top: Option<usize>) -> u16 {
+    row_hit_height(top, next_top, 0)
+}
+
+/// [`pill_hit_height`] for a pill with `extra` rows of its own between
+/// its text row and its bottom pad — a session's RECENT PROMPTS lines —
+/// which the target runs over too, so a click on a prompt line lands on
+/// its session.
+fn row_hit_height(top: usize, next_top: Option<usize>, extra: usize) -> u16 {
+    let cell = PILL_H as usize + 1 + extra;
+    next_top.map_or(cell, |n| n.saturating_sub(top).min(cell)) as u16
 }
 
 /// A rect `height` rows tall starting at the i-th row inside `inner`:
@@ -4675,7 +5471,11 @@ fn fmt_mem(bytes: u64) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Clip `s` to `max` chars, spending the last one on `…` when it had to
+/// cut. Counts chars, not columns — wide glyphs are the caller's problem.
+/// The one clipper for every row, title and grep hit, so they all cut the
+/// same way.
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -4689,6 +5489,36 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn truncate_clips_to_max_chars_with_an_ellipsis() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exact", 5), "exact");
+        assert_eq!(truncate("toolong", 5), "tool…");
+        assert_eq!(truncate("toolong", 5).chars().count(), 5);
+        assert_eq!(
+            truncate("héllo wörld", 6),
+            "héllo…",
+            "counts chars, not bytes"
+        );
+        // Degenerate budgets: nothing fits but the ellipsis itself.
+        assert_eq!(truncate("ab", 1), "…");
+        assert_eq!(truncate("ab", 0), "…");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn visible_positions_drops_matches_on_the_ellipsis() {
+        let full = "abcdefgh";
+        let positions = [0, 3, 4, 7];
+        // Truncated to 5 chars: "abcd…" — index 4 is the ellipsis, so only
+        // positions before it survive; 7 is off the end entirely.
+        assert_eq!(visible_positions(&positions, "abcd…", full), &[0, 3]);
+        // Untruncated keeps everything, even a match on the last char.
+        assert_eq!(visible_positions(&positions, full, full), &positions);
+        let none: [usize; 0] = [];
+        assert_eq!(visible_positions(&none, "abcd…", full), &none);
+    }
 
     const RAMP: [Color; 3] = [Color::Yellow, Color::Indexed(220), Color::Indexed(230)];
 
@@ -4738,6 +5568,44 @@ mod tests {
         input.handle_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         // Caret at the start: the head is shown, the tail elided.
         assert_eq!(rendered(&input, 8), "[a]bcdefg…");
+    }
+
+    /// Every tier of a task box's hint has to fit between the borders it
+    /// is drawn on, or ratatui clips the end silently — the SETTINGS
+    /// OVERLAY has been bitten by exactly that.
+    #[test]
+    fn task_prompt_hints_fit_the_border_they_sit_on() {
+        use crate::app::PromptKind;
+        let quick = PromptKind::QuickPrompt(crate::quick_prompt::QuickLaunch {
+            target: crate::quick_prompt::QuickTarget::Worktree(nebula_core::WorktreeId::from(
+                "wt".to_string(),
+            )),
+            kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
+            preset: None,
+        });
+        let cloud = PromptKind::CloudMessage {
+            id: nebula_core::AgentId::from("a".to_string()),
+        };
+        for width in 20..=TASK_PROMPT_SIZE.0 {
+            for kind in [&quick, &cloud] {
+                let hint = task_prompt_hint(kind, width);
+                assert!(
+                    hint.chars().count() <= width.saturating_sub(2) as usize,
+                    "{width}: {hint:?}"
+                );
+            }
+        }
+        // The full-width box advertises the two pickers and the toggle.
+        let full = task_prompt_hint(&quick, TASK_PROMPT_SIZE.0);
+        assert!(
+            full.contains("Tab agent")
+                && full.contains("⇧Tab preset")
+                && full.contains("^N worktree"),
+            "{full}"
+        );
+        assert!(!task_prompt_hint(&cloud, TASK_PROMPT_SIZE.0).contains("Tab"));
     }
 
     #[test]
@@ -4809,6 +5677,121 @@ mod tests {
         );
     }
 
+    /// A checkout wearing its merged pull request animates like a running
+    /// one — on the purple ramp — and the animations setting stills it the
+    /// same way. Its dot and rail are the merged purple; a checkout on its
+    /// sessions is exactly what `status_dot` / `status_color` /
+    /// `sweep_ramp` already say.
+    #[test]
+    fn merged_row_state_sweeps_purple_and_obeys_the_setting() {
+        let th = Theme::default();
+        let merged = RowState::Merged;
+        assert_eq!(merged.ramp(th, true), Some(th.merged_sweep));
+        assert_eq!(merged.ramp(th, false), None);
+        assert_eq!(merged.color(false, th), th.merged);
+        assert_eq!(
+            merged.color(true, th),
+            th.merged,
+            "unseen is a sessions thing"
+        );
+        let dot = merged.dot(false, th);
+        assert_eq!(dot.content, "● ", "solid: the checkout is very much there");
+        assert_eq!(dot.style.fg, Some(th.merged));
+
+        let running = RowState::Sessions(Some(AgentStatus::Running));
+        assert_eq!(running.ramp(th, true), Some(th.warn_sweep));
+        assert_eq!(running.color(false, th), th.warn);
+        let done = RowState::Sessions(Some(AgentStatus::Finished));
+        assert_eq!(done.ramp(th, true), None);
+        assert_eq!(done.color(true, th), th.done);
+        assert_eq!(done.color(false, th), th.ok);
+        assert_eq!(RowState::Sessions(None).dot(false, th).content, "○ ");
+    }
+
+    /// The WORKTREES row of a checkout whose pull request has merged is
+    /// purple end to end — dot, selection rail, and the branch name on the
+    /// merged sweep — so the checkout to delete stands out. Animations off,
+    /// the name holds still in plain text and the purple stays. A session
+    /// still running there takes the row back: yellow, as a checkout not
+    /// to pull out from under it.
+    #[test]
+    fn worktree_row_wears_its_merged_pull_request() {
+        use nebula_core::{AgentStatus, WorktreeId};
+        let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        app.pull_requests.insert(
+            WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "Attach links".into(),
+                state: crate::pull_request::STATE_MERGED.into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
+        );
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 12);
+        // The feat row's text line, as (rail color, dot color, name colors).
+        let row = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+            terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // Cell-wise, not by byte offset: the rail and dot glyphs
+            // ahead of the name are multi-byte.
+            let cells = |y: u16| -> Vec<String> {
+                (0..30)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            };
+            let name_at = |y: u16| {
+                cells(y)
+                    .windows(4)
+                    .position(|w| w.concat() == "feat")
+                    .map(|x| x as u16)
+            };
+            let (y, name_x) = (0..12)
+                .find_map(|y| name_at(y).map(|x| (y, x)))
+                .expect("the feat row");
+            let rail = buf.cell((0, y)).unwrap().clone();
+            assert_eq!(rail.symbol(), PILL_RAIL, "the cursor is on the row");
+            let dot = buf.cell((1, y)).unwrap().clone();
+            assert_eq!(dot.symbol(), "●", "solid dot");
+            let name: Vec<Color> = (name_x..name_x + 4)
+                .map(|x| buf.cell((x, y)).unwrap().fg)
+                .collect();
+            (rail.fg, dot.fg, name)
+        };
+
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!(rail, th.merged, "the rail is the merge's purple");
+        assert_eq!(dot, th.merged, "so is the dot");
+        assert!(
+            name.iter().all(|c| th.merged_sweep.contains(c)),
+            "the name rides the merged sweep: {name:?}"
+        );
+
+        app.animations = false;
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged), "still purple");
+        assert_eq!(name, vec![Color::Reset; 4], "the name holds still");
+
+        // A running session in the checkout: not one to delete yet.
+        app.animations = true;
+        app.tree.agents[0].worktree_id = WorktreeId("w1".into());
+        app.tree.agents[0].status = AgentStatus::Running;
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!((rail, dot), (th.warn, th.warn), "running wins");
+        assert!(name.iter().all(|c| th.warn_sweep.contains(c)), "{name:?}");
+
+        // Finished, though, and the merge is the story again.
+        app.tree.agents[0].status = AgentStatus::Finished;
+        let (rail, dot, _) = row(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged));
+    }
+
     /// The tint fills every untouched cell of the panel rect — and only
     /// those: a selection fill keeps its own, and cells outside the rect
     /// stay untinted.
@@ -4848,7 +5831,16 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 3)).unwrap();
         terminal
             .draw(|f| {
-                render_pill(f, inner, 0, vec![Span::raw("● ok")], true, true, th);
+                render_pill(
+                    f,
+                    inner,
+                    0,
+                    vec![Span::raw("● ok")],
+                    true,
+                    true,
+                    th,
+                    th.warn,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -4860,7 +5852,7 @@ mod tests {
             let glyph = glyph.to_string();
             let c = cell(0, y);
             assert_eq!(c.symbol(), glyph, "pad row {y} rail glyph");
-            assert_eq!(c.fg, th.accent, "pad row {y} rail color");
+            assert_eq!(c.fg, th.warn, "pad row {y} rail color");
             // The rail cell covers exactly what the fill cells beside it
             // do; a narrower glyph there is the notch coming back.
             for x in 1..8 {
@@ -4872,16 +5864,93 @@ mod tests {
                 assert_eq!(cell(x, y).fg, th.sel_bg, "pad row {y} fill color at x={x}");
             }
         }
-        // Text row: a solid block, sitting on the fill.
+        // Text row: a solid block, sitting on the fill, in the mark the
+        // caller passed (a RUNNING row's yellow here), not the accent.
         let c = cell(0, 1);
         assert_eq!(c.symbol(), PILL_RAIL);
-        assert_eq!(c.fg, th.accent);
+        assert_eq!(c.fg, th.warn);
         assert_eq!(c.bg, th.sel_bg);
+    }
+
+    /// The selection rail of the focused SESSION row is its STATUS DOT's
+    /// color, not the accent: yellow while it runs, violet while its
+    /// finish is UNSEEN, green once read, and a FRESH row's gray lifted
+    /// to muted so it still reads as the cursor on the fill.
+    #[test]
+    fn session_rail_takes_the_status_dot_color() {
+        use nebula_core::AgentStatus;
+        let mut app = hit_test_app(&["main"], &["agent"], &[]);
+        app.focus = Focus::Sessions;
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 12);
+        let rail = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // The agent's pill sits at rows 3..=5: pad, text, pad.
+            let text = buf.cell((0, 4)).unwrap().clone();
+            assert_eq!(text.symbol(), PILL_RAIL);
+            let pads = [buf.cell((0, 3)).unwrap().fg, buf.cell((0, 5)).unwrap().fg];
+            assert_eq!(pads, [text.fg, text.fg], "the pad caps match the rail");
+            text.fg
+        };
+        for (status, unseen, want) in [
+            (AgentStatus::Fresh, false, th.muted),
+            (AgentStatus::Running, false, th.warn),
+            (AgentStatus::Finished, true, th.done),
+            (AgentStatus::Finished, false, th.ok),
+            (AgentStatus::NeedsFeedback, false, th.err),
+        ] {
+            app.tree.agents[0].status = status;
+            app.tree.agents[0].unseen = unseen;
+            assert_eq!(rail(&mut app), want, "{status:?} unseen={unseen}");
+        }
+        // Unfocused, the rail is the quiet gray whatever the status.
+        app.focus = Focus::Worktrees;
+        assert_eq!(rail(&mut app), th.dim, "unfocused panel");
+    }
+
+    /// The TAB UNDERLINE under the open WORKSPACE TAB is the tab's rollup
+    /// STATUS DOT color — the same color the dot in the tab shows.
+    #[test]
+    fn tab_underline_takes_the_rollup_dot_color() {
+        use nebula_core::{AgentStatus, Workspace, WorkspaceId};
+        let mut app = hit_test_app(&["main"], &["agent"], &[]);
+        app.tree.workspaces.push(Workspace {
+            id: WorkspaceId::default(),
+            name: "default".into(),
+        });
+        let th = app.theme;
+        let area = Rect::new(0, 0, 60, crate::app::WORKSPACES_BAR_H);
+        let underline = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4)).unwrap();
+            terminal
+                .draw(|f| draw_workspaces_bar(f, app, area))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let rule = area.height - 1;
+            let x = (0..60)
+                .find(|&x| buf.cell((x, rule)).unwrap().symbol() == "▀")
+                .expect("an underline under the open tab");
+            buf.cell((x, rule)).unwrap().fg
+        };
+        for (status, unseen, want) in [
+            (AgentStatus::Fresh, false, th.muted),
+            (AgentStatus::Running, false, th.warn),
+            (AgentStatus::Finished, true, th.done),
+            (AgentStatus::NeedsFeedback, false, th.err),
+        ] {
+            app.tree.agents[0].status = status;
+            app.tree.agents[0].unseen = unseen;
+            assert_eq!(underline(&mut app), want, "{status:?} unseen={unseen}");
+        }
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three
     /// cells centered vertically: muted at rest, accent under hover. All
-    /// four boundaries get one while the Workspaces column is shown.
+    /// three visible sidebar boundaries get one.
     #[test]
     fn splitter_grips_center_on_the_rules() {
         let th = Theme::default();
@@ -4890,7 +5959,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(body);
         draw_splitter_grips(&mut buf, &app, body);
         let mid = body.height / 2; // 17
-        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
         for i in app.splitter_indices() {
             let x = app.splitter_x(i) - 1;
             for y in mid - 1..=mid + 1 {
@@ -4928,5 +5997,306 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(tiny);
         draw_splitter_grips(&mut buf, &app, tiny);
         assert!(buf.content().iter().all(|c| c.symbol() == " "));
+    }
+
+    /// A test tree: one project, `branches` as its worktrees (the first is
+    /// the root checkout), `agents` and `terminals` under the first worktree.
+    fn hit_test_app(branches: &[&str], agents: &[&str], terminals: &[&str]) -> App {
+        use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        let project_id = ProjectId("p1".into());
+        app.tree.projects.push(Project {
+            workspace_id: Default::default(),
+            id: project_id.clone(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        });
+        for (i, branch) in branches.iter().enumerate() {
+            app.tree.worktrees.push(Worktree {
+                id: WorktreeId(format!("w{i}")),
+                project_id: project_id.clone(),
+                path: format!("/tmp/{branch}").into(),
+                branch: (*branch).into(),
+                is_main: i == 0,
+                sort_order: i as i64,
+            });
+        }
+        for (i, name) in agents.iter().enumerate() {
+            app.tree.agents.push(Agent {
+                id: AgentId(format!("a{i}")),
+                worktree_id: WorktreeId("w0".into()),
+                name: (*name).into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                status_changed_at: 0,
+                kind: nebula_core::AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: i as i64,
+                alive: false,
+                cloud_mirroring: false,
+                recent_prompts: Vec::new(),
+            });
+        }
+        for (i, name) in terminals.iter().enumerate() {
+            app.tree.terminals.push(nebula_core::TerminalTab {
+                id: nebula_core::TerminalId(format!("t{i}")),
+                worktree_id: WorktreeId("w0".into()),
+                name: (*name).into(),
+                sort_order: i as i64,
+                alive: false,
+            });
+        }
+        app
+    }
+
+    /// Pills are 3-row cells on a 2-row stride, so a pill's bottom pad is
+    /// normally the next pill's top pad and clicks there select the lower
+    /// one. The root checkout sits over a quiet row and the last pill
+    /// over nothing: their bottom pads — the lower half of the pill as
+    /// drawn — must still hit the pill, not the panel background.
+    #[test]
+    fn worktree_pills_are_clickable_over_their_whole_height() {
+        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+
+        // `draw_column` hands the list rows from y=3: root at 3..=5, then a
+        // quiet row, `feature` at 6..=8 sharing its bottom pad with
+        // `other` at 8..=10.
+        let at = |y: u16| app.hit_at(1, y);
+        for y in 3..=5 {
+            assert_eq!(at(y), Some(HitTarget::Worktree(0)), "root row y={y}");
+        }
+        assert_eq!(at(6), Some(HitTarget::Worktree(1)));
+        assert_eq!(at(7), Some(HitTarget::Worktree(1)));
+        assert_eq!(
+            at(8),
+            Some(HitTarget::Worktree(2)),
+            "shared pad goes to the lower pill"
+        );
+        assert_eq!(at(9), Some(HitTarget::Worktree(2)));
+        assert_eq!(
+            at(10),
+            Some(HitTarget::Worktree(2)),
+            "last pill keeps its bottom pad"
+        );
+        assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
+    }
+
+    /// RECENT PROMPTS under a session's name. Off (the default), the list
+    /// is as it was; on, the newest N follow the name oldest-first inside
+    /// the pill, each with its ago label, the next group moves down by
+    /// that much, a click over the lines lands on their session, and a
+    /// session with fewer prompts than asked lists only what it has.
+    /// Archived rows and terminals list none.
+    #[test]
+    fn recent_prompts_hang_under_the_session_pill_newest_last() {
+        use nebula_core::PromptEntry;
+        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
+        let now = crate::app::now_ms();
+        app.tree.agents[0].recent_prompts = (1..=4)
+            .map(|n| PromptEntry {
+                text: format!("prompt {n}"),
+                submitted_at: now - (5 - n) * 10 * 60_000,
+            })
+            .collect();
+        let area = Rect::new(0, 0, 32, 24);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 24)).unwrap();
+        let row_text = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+
+        // Off: the pill at 3..=5, the TERMINALS header at 6, as ever.
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt"), "off draws no history");
+        assert!(row_text(&terminal, 6).contains("TERMINALS"));
+
+        // On, three of four: the newest three, oldest first, straight
+        // under the name — rows 5..=7, the pill's bottom pad at 8 —
+        // pushing the header (and the blank every header keeps above it)
+        // down to 10.
+        app.recent_prompts = 3;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert!(row_text(&terminal, 4).contains("agent"));
+        for (y, n, ago) in [(5, 2, "30m ago"), (6, 3, "20m ago"), (7, 4, "10m ago")] {
+            let line = row_text(&terminal, y);
+            assert!(line.contains(&format!("prompt {n}")), "y={y}: {line:?}");
+            // Pinned to the column's right edge, just inside its border.
+            let inside = line.trim_end().trim_end_matches('│').trim_end();
+            assert!(inside.ends_with(ago), "y={y}: {line:?}");
+            assert!(line.contains(PROMPT_INDENT.trim_start()), "y={y}: {line:?}");
+        }
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt 1"), "only the newest three");
+        assert!(row_text(&terminal, 10).contains("TERMINALS"));
+        let at = |app: &App, y: u16| app.hit_at(1, y);
+        for y in 3..=8 {
+            assert_eq!(at(&app, y), Some(HitTarget::Session(0)), "y={y}");
+        }
+        for y in 9..=10 {
+            assert_eq!(at(&app, y), Some(HitTarget::PanelBg(Focus::Sessions)));
+        }
+        for y in 11..=13 {
+            assert_eq!(at(&app, y), Some(HitTarget::Session(1)), "y={y}");
+        }
+
+        // Asked for more than the session has: its four, and no blank.
+        app.recent_prompts = 5;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert!(row_text(&terminal, 5).contains("prompt 1"));
+        assert!(row_text(&terminal, 8).contains("prompt 4"));
+        assert!(row_text(&terminal, 11).contains("TERMINALS"));
+
+        // Archived: the history is over and the row is back to a pill.
+        app.tree.agents[0].archived = true;
+        app.show_archived = true;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt"), "archived rows list none: {all}");
+    }
+
+    /// With the cursor on a row, its RECENT PROMPTS lines sit on the pill's
+    /// fill with the rail running down their first column and the bottom
+    /// pad closing under the last line: one slab, so the history reads as
+    /// part of the session under the cursor. Unfocused, the same shape on
+    /// the quiet fill under a dim rail; a row the cursor is not on keeps
+    /// its lines on bare background, dim as ever.
+    #[test]
+    fn selected_session_prompt_lines_sit_on_the_pill_fill() {
+        use nebula_core::{AgentStatus, PromptEntry};
+        let mut app = hit_test_app(&["main"], &["agent", "other"], &[]);
+        let now = crate::app::now_ms();
+        for a in &mut app.tree.agents {
+            a.status = AgentStatus::Running;
+            a.recent_prompts = (1..=2)
+                .map(|n| PromptEntry {
+                    text: format!("ask {n}"),
+                    submitted_at: now - (3 - n) * 60_000,
+                })
+                .collect();
+        }
+        app.recent_prompts = 2;
+        app.focus = Focus::Sessions;
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 16);
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 16)).unwrap();
+            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let text_x = |buf: &ratatui::buffer::Buffer, y: u16, needle: &str| {
+            let line: String = (0..30)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            line.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} on row {y}: {line:?}")) as u16
+        };
+
+        // Focused: the agent's pill is pad 3, name 4, lines 5..=6, pad 7 —
+        // one fill end to end, the rail in the RUNNING yellow all the way
+        // down, the pad's cap included.
+        let buf = draw(&mut app);
+        let cell =
+            |buf: &ratatui::buffer::Buffer, x: u16, y: u16| buf.cell((x, y)).unwrap().clone();
+        assert_eq!(cell(&buf, 0, 3).symbol(), PILL_HALF.0.to_string());
+        for y in 4..=6 {
+            let rail = cell(&buf, 0, y);
+            assert_eq!(rail.symbol(), PILL_RAIL, "y={y}");
+            assert_eq!(rail.fg, th.warn, "y={y}: the rail keeps the status color");
+            // The row's 28 cells: the column keeps a pad column and its
+            // rule past them, which no row paints.
+            for x in 0..28 {
+                assert_eq!(cell(&buf, x, y).bg, th.sel_bg, "({x},{y}) is on the fill");
+            }
+        }
+        let pad = cell(&buf, 0, 7);
+        assert_eq!(
+            pad.symbol(),
+            PILL_HALF.1.to_string(),
+            "the pad closes under the lines"
+        );
+        assert_eq!(pad.fg, th.warn);
+        assert_eq!(
+            cell(&buf, 5, 7).fg,
+            th.sel_bg,
+            "the pad row is the fill's half-block"
+        );
+        assert_eq!(
+            cell(&buf, text_x(&buf, 5, "ask 1"), 5).fg,
+            th.muted,
+            "an older line is lifted off dim on the fill"
+        );
+        assert_eq!(cell(&buf, text_x(&buf, 6, "ask 2"), 6).fg, th.muted);
+        // The other row — pad 8, name 9, lines 10..=11 — draws its lines
+        // on bare background with a plain gutter, older one dim.
+        for y in 10..=11 {
+            assert_eq!(
+                cell(&buf, 0, y).symbol(),
+                " ",
+                "y={y}: no rail off the cursor"
+            );
+            assert_eq!(
+                cell(&buf, 5, y).bg,
+                Color::Reset,
+                "y={y}: no fill off the cursor"
+            );
+        }
+        assert_eq!(cell(&buf, text_x(&buf, 10, "ask 1"), 10).fg, th.dim);
+        assert_eq!(cell(&buf, text_x(&buf, 11, "ask 2"), 11).fg, th.muted);
+
+        // Unfocused: the quiet fill, the dim rail, the same shape.
+        app.focus = Focus::Worktrees;
+        let buf = draw(&mut app);
+        for y in 4..=6 {
+            assert_eq!(cell(&buf, 0, y).symbol(), PILL_RAIL, "y={y}");
+            assert_eq!(cell(&buf, 0, y).fg, th.dim, "y={y}");
+            assert_eq!(cell(&buf, 5, y).bg, th.sel_bg_dim, "y={y}");
+        }
+        assert_eq!(cell(&buf, 0, 7).fg, th.dim, "the pad cap follows the rail");
+        assert_eq!(cell(&buf, 5, 7).fg, th.sel_bg_dim);
+    }
+
+    /// The same rule in the Sessions panel: the last pill of a group has
+    /// a header under it instead of another pill, and keeps its bottom pad.
+    #[test]
+    fn session_pills_are_clickable_over_their_whole_height() {
+        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+
+        // The agent has no header: its pill at 3..=5 (the "blank" row above
+        // the next header is that pill's bottom pad), TERMINALS header at
+        // 6, the terminal's pill at 7..=9.
+        let at = |y: u16| app.hit_at(1, y);
+        for y in 3..=5 {
+            assert_eq!(at(y), Some(HitTarget::Session(0)), "agent row y={y}");
+        }
+        assert_eq!(at(6), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
+        for y in 7..=9 {
+            assert_eq!(at(y), Some(HitTarget::Session(1)), "terminal row y={y}");
+        }
+        assert_eq!(at(10), Some(HitTarget::PanelBg(Focus::Sessions)));
     }
 }

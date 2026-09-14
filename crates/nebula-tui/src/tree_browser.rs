@@ -2,7 +2,10 @@
 //! right, with an always-live fuzzy filter that narrows the tree to the
 //! matching files and the hierarchies containing them.
 
-use crate::app::{DEFAULT_DIFF_FILES_W, MIN_DIFF_FILES_W, MIN_DIFF_PANE_W};
+use crate::app::{
+    clamp_files_width, clamp_selection, max_scroll, scrolled_by, window_start, DEFAULT_DIFF_FILES_W,
+};
+use crate::git_diff::cap_lines;
 use crate::syntax::{Highlighter, TokenKind};
 use crate::text_input::TextInput;
 use ratatui::layout::Rect;
@@ -133,12 +136,12 @@ impl TreeBrowser {
     }
 
     pub fn max_scroll(&self) -> u16 {
-        (self.preview_line_count as u16).saturating_sub(self.view_height.max(1))
+        max_scroll(self.preview_line_count, self.view_height)
     }
 
     /// Clamped relative preview scroll.
     pub fn scroll_by(&mut self, delta: i32) {
-        self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll() as i32) as u16;
+        self.scroll = scrolled_by(self.scroll, delta, self.max_scroll());
     }
 
     /// Screen x of the tree/preview boundary — the column where the preview
@@ -150,24 +153,20 @@ impl TreeBrowser {
     /// Move the tree/preview boundary to `boundary_x`, clamped so the tree
     /// keeps `MIN_DIFF_FILES_W` and the preview keeps `MIN_DIFF_PANE_W`.
     pub fn set_files_width(&mut self, boundary_x: i32) {
-        let max = self.area.width.saturating_sub(MIN_DIFF_PANE_W);
-        if max < MIN_DIFF_FILES_W {
-            return; // modal too small to honor the minimums
+        if let Some(width) = clamp_files_width(self.area, boundary_x) {
+            self.files_width = width;
         }
-        let want = (boundary_x - self.area.x as i32).max(0) as u16;
-        self.files_width = want.clamp(MIN_DIFF_FILES_W, max);
     }
 
     /// First visible row of the tree's stateless follow-window for a list of
     /// `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Clamped absolute selection; reloads the preview when it moved.
     pub fn select(&mut self, index: i64) {
-        let max = self.rows.len().saturating_sub(1) as i64;
-        let clamped = index.clamp(0, max) as usize;
+        let clamped = clamp_selection(index, self.rows.len());
         if clamped != self.selected {
             self.selected = clamped;
             self.load_preview();
@@ -387,9 +386,31 @@ impl TreeBrowser {
     }
 }
 
-/// File contents for the preview pane, capped and binary-guarded. `Err` is
-/// the placeholder/error message to display (unhighlighted).
-fn read_preview(path: &std::path::Path) -> Result<String, String> {
+/// How much of a file's head the binary test reads: git's own 8 KiB.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// git's own test for "not text": a NUL byte anywhere in the first 8 KiB.
+/// The preview pane says `(binary file)` on it; `nebula open` refuses the
+/// file outright on it, since a tab of a PNG's bytes shows nobody anything.
+pub(crate) fn looks_binary(head: &[u8]) -> bool {
+    head.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
+}
+
+/// Is this a text file by that test? Reads only the head. An unreadable
+/// file is the caller's error to word.
+pub(crate) fn is_text_file(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(BINARY_SNIFF_BYTES);
+    std::fs::File::open(path)?
+        .take(BINARY_SNIFF_BYTES as u64)
+        .read_to_end(&mut head)?;
+    Ok(!looks_binary(&head))
+}
+
+/// File contents for a preview pane (this browser's, or the FILE TABS'),
+/// capped and binary-guarded. `Err` is the placeholder/error message to
+/// display (unhighlighted).
+pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -402,7 +423,7 @@ fn read_preview(path: &std::path::Path) -> Result<String, String> {
     {
         return Err(format!("couldn't read file: {e}"));
     }
-    if bytes.iter().take(8192).any(|b| *b == 0) {
+    if looks_binary(&bytes) {
         return Err("(binary file)".to_string());
     }
     let byte_capped = bytes.len() > MAX_PREVIEW_BYTES;
@@ -410,15 +431,7 @@ fn read_preview(path: &std::path::Path) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("(empty file)".to_string());
     }
-    let mut lines = text.lines();
-    let mut out: String = lines
-        .by_ref()
-        .take(MAX_PREVIEW_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.next().is_some() || byte_capped {
-        out.push_str("\n… (truncated)");
-    }
+    let out = cap_lines(&text, MAX_PREVIEW_LINES, byte_capped);
     // ratatui doesn't expand tabs; keep columns readable.
     Ok(out.replace('\t', "    "))
 }
@@ -665,5 +678,25 @@ mod tests {
             vec!["blob.bin".into()],
         );
         assert_eq!(b.preview, "(binary file)");
+    }
+
+    /// The test `nebula open` refuses a file on, shared with the preview:
+    /// git's NUL in the first 8 KiB. A PNG's header has one; text, however
+    /// odd its characters, has none; an empty file is not binary.
+    #[test]
+    fn is_text_file_is_gits_nul_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let text = dir.path().join("notes.md");
+        std::fs::write(&text, "# notes\nwith \u{e9} and \u{2192} in it\n").unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        assert!(!is_text_file(&png).unwrap());
+        assert!(is_text_file(&text).unwrap());
+        assert!(is_text_file(&empty).unwrap());
+        assert!(is_text_file(&dir.path().join("missing")).is_err());
+        assert!(!looks_binary(b"plain"));
+        assert!(looks_binary(b"a\0b"));
     }
 }

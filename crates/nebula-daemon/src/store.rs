@@ -2,11 +2,12 @@
 //! changes), so a mutex-guarded connection is sufficient — no ORM, no
 //! connection pool.
 
+use crate::session_title::TitleState;
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, Task, TaskId,
-    TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
-    DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
+    Task, TaskId, TaskTarget, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
+    WorktreeId, DEFAULT_WORKSPACE_ID, RECENT_PROMPTS_KEPT,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -68,11 +69,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'claude';
     ",
-    // 5: pinned agents (their own group in the sessions list)
+    // 5: pinned agents — the PIN feature was removed on 2026-08-28; the
+    //    column stays (unread) rather than costing a table rebuild
     "
     ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
     ",
-    // 6: pinned worktrees (their own group in the worktrees list)
+    // 6: pinned worktrees (same story as 5)
     "
     ALTER TABLE worktrees ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
     ",
@@ -265,6 +267,30 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tasks ADD COLUMN stall_timeout_secs INTEGER NOT NULL DEFAULT 1800;
     ALTER TABLE tasks ADD COLUMN commit_on_finish INTEGER NOT NULL DEFAULT 0;
     ",
+    // 24: the PR URL that scopes a Claude AGENT created from an OPEN PRS
+    // row. Nullable and request-driven: every existing AGENT remains an
+    // ordinary session, while a PR-created one can rebuild its appended
+    // system prompt after a daemon restart or RESUME.
+    "
+    ALTER TABLE agents ADD COLUMN pr_url TEXT;
+    ",
+    // 25: the title Claude Code itself holds for the row's session — what
+    // `/rename` set inside the CLI, or what nebula last pushed into it
+    // through the UserPromptSubmit hook reply (CLAUDE TITLE SYNC, see
+    // `session_title.rs`). Compared with `name` to keep the two tied
+    // without either side undoing the other's newer choice; NULL until
+    // the first sync, so every existing row simply starts unsynced.
+    "
+    ALTER TABLE agents ADD COLUMN claude_title TEXT;
+    ",
+    // 26: RECENT PROMPTS — the newest few prompts typed into the session,
+    // as a JSON array of `PromptEntry` (oldest first), for the SESSIONS
+    // PANEL's history lines. A bounded list on the row rather than a
+    // table: it is read with every row and pruned on every write.
+    // NULL (the empty history) for every row that predates the capture.
+    "
+    ALTER TABLE agents ADD COLUMN recent_prompts TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -395,12 +421,19 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+    /// `DELETE FROM <table> WHERE id = ?1` — every entity delete is exactly
+    /// this one statement, the schema's cascades taking the children with
+    /// the row.
+    fn delete_by_id(&self, table: &'static str, id: &str) -> Result<()> {
         self.conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
+            .execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
         Ok(())
+    }
+
+    pub fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        self.delete_by_id("workspaces", id.as_str())
     }
 
     /// Every workspace, oldest first (the 'default' one leads — it is
@@ -408,25 +441,21 @@ impl Store {
     pub fn load_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock().unwrap();
         let workspaces = conn
-            .prepare("SELECT id, name FROM workspaces ORDER BY created_at, id")?
-            .query_map([], |r| {
-                Ok(Workspace {
-                    id: WorkspaceId(r.get(0)?),
-                    name: r.get(1)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY created_at, id"
+            ))?
+            .query_map([], row_to_workspace)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(workspaces)
     }
 
     pub fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<Workspace>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name FROM workspaces WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Workspace {
-            id: WorkspaceId(r.get::<_, String>(0).unwrap()),
-            name: r.get(1).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_workspace).transpose()?)
     }
 
     pub fn workspace_by_name(&self, name: &str) -> Result<Option<WorkspaceId>> {
@@ -435,7 +464,9 @@ impl Store {
         let mut rows = stmt.query(params![name])?;
         Ok(rows
             .next()?
-            .map(|r| WorkspaceId(r.get::<_, String>(0).unwrap())))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(WorkspaceId))
     }
 
     /// The open workspace. Falls back to 'default' if no row is flagged
@@ -447,7 +478,9 @@ impl Store {
         let mut rows = stmt.query([])?;
         Ok(rows
             .next()?
-            .map(|r| WorkspaceId(r.get::<_, String>(0).unwrap()))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(WorkspaceId)
             .unwrap_or_default())
     }
 
@@ -494,21 +527,16 @@ impl Store {
         )?)
     }
 
-    /// Persist a project's list position (its sort order).
-    pub fn set_project_position(&self, p: &Project) -> Result<()> {
+    pub fn rename_project(&self, id: &ProjectId, name: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE projects SET sort_order = ?2 WHERE id = ?1",
-            params![p.id.as_str(), p.sort_order],
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![id.as_str(), name],
         )?;
         Ok(())
     }
 
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("projects", id.as_str())
     }
 
     /// The project row for `path` within one workspace. Repo paths may
@@ -530,22 +558,23 @@ impl Store {
         ])?;
         Ok(rows
             .next()?
-            .map(|r| ProjectId(r.get::<_, String>(0).unwrap())))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(ProjectId))
     }
 
     // ---- worktrees ----
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 w.id.as_str(),
                 w.project_id.as_str(),
                 w.path.to_string_lossy(),
                 w.branch,
                 w.is_main as i64,
-                w.pinned as i64,
                 w.sort_order,
                 now_ms()
             ],
@@ -554,11 +583,7 @@ impl Store {
     }
 
     pub fn delete_worktree(&self, id: &WorktreeId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM worktrees WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("worktrees", id.as_str())
     }
 
     pub fn update_worktree_branch(&self, id: &WorktreeId, branch: &str) -> Result<()> {
@@ -579,26 +604,30 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_worktree_pinned(&self, id: &WorktreeId, pinned: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE worktrees SET pinned = ?2 WHERE id = ?1",
-            params![id.as_str(), pinned as i64],
-        )?;
-        Ok(())
-    }
-
     // ---- agents ----
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
-        self.insert_agent_with_auto_title(a, false)
+        self.insert_agent_with_launch_context(a, false, None)
     }
 
     /// `auto_title` marks the row as awaiting one agent-driven title
     /// (`nebula rename` from inside the CLI). The flag is store-internal:
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
+        self.insert_agent_with_launch_context(a, auto_title, None)
+    }
+
+    /// Persist an AGENT plus the launch-only context that must be rebuilt
+    /// on every process spawn. `pr_url` is intentionally not part of the
+    /// shared Agent entity: it constrains Claude's launch, not row display.
+    pub fn insert_agent_with_launch_context(
+        &self,
+        a: &Agent,
+        auto_title: bool,
+        pr_url: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id)
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 a.id.as_str(),
@@ -607,7 +636,6 @@ impl Store {
                 a.status.as_str(),
                 a.archived as i64,
                 a.archived_at,
-                a.pinned as i64,
                 a.kind.as_str(),
                 a.session_id,
                 a.sort_order,
@@ -617,10 +645,24 @@ impl Store {
                 a.effort,
                 auto_title as i64,
                 a.unseen as i64,
-                a.cloud_session_id
+                a.cloud_session_id,
+                pr_url,
             ],
         )?;
         Ok(())
+    }
+
+    /// PR launch context for an AGENT, or None for an ordinary/pre-existing
+    /// row. A missing row also returns None; the spawn path has already
+    /// resolved the Agent itself before asking for this adjunct.
+    pub fn agent_pr_url(&self, id: &AgentId) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pr_url FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(None),
+        }
     }
 
     /// User rename: always applies, and retires any pending auto-title so a
@@ -664,6 +706,77 @@ impl Store {
         Ok(pending == Some(1))
     }
 
+    /// The title last seen from (or pushed into) Claude for this session;
+    /// `None` until the CLAUDE TITLE SYNC has run once.
+    /// Append one prompt to the row's RECENT PROMPTS, keeping only the
+    /// newest [`RECENT_PROMPTS_KEPT`]. Returns whether a row was there to
+    /// take it.
+    pub fn push_prompt(&self, id: &AgentId, entry: &PromptEntry) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT recent_prompts FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let mut prompts = parse_prompts(row.get::<_, Option<String>>(0)?.as_deref());
+        drop(rows);
+        drop(stmt);
+        prompts.push(entry.clone());
+        if prompts.len() > RECENT_PROMPTS_KEPT {
+            prompts.drain(..prompts.len() - RECENT_PROMPTS_KEPT);
+        }
+        let json = serde_json::to_string(&prompts)?;
+        conn.execute(
+            "UPDATE agents SET recent_prompts = ?2 WHERE id = ?1",
+            params![id.as_str(), json],
+        )?;
+        Ok(true)
+    }
+
+    pub fn agent_claude_title(&self, id: &AgentId) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT claude_title FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Claude's own title for the session, as just read from disk: when it
+    /// is not the one last seen from Claude, the row takes it as a user
+    /// rename (retiring any pending auto-title) and remembers it. The
+    /// comparison is deliberately against `claude_title`, not `name`, so a
+    /// name the user set in nebula since is never undone by re-reading
+    /// Claude's older title. Returns whether anything changed.
+    pub fn adopt_claude_title(&self, id: &AgentId, title: &str) -> Result<bool> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE agents SET name = ?2, claude_title = ?2, auto_title_pending = 0 \
+             WHERE id = ?1 AND (claude_title IS NULL OR claude_title != ?2)",
+            params![id.as_str(), title],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Everything the hook reply needs to decide whether to push the row's
+    /// name into Claude (`TitleState::to_push`); `None` for an unknown id.
+    pub fn agent_title_state(&self, id: &AgentId) -> Result<Option<TitleState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, claude_title, auto_title_pending, kind FROM agents WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(TitleState {
+                name: row.get(0)?,
+                claude_title: row.get(1)?,
+                auto_title_pending: row.get::<_, i64>(2)? != 0,
+                kind: AgentKind::parse(&row.get::<_, String>(3)?).unwrap_or_default(),
+            })),
+            None => Ok(None),
+        }
+    }
+
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
@@ -683,14 +796,6 @@ impl Store {
                     unseen = CASE WHEN ?2 THEN 0 ELSE unseen END
              WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_agent_pinned(&self, id: &AgentId, pinned: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE agents SET pinned = ?2 WHERE id = ?1",
-            params![id.as_str(), pinned as i64],
         )?;
         Ok(())
     }
@@ -762,11 +867,7 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM agents WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("agents", id.as_str())
     }
 
     /// Boot sweep: agents whose PTYs died with the previous daemon.
@@ -806,11 +907,7 @@ impl Store {
     }
 
     pub fn delete_terminal(&self, id: &TerminalId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM terminals WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("terminals", id.as_str())
     }
 
     // ---- links ----
@@ -847,39 +944,24 @@ impl Store {
     }
 
     pub fn delete_link(&self, id: &LinkId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM links WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("links", id.as_str())
     }
 
     pub fn get_link(&self, id: &LinkId) -> Result<Option<Link>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, worktree_id, url, sort_order FROM links WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!("SELECT {LINK_COLUMNS} FROM links WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Link {
-            id: LinkId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            url: r.get(2).unwrap(),
-            sort_order: r.get(3).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_link).transpose()?)
     }
 
     /// Every link, in per-worktree list order.
     pub fn load_links(&self) -> Result<Vec<Link>> {
         let conn = self.conn.lock().unwrap();
         let links = conn
-            .prepare("SELECT id, worktree_id, url, sort_order FROM links ORDER BY worktree_id, sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Link {
-                    id: LinkId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    url: r.get(2)?,
-                    sort_order: r.get(3)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {LINK_COLUMNS} FROM links ORDER BY worktree_id, sort_order, created_at"
+            ))?
+            .query_map([], row_to_link)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(links)
     }
@@ -1081,74 +1163,37 @@ impl Store {
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Project {
-            id: ProjectId(r.get::<_, String>(0).unwrap()),
-            name: r.get(1).unwrap(),
-            repo_path: PathBuf::from(r.get::<_, String>(2).unwrap()),
-            sort_order: r.get(3).unwrap(),
-            workspace_id: WorkspaceId(r.get::<_, String>(4).unwrap()),
-        }))
+        Ok(rows.next()?.map(row_to_project).transpose()?)
     }
 
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees WHERE id = ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKTREE_COLUMNS} FROM worktrees WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Worktree {
-            id: WorktreeId(r.get::<_, String>(0).unwrap()),
-            project_id: ProjectId(r.get::<_, String>(1).unwrap()),
-            path: PathBuf::from(r.get::<_, String>(2).unwrap()),
-            branch: r.get(3).unwrap(),
-            is_main: r.get::<_, i64>(4).unwrap() != 0,
-            pinned: r.get::<_, i64>(5).unwrap() != 0,
-            sort_order: r.get(6).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_worktree).transpose()?)
     }
 
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Agent {
-            id: AgentId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            name: r.get(2).unwrap(),
-            status: AgentStatus::parse(&r.get::<_, String>(3).unwrap())
-                .unwrap_or(AgentStatus::Fresh),
-            archived: r.get::<_, i64>(4).unwrap() != 0,
-            pinned: r.get::<_, i64>(5).unwrap() != 0,
-            kind: AgentKind::parse(&r.get::<_, String>(6).unwrap()).unwrap_or_default(),
-            session_id: r.get(7).unwrap(),
-            sort_order: r.get(8).unwrap(),
-            status_changed_at: r.get(9).unwrap(),
-            model: r.get(10).unwrap(),
-            effort: r.get(11).unwrap(),
-            archived_at: r.get(12).unwrap(),
-            unseen: r.get::<_, i64>(13).unwrap() != 0,
-            cloud_session_id: r.get(14).unwrap(),
-            alive: false,
-        }))
+        Ok(rows.next()?.map(row_to_agent).transpose()?)
     }
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, worktree_id, name, sort_order FROM terminals WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| TerminalTab {
-            id: TerminalId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            name: r.get(2).unwrap(),
-            sort_order: r.get(3).unwrap(),
-            alive: false,
-        }))
+        Ok(rows.next()?.map(row_to_terminal).transpose()?)
     }
 
     pub fn count_terminals(&self, worktree_id: &WorktreeId) -> Result<i64> {
@@ -1165,68 +1210,31 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Project {
-                    id: ProjectId(r.get(0)?),
-                    name: r.get(1)?,
-                    repo_path: PathBuf::from(r.get::<_, String>(2)?),
-                    sort_order: r.get(3)?,
-                    workspace_id: WorkspaceId(r.get(4)?),
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY sort_order, created_at"
+            ))?
+            .query_map([], row_to_project)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
-            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Worktree {
-                    id: WorktreeId(r.get(0)?),
-                    project_id: ProjectId(r.get(1)?),
-                    path: PathBuf::from(r.get::<_, String>(2)?),
-                    branch: r.get(3)?,
-                    is_main: r.get::<_, i64>(4)? != 0,
-                    pinned: r.get::<_, i64>(5)? != 0,
-                    sort_order: r.get(6)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {WORKTREE_COLUMNS} FROM worktrees ORDER BY is_main DESC, sort_order, created_at"
+            ))?
+            .query_map([], row_to_worktree)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Agent {
-                    id: AgentId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    name: r.get(2)?,
-                    status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
-                    archived: r.get::<_, i64>(4)? != 0,
-                    pinned: r.get::<_, i64>(5)? != 0,
-                    kind: AgentKind::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
-                    session_id: r.get(7)?,
-                    sort_order: r.get(8)?,
-                    status_changed_at: r.get(9)?,
-                    model: r.get(10)?,
-                    effort: r.get(11)?,
-                    archived_at: r.get(12)?,
-                    unseen: r.get::<_, i64>(13)? != 0,
-                    cloud_session_id: r.get(14)?,
-                    alive: false,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {AGENT_COLUMNS} FROM agents ORDER BY sort_order, created_at"
+            ))?
+            .query_map([], row_to_agent)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let terminals = conn
-            .prepare("SELECT id, worktree_id, name, sort_order FROM terminals ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(TerminalTab {
-                    id: TerminalId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    name: r.get(2)?,
-                    sort_order: r.get(3)?,
-                    alive: false,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {TERMINAL_COLUMNS} FROM terminals ORDER BY sort_order, created_at"
+            ))?
+            .query_map([], row_to_terminal)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok((projects, worktrees, agents, terminals))
@@ -1247,8 +1255,110 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT json FROM ui_state WHERE id = 1")?;
         let mut rows = stmt.query([])?;
-        Ok(rows.next()?.map(|r| r.get::<_, String>(0).unwrap()))
+        Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
     }
+}
+
+// ---- row shapes ----
+//
+// One column list and one row mapper per entity, shared by the point
+// lookups and `load_tree`, so a row can never read differently depending
+// on which path fetched it. The column order is the mapper's contract.
+
+// Column orders the `row_to_*` mappers below read.
+const WORKSPACE_COLUMNS: &str = "id, name";
+/// `workspace_id` is NULL on rows that predate workspaces; `row_to_project`
+/// fills in the default rather than a `COALESCE(.., ?1)` in the column list,
+/// which would hide a positional bind every query had to remember.
+const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
+const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
+const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
+                             claude_session_id, sort_order, status_changed_at, model, effort, \
+                             archived_at, unseen, cloud_session_id, recent_prompts";
+const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order";
+const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
+
+fn row_to_workspace(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
+    Ok(Workspace {
+        id: WorkspaceId(r.get(0)?),
+        name: r.get(1)?,
+    })
+}
+
+fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: ProjectId(r.get(0)?),
+        name: r.get(1)?,
+        repo_path: PathBuf::from(r.get::<_, String>(2)?),
+        sort_order: r.get(3)?,
+        workspace_id: WorkspaceId(
+            r.get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| DEFAULT_WORKSPACE_ID.to_string()),
+        ),
+    })
+}
+
+fn row_to_worktree(r: &rusqlite::Row) -> rusqlite::Result<Worktree> {
+    Ok(Worktree {
+        id: WorktreeId(r.get(0)?),
+        project_id: ProjectId(r.get(1)?),
+        path: PathBuf::from(r.get::<_, String>(2)?),
+        branch: r.get(3)?,
+        is_main: r.get::<_, i64>(4)? != 0,
+        sort_order: r.get(5)?,
+    })
+}
+
+/// `alive` and `cloud_mirroring` are daemon state, not columns: the
+/// registry fills them in from its session table after the read.
+fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
+    Ok(Agent {
+        id: AgentId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        name: r.get(2)?,
+        status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
+        archived: r.get::<_, i64>(4)? != 0,
+        kind: AgentKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+        session_id: r.get(6)?,
+        sort_order: r.get(7)?,
+        status_changed_at: r.get(8)?,
+        model: r.get(9)?,
+        effort: r.get(10)?,
+        archived_at: r.get(11)?,
+        unseen: r.get::<_, i64>(12)? != 0,
+        cloud_session_id: r.get(13)?,
+        alive: false,
+        cloud_mirroring: false,
+        recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
+    })
+}
+
+/// The `recent_prompts` column: NULL is the empty history, and a column
+/// that will not parse (a hand edit, a downgrade) reads as empty too
+/// rather than failing every row load.
+fn parse_prompts(json: Option<&str>) -> Vec<PromptEntry> {
+    json.and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default()
+}
+
+/// `alive` is daemon state, filled in by the registry like the agent's.
+fn row_to_terminal(r: &rusqlite::Row) -> rusqlite::Result<TerminalTab> {
+    Ok(TerminalTab {
+        id: TerminalId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        name: r.get(2)?,
+        sort_order: r.get(3)?,
+        alive: false,
+    })
+}
+
+fn row_to_link(r: &rusqlite::Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: LinkId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        url: r.get(2)?,
+        sort_order: r.get(3)?,
+    })
 }
 
 #[cfg(test)]
@@ -1273,7 +1383,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1284,7 +1393,6 @@ mod tests {
             status: AgentStatus::Running,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: Some("opus".into()),
@@ -1294,8 +1402,13 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
-        store.insert_agent(&agent).unwrap();
+        let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
+        store
+            .insert_agent_with_launch_context(&agent, false, Some(pr_url))
+            .unwrap();
         let codex_agent = Agent {
             id: AgentId::generate(),
             worktree_id: worktree.id.clone(),
@@ -1303,7 +1416,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Codex,
             model: None,
@@ -1313,6 +1425,8 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
         let cursor_agent = Agent {
@@ -1322,7 +1436,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Cursor,
             model: None,
@@ -1332,6 +1445,8 @@ mod tests {
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
 
@@ -1344,6 +1459,11 @@ mod tests {
         assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
         assert_eq!(agents[0].model.as_deref(), Some("opus"));
         assert_eq!(agents[0].effort.as_deref(), Some("high"));
+        assert_eq!(
+            store.agent_pr_url(&agents[0].id).unwrap().as_deref(),
+            Some(pr_url)
+        );
+        assert_eq!(store.agent_pr_url(&agents[1].id).unwrap(), None);
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
@@ -1392,7 +1512,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1441,7 +1560,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1550,7 +1668,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1663,7 +1780,7 @@ mod tests {
     #[test]
     fn migration_22_adds_the_tasks_table_to_a_v21_database() {
         let path =
-            std::env::temp_dir().join(format!("nebula-mig22-test-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("nebula-mig-tasks-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).unwrap();
@@ -1756,6 +1873,63 @@ mod tests {
             .unwrap();
         assert_eq!(tables, 0);
         drop(conn);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    /// A database already at v21 gains nullable PR launch context without
+    /// rewriting or invalidating its existing AGENT rows.
+    #[test]
+    fn migration_24_adds_pr_context_without_backfill() {
+        let path = std::env::temp_dir().join(format!(
+            "nebula-mig-pr-context-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(21).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at, workspace_id)
+                   VALUES ('p1', 'p', '/tmp/p', 0, 0, 'default');
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at, pinned)
+                   VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0, 0);
+                 INSERT INTO agents (id, worktree_id, name, created_at)
+                   VALUES ('a1', 'w1', 'existing', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.agent_pr_url(&AgentId("a1".into())).unwrap(), None);
+        // …and the later columns arrive NULL too (25: claude_title,
+        // 26: recent_prompts — read as the empty history).
+        assert_eq!(
+            store.agent_claude_title(&AgentId("a1".into())).unwrap(),
+            None
+        );
+        assert!(store
+            .get_agent(&AgentId("a1".into()))
+            .unwrap()
+            .unwrap()
+            .recent_prompts
+            .is_empty());
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -2016,7 +2190,6 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();
@@ -2027,7 +2200,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: None,
@@ -2037,6 +2209,8 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
 
         // Default-named session: pending until the agent titles it, and the
@@ -2080,6 +2254,99 @@ mod tests {
             .unwrap());
     }
 
+    /// CLAUDE TITLE SYNC bookkeeping: Claude's title is adopted only when
+    /// it changed on Claude's side, a nebula rename made since survives a
+    /// re-read of Claude's older title, and the reply pushes the row's
+    /// name only until Claude holds it.
+    #[test]
+    fn claude_title_follows_claude_without_undoing_a_nebula_rename() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let wt = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/p".into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        store.insert_worktree(&wt).unwrap();
+        let id = AgentId("a1".into());
+        store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    id: id.clone(),
+                    worktree_id: wt.id.clone(),
+                    name: "agent-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    unseen: false,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                    cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
+                },
+                true,
+            )
+            .unwrap();
+        let state = |store: &Store| store.agent_title_state(&id).unwrap().unwrap();
+
+        // Fresh: nothing seen from Claude, nothing to push while pending.
+        assert_eq!(store.agent_claude_title(&id).unwrap(), None);
+        assert!(state(&store).auto_title_pending);
+        assert_eq!(state(&store).to_push(), None);
+
+        // `/rename` in Claude: adopted as a user rename, once.
+        assert!(store.adopt_claude_title(&id, "From Claude").unwrap());
+        assert!(!store.adopt_claude_title(&id, "From Claude").unwrap());
+        let agent = store.get_agent(&id).unwrap().unwrap();
+        assert_eq!(agent.name, "From Claude");
+        assert!(!store.agent_auto_title_pending(&id).unwrap());
+        assert_eq!(
+            store.agent_claude_title(&id).unwrap().as_deref(),
+            Some("From Claude")
+        );
+        assert_eq!(state(&store).to_push(), None, "the two agree");
+
+        // `r` in nebula: the row changes, Claude's title is unchanged, so
+        // re-reading it must not revert the row — and the name is due a push.
+        store.rename_agent(&id, "From Nebula").unwrap();
+        assert!(!store.adopt_claude_title(&id, "From Claude").unwrap());
+        assert_eq!(store.get_agent(&id).unwrap().unwrap().name, "From Nebula");
+        assert_eq!(state(&store).to_push(), Some("From Nebula"));
+
+        // Claude took the push (or the user typed the same name there).
+        assert!(store.adopt_claude_title(&id, "From Nebula").unwrap());
+        assert_eq!(state(&store).to_push(), None);
+
+        // Unknown ids read as nothing rather than erroring.
+        assert_eq!(
+            store.agent_claude_title(&AgentId("ghost".into())).unwrap(),
+            None
+        );
+        assert!(store
+            .agent_title_state(&AgentId("ghost".into()))
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .adopt_claude_title(&AgentId("ghost".into()), "x")
+            .unwrap());
+    }
+
     #[test]
     fn cascade_delete_project_removes_children() {
         let store = Store::open_in_memory().unwrap();
@@ -2097,7 +2364,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -2135,7 +2401,6 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();
@@ -2152,7 +2417,6 @@ mod tests {
                     status,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
@@ -2162,6 +2426,8 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 })
                 .unwrap();
         }
@@ -2206,7 +2472,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -2218,7 +2483,6 @@ mod tests {
                 status,
                 archived: false,
                 archived_at: 0,
-                pinned: false,
                 unseen: false,
                 kind: AgentKind::Claude,
                 model: None,
@@ -2228,6 +2492,8 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
             agent.id
@@ -2282,5 +2548,86 @@ mod tests {
         assert!(flip(&c, AgentStatus::Finished));
         store.sweep_disconnected().unwrap();
         assert!(unseen(&c), "still waiting to be read after the restart");
+    }
+
+    /// RECENT PROMPTS: appended in order, pruned to the newest
+    /// `RECENT_PROMPTS_KEPT`, read back by both row paths, and nothing
+    /// for an id with no row.
+    #[test]
+    fn push_prompt_keeps_the_newest_bounded_history() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p1".into()),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: project.id.clone(),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                sort_order: 0,
+            })
+            .unwrap();
+        let id = AgentId("a1".into());
+        store
+            .insert_agent(&Agent {
+                id: id.clone(),
+                worktree_id: WorktreeId("w1".into()),
+                name: "agent-1".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: false,
+                cloud_mirroring: false,
+                recent_prompts: Vec::new(),
+            })
+            .unwrap();
+        let entry = |n: usize| PromptEntry {
+            text: format!("prompt {n}"),
+            submitted_at: 1_000 + n as i64,
+        };
+        assert!(store
+            .get_agent(&id)
+            .unwrap()
+            .unwrap()
+            .recent_prompts
+            .is_empty());
+
+        assert!(store.push_prompt(&id, &entry(1)).unwrap());
+        assert!(store.push_prompt(&id, &entry(2)).unwrap());
+        let got = store.get_agent(&id).unwrap().unwrap().recent_prompts;
+        assert_eq!(got, vec![entry(1), entry(2)], "oldest first");
+
+        // Past the cap the oldest fall off the front.
+        for n in 3..=(RECENT_PROMPTS_KEPT + 2) {
+            assert!(store.push_prompt(&id, &entry(n)).unwrap());
+        }
+        let got = store.get_agent(&id).unwrap().unwrap().recent_prompts;
+        assert_eq!(got.len(), RECENT_PROMPTS_KEPT);
+        assert_eq!(got.first(), Some(&entry(3)));
+        assert_eq!(got.last(), Some(&entry(RECENT_PROMPTS_KEPT + 2)));
+
+        // `load_tree` reads the same column through the same mapper.
+        let (_, _, agents, _) = store.load_tree().unwrap();
+        assert_eq!(agents[0].recent_prompts, got);
+
+        // No row, nothing recorded — and no error.
+        assert!(!store
+            .push_prompt(&AgentId("ghost".into()), &entry(1))
+            .unwrap());
     }
 }

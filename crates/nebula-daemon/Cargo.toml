@@ -25,6 +25,6 @@ rand = "0.10"
 subtle = "2"
 cron = { workspace = true }
 chrono = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

@@ -72,10 +72,26 @@ pub fn classify_diff_line(line: &str) -> DiffLineKind {
     }
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
+/// `git -C root`, with the locks git takes on its own initiative switched
+/// off. `git status` and `git diff` refresh the index's stat cache as a
+/// side effect and, when it is stale — it always is while an agent edits
+/// files — write it back through `.git/index.lock`. The WORKTREES PANEL's
+/// changed-files badge polls `status` every two seconds on the checkout
+/// the user is working in, so left on, that write lands under the agent's
+/// own `git add` / `commit` / `checkout`, which then fails with "Unable to
+/// create '.git/index.lock': File exists" (issue #15). Nothing the TUI
+/// runs needs the refresh persisted — the agent CLIs themselves run their
+/// background git with `--no-optional-locks` for the same reason — and
+/// commands that must lock (none of ours) still do: `GIT_OPTIONAL_LOCKS=0`
+/// only skips the optional ones. Every TUI-side git goes through here.
+pub(crate) fn git_command(root: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
+pub(crate) fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
+    git_command(root)
         .args(args)
         .output()
         .map_err(|e| format!("failed to run git: {e}"))
@@ -207,14 +223,21 @@ pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool) -> String {
     if text.trim().is_empty() {
         return "(no textual changes)".to_string();
     }
+    cap_lines(&text, MAX_DIFF_LINES, false)
+}
+
+/// What a capped text ends with, so the pane says why it stops short.
+pub const TRUNCATED_MARK: &str = "\n… (truncated)";
+
+/// The first `max` lines of `text`, joined, ending in [`TRUNCATED_MARK`]
+/// when lines were dropped — or when `already_cut` says the caller trimmed
+/// the text before handing it over (a byte cap), so the mark still shows.
+/// Shared by the diff pane and the tree preview so both stop the same way.
+pub fn cap_lines(text: &str, max: usize, already_cut: bool) -> String {
     let mut lines = text.lines();
-    let mut out: String = lines
-        .by_ref()
-        .take(MAX_DIFF_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.next().is_some() {
-        out.push_str("\n… (truncated)");
+    let mut out: String = lines.by_ref().take(max).collect::<Vec<_>>().join("\n");
+    if lines.next().is_some() || already_cut {
+        out.push_str(TRUNCATED_MARK);
     }
     out
 }
@@ -241,6 +264,27 @@ pub fn load_selected_diff(view: &mut DiffView) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn cap_lines_keeps_the_head_and_marks_what_it_dropped() {
+        assert_eq!(cap_lines("a\nb\nc", 5, false), "a\nb\nc");
+        assert_eq!(
+            cap_lines("a\nb\nc\n", 3, false),
+            "a\nb\nc",
+            "trailing newline is not a line"
+        );
+        assert_eq!(
+            cap_lines("a\nb\nc", 2, false),
+            format!("a\nb{TRUNCATED_MARK}")
+        );
+        assert_eq!(
+            cap_lines("a\nb", 2, true),
+            format!("a\nb{TRUNCATED_MARK}"),
+            "byte cap forces the mark"
+        );
+        assert_eq!(cap_lines("a\nb\nc", 0, false), TRUNCATED_MARK);
+        assert_eq!(cap_lines("", 3, false), "");
+    }
 
     #[test]
     fn parse_status_z_handles_all_statuses() {
@@ -376,6 +420,61 @@ mod tests {
         assert!(files[0].is_untracked());
         let diff = diff_for(&repo, &files[0], false);
         assert!(diff.contains("+content"), "{diff}");
+    }
+
+    /// The WORKTREES PANEL badge polls `changed_files` every two seconds on
+    /// the checkout the user's agent is working in. A plain `git status`
+    /// rewrites the index through `.git/index.lock` whenever its stat cache
+    /// is stale, and an agent mid-`git add` or `commit` then fails with
+    /// "index.lock: File exists" (issue #15). The poll must read without
+    /// ever writing.
+    #[test]
+    fn changed_files_never_rewrites_the_index() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        let index = repo.join(".git").join("index");
+        // A rewrite lands as a rename over the file, so the inode moves;
+        // the mtime is the second witness in case a filesystem reuses it.
+        let stamp = || {
+            let meta = std::fs::metadata(&index).unwrap();
+            (meta.ino(), meta.modified().unwrap())
+        };
+        // Same content, a different (whole-second) mtime: the index's
+        // stat cache no longer matches, which is exactly what makes a
+        // status want to write the refreshed cache back.
+        let stale = |secs: u64| {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(repo.join("tracked.txt"))
+                .unwrap();
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+
+        stale(1_000_000_000);
+        let before = stamp();
+        changed_files(&repo).unwrap();
+        assert_eq!(stamp(), before, "the status poll rewrote the index");
+
+        // The control: with optional locks allowed, the same status does
+        // rewrite it — so the assertion above is testing something.
+        stale(1_000_000_100);
+        let before = stamp();
+        let plain = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_OPTIONAL_LOCKS", "1")
+            .args(["status", "--porcelain=v1", "-z", "-uall"])
+            .output()
+            .unwrap();
+        assert!(plain.status.success());
+        assert_ne!(
+            stamp(),
+            before,
+            "a plain status left the index alone, so this test proves nothing"
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! Unix-socket server: accept loop, per-client request handling, PTY
-//! attach/forward plumbing.
+//! Unix-socket server: accept loop and per-client request handling. The
+//! PTY plane of a connection (attach replay, forwarding) lives in `attach`.
 
-use crate::pty::PtyEvent;
+use crate::attach::{self, PaneSize};
+use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
@@ -145,37 +146,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 } => {
                     match daemon.ensure_session(&sref, cols, rows) {
                         Ok(session) => {
-                            // Subscribe BEFORE snapshotting so nothing falls in
-                            // the gap; the forward task drops frames the
-                            // snapshot already covers.
-                            let events_rx = session.events.subscribe();
-                            let (base_seq, data) = session.snapshot(from_seq);
-                            let replay_end = base_seq + data.len() as u64;
-                            let _ = out_tx
-                                .send(ServerEvent::Scrollback {
-                                    session: sref.clone(),
-                                    base_seq,
-                                    data,
-                                })
-                                .await;
-                            let _ = out_tx
-                                .send(ServerEvent::KittyFlags {
-                                    session: sref.clone(),
-                                    flags: session.kitty_flags(),
-                                })
-                                .await;
-                            let _ = session.resize_with_jiggle(cols, rows);
+                            // Replay inline, before the loop takes the next
+                            // request, so the Scrollback precedes any later
+                            // reply; the forward task follows from there.
+                            let size = PaneSize { cols, rows };
+                            let (events_rx, replay_end) =
+                                attach::bind(&session, &sref, &out_tx, size, from_seq).await;
 
                             let rebind = attached.remove(&sref);
                             if let Some(old) = &rebind {
                                 old.abort();
                             }
-                            let handle = tokio::spawn(forward_pty(
-                                session.clone(),
+                            let handle = tokio::spawn(attach::forward(
+                                daemon.clone(),
+                                session,
                                 sref.clone(),
                                 events_rx,
                                 out_tx.clone(),
                                 replay_end,
+                                size,
                             ));
                             // Count this connection once even across
                             // re-attaches to the same session.
@@ -251,15 +240,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(&out_tx, req_id, daemon.add_workspace(&name).map(Some)).await;
                 }
                 ClientRequest::RemoveWorkspace { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.remove_workspace(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.remove_workspace(&id)).await;
                 }
                 ClientRequest::RenameWorkspace { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_workspace(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_workspace(&id, &name)).await;
                 }
                 ClientRequest::OpenWorkspace { req_id, id } => {
                     // Scope this connection, and leave the pick behind as the
@@ -269,7 +253,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     if result.is_ok() {
                         workspace = Some(id);
                     }
-                    reply(&out_tx, req_id, result.map(|_| None)).await;
+                    reply_done(&out_tx, req_id, result).await;
                 }
                 ClientRequest::AddProject {
                     req_id,
@@ -288,13 +272,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::RemoveProject { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.remove_project(&id)).await;
                 }
-                ClientRequest::MoveProject { req_id, id, delta } => {
+                ClientRequest::RenameProject { req_id, id, name } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.move_project(&id, delta).map(|_| None),
+                        daemon.rename_project(&id, &name).map(|_| None),
                     )
                     .await;
                 }
@@ -304,15 +288,23 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     branch,
                     base,
                 } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon
-                            .create_worktree(&project, &branch, base.as_deref())
-                            .await
-                            .map(Some),
-                    )
-                    .await;
+                    // A create fetches `origin` and then runs the WORKTREE
+                    // HOOK, each bounded by a 30 s timeout; off the request
+                    // loop, like the delete below, so Input/Attach frames on
+                    // this connection never wait on either.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply(
+                            &out_tx,
+                            req_id,
+                            daemon
+                                .create_worktree(&project, &branch, base.as_deref())
+                                .await
+                                .map(Some),
+                        )
+                        .await;
+                    });
                 }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
                     // `git worktree remove` can take seconds on a large
@@ -322,21 +314,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
-                        reply(
-                            &out_tx,
-                            req_id,
-                            daemon.delete_worktree(&id, force).await.map(|_| None),
-                        )
-                        .await;
+                        reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
                     });
-                }
-                ClientRequest::SetWorktreePinned { req_id, id, pinned } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_worktree_pinned(&id, pinned).map(|_| None),
-                    )
-                    .await;
                 }
                 ClientRequest::CreateAgent {
                     req_id,
@@ -347,8 +326,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     effort,
                     auto_title,
                     cloud_prompt,
+                    starting_prompt,
                 } => {
-                    let is_cloud = cloud_prompt.is_some();
+                    // Logged by mode only — never the task or prompt text.
+                    let launch_mode = match (&cloud_prompt, &starting_prompt) {
+                        (Some(_), _) => Some("cloud"),
+                        (None, Some(_)) => Some("preset"),
+                        (None, None) => None,
+                    };
                     let result = daemon
                         .create_agent(CreateAgentSpec {
                             worktree: worktree.clone(),
@@ -358,16 +343,18 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             effort,
                             auto_title,
                             cloud_prompt,
+                            starting_prompt,
+                            pr_url: None,
                         })
                         .await;
-                    if is_cloud {
+                    if let Some(launch_mode) = launch_mode {
                         match &result {
                             Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
                                 req_id,
                                 agent = %agent,
                                 kind = kind.as_str(),
                                 worktree = %worktree,
-                                launch_mode = "cloud",
+                                launch_mode,
                                 "agent session spawned"
                             ),
                             Err(error) => tracing::warn!(
@@ -375,11 +362,57 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 error = %error,
                                 kind = kind.as_str(),
                                 worktree = %worktree,
-                                launch_mode = "cloud",
+                                launch_mode,
                                 "agent session spawn failed"
                             ),
                             Ok(_) => unreachable!("CreateAgent returned a non-agent id"),
                         }
+                    }
+                    reply(&out_tx, req_id, result.map(Some)).await;
+                }
+                ClientRequest::CreatePrAgent {
+                    req_id,
+                    project,
+                    name,
+                    kind,
+                    model,
+                    effort,
+                    auto_title,
+                    pr_url,
+                    head,
+                } => {
+                    let result = daemon
+                        .create_pr_agent(CreatePrAgentSpec {
+                            project: project.clone(),
+                            name,
+                            kind,
+                            model,
+                            effort,
+                            auto_title,
+                            pr_url: pr_url.clone(),
+                            head,
+                        })
+                        .await;
+                    match &result {
+                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                            req_id,
+                            agent = %agent,
+                            kind = kind.as_str(),
+                            project = %project,
+                            pr_url = %pr_url,
+                            launch_mode = "pull_request",
+                            "agent session spawned"
+                        ),
+                        Err(error) => tracing::warn!(
+                            req_id,
+                            error = %error,
+                            kind = kind.as_str(),
+                            project = %project,
+                            pr_url = %pr_url,
+                            launch_mode = "pull_request",
+                            "agent session spawn failed"
+                        ),
+                        Ok(_) => unreachable!("CreatePrAgent returned a non-agent id"),
                     }
                     reply(&out_tx, req_id, result.map(Some)).await;
                 }
@@ -404,40 +437,57 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     cols,
                     rows,
                 } => {
-                    // Deliberately inline: an Attach for one of these
-                    // sessions is then ordered after it instead of racing it
-                    // (two concurrent ensure_session calls for the same sref
-                    // would double-spawn). Spawns are forkpty-fast; the
-                    // children boot in the background.
+                    // Returns at once: the sweep boots the worktree's dead
+                    // sessions on its own task, staggered, skipping the one
+                    // the Attach above already spawned. Racing that Attach is
+                    // safe — ensure_session's spawn gate makes the
+                    // check-and-spawn atomic, so neither can double-fork.
                     daemon.prewarm_worktree_sessions(&worktree, cols, rows);
                 }
                 ClientRequest::RenameAgent { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_agent(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_agent(&id, &name)).await;
                 }
                 ClientRequest::AutoRenameAgent { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.auto_rename_agent(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.auto_rename_agent(&id, &name)).await;
                 }
                 ClientRequest::MoveAgent {
                     req_id,
                     id,
                     worktree,
                 } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.move_agent(&id, &worktree).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.move_agent(&id, &worktree)).await;
+                }
+                ClientRequest::SpawnSiblingAgent {
+                    req_id,
+                    id,
+                    kind,
+                    starting_prompt,
+                } => {
+                    // Logged by mode only — never the prompt text.
+                    let result = daemon
+                        .spawn_sibling_agent(&id, kind, &starting_prompt)
+                        .await;
+                    match &result {
+                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                            req_id,
+                            agent = %agent,
+                            spawned_by = %id,
+                            launch_mode = "sibling",
+                            "agent session spawned"
+                        ),
+                        Err(error) => tracing::warn!(
+                            req_id,
+                            error = %error,
+                            spawned_by = %id,
+                            launch_mode = "sibling",
+                            "agent session spawn failed"
+                        ),
+                        Ok(_) => unreachable!("SpawnSiblingAgent returned a non-agent id"),
+                    }
+                    reply(&out_tx, req_id, result.map(Some)).await;
+                }
+                ClientRequest::OpenFiles { req_id, id, paths } => {
+                    reply_done(&out_tx, req_id, daemon.open_files(&id, paths)).await;
                 }
                 ClientRequest::EnterWorktree {
                     req_id,
@@ -459,35 +509,30 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let _ = out_tx.send(ev).await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.archive_agent(&id)).await;
                 }
                 ClientRequest::UnarchiveAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.unarchive_agent(&id).map(|_| None)).await;
-                }
-                ClientRequest::SetAgentPinned { req_id, id, pinned } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_agent_pinned(&id, pinned).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.unarchive_agent(&id)).await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.delete_agent(&id)).await;
                 }
                 ClientRequest::RestartAgent { req_id, id } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.restart_agent(&id).await.map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.restart_agent(&id).await).await;
                 }
                 ClientRequest::AttachCloudAgent { req_id, id } => {
-                    reply(
+                    reply_done(&out_tx, req_id, daemon.attach_cloud_agent(&id).await).await;
+                }
+                ClientRequest::SendCloudMessage {
+                    req_id,
+                    id,
+                    message,
+                } => {
+                    tracing::info!(agent = %id, bytes = message.len(), "send to cloud session");
+                    reply_done(
                         &out_tx,
                         req_id,
-                        daemon.attach_cloud_agent(&id).await.map(|_| None),
+                        daemon.send_cloud_message(&id, &message).await,
                     )
                     .await;
                 }
@@ -516,10 +561,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::UpdateLink { req_id, id, url } => {
-                    reply(&out_tx, req_id, daemon.update_link(&id, &url).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.update_link(&id, &url)).await;
                 }
                 ClientRequest::DeleteLink { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.delete_link(&id)).await;
                 }
                 ClientRequest::CreateTask { req_id, spec } => {
                     reply(&out_tx, req_id, daemon.create_task(spec).map(Some)).await;
@@ -554,15 +599,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     });
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_terminal(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_terminal(&id, &name)).await;
                 }
                 ClientRequest::CloseTerminal { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.close_terminal(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.close_terminal(&id)).await;
                 }
             }
         }
@@ -579,101 +619,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     result
 }
 
-/// Forward live PTY output/exit to one client, skipping bytes the attach
-/// replay already delivered. On broadcast lag, resync with a fresh
-/// Scrollback (the client resets its parser on every Scrollback frame).
-async fn forward_pty(
-    session: Arc<crate::pty::PtySession>,
-    sref: SessionRef,
-    mut rx: tokio::sync::broadcast::Receiver<PtyEvent>,
-    out_tx: mpsc::Sender<ServerEvent>,
-    mut min_seq: u64,
-) {
-    loop {
-        match rx.recv().await {
-            Ok(PtyEvent::Output { seq, data }) => {
-                let end = seq + data.len() as u64;
-                if end <= min_seq {
-                    continue; // fully covered by the replay
-                }
-                let skip = min_seq.saturating_sub(seq) as usize;
-                let payload = if skip > 0 {
-                    data[skip..].to_vec()
-                } else {
-                    data
-                };
-                let send_seq = seq + skip as u64;
-                min_seq = end;
-                if out_tx
-                    .send(ServerEvent::Output {
-                        session: sref.clone(),
-                        seq: send_seq,
-                        data: payload,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Ok(PtyEvent::Exited { exit_code }) => {
-                let _ = out_tx
-                    .send(ServerEvent::SessionExited {
-                        session: sref.clone(),
-                        exit_code,
-                    })
-                    .await;
-                break;
-            }
-            Ok(PtyEvent::KittyFlags { flags }) => {
-                if out_tx
-                    .send(ServerEvent::KittyFlags {
-                        session: sref.clone(),
-                        flags,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            // Daemon-side only: the progress edge drives the status machine
-            // and reaches clients as a StatusChanged, not as session output;
-            // the cloud sightings reach them as the row's own upsert.
-            Ok(
-                PtyEvent::Progress { .. }
-                | PtyEvent::CloudSession { .. }
-                | PtyEvent::CloudAttachRejected,
-            ) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Catch up from the ring. If the missed bytes are still
-                // retained, send them as a plain Output continuation so the
-                // client keeps its parser state; only when the gap has fallen
-                // off the ring do we force a full replay (parser reset —
-                // expensive on the client, so avoid it when possible).
-                let wanted = min_seq;
-                let (base_seq, data) = session.snapshot(Some(wanted));
-                min_seq = base_seq + data.len() as u64;
-                let ev = if base_seq == wanted {
-                    ServerEvent::Output {
-                        session: sref.clone(),
-                        seq: base_seq,
-                        data,
-                    }
-                } else {
-                    ServerEvent::Scrollback {
-                        session: sref.clone(),
-                        base_seq,
-                        data,
-                    }
-                };
-                if out_tx.send(ev).await.is_err() {
-                    break;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
-    }
+/// [`reply`] for the requests that create nothing: success is a bare Ack.
+async fn reply_done(out_tx: &mpsc::Sender<ServerEvent>, req_id: u64, result: anyhow::Result<()>) {
+    reply(out_tx, req_id, result.map(|_| None)).await
 }
 
 async fn reply(
