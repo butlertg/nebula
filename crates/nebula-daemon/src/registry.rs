@@ -3,18 +3,21 @@
 
 use crate::git;
 use crate::hooks::{self, HookEnv};
-use crate::pty::{PtyEvent, PtySession, SpawnSpec};
+use crate::pty::{PtyEvent, PtySession, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
+use crate::worktree_hooks::{self, HookContext, WorktreeHook};
 use anyhow::{bail, Context, Result};
+use nebula_core::env;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Project,
-    ProjectId, ServerEvent, SessionRef, Task, TaskId, TaskSpec, TaskTarget, TerminalId,
-    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
+    PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, Task, TaskId, TaskSpec, TaskTarget,
+    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
     MAX_TASK_ITERATIONS,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -28,9 +31,51 @@ const PREWARM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 /// `PREWARM_MAX_AGE - PREWARM_RECYCLE_AGE`, so a slot they still care about
 /// is always refreshed before the reaper can empty it.
 const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
+/// Gap between the boots of a worktree prewarm sweep. A worktree with five
+/// agents must not fork five agent CLIs at once: they would all contend for
+/// the CPU with the one session the user is actually waiting to see, which
+/// is the whole reason the sweep exists. Nothing is watching these, so
+/// warming them slowly costs the user nothing.
+const PREWARM_STAGGER: Duration = Duration::from_millis(1500);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+/// How often a Cloud mirror re-teleports to pick up the session's newer
+/// turns. `claude --teleport` re-fetches the transcript and re-checks-out
+/// the branch each time, so this trades freshness against a git checkout
+/// and a CLI boot per tick.
+const CLOUD_MIRROR_REFRESH: Duration = Duration::from_secs(45);
+/// Floor for the `NEBULA_CLOUD_MIRROR_SECS` override. A teleport is a git
+/// checkout plus a CLI boot; below this the row would spend its life
+/// respawning.
+const CLOUD_MIRROR_MIN: Duration = Duration::from_secs(2);
+/// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
+/// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
+/// terminal has. The CLI probe and the spawn wrapper share it so they can
+/// never disagree about what "on the user's PATH" means.
+const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
+/// Cap on one CLI probe. A heavy rc file costs ~1s; a hung one must not
+/// stall a create forever, so on timeout the CLI is assumed present and
+/// the spawn itself gets to report.
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Mirror cadence, `NEBULA_CLOUD_MIRROR_SECS` overriding the default (and
+/// `0` disabling the follow entirely — the pane is then only refreshed by
+/// hand, from the row's menu). Read once: this is a daemon-wide knob, not
+/// something to re-probe per tick.
+fn cloud_mirror_refresh() -> Option<Duration> {
+    static CADENCE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *CADENCE.get_or_init(|| {
+        match std::env::var(env::CLOUD_MIRROR_SECS)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs).max(CLOUD_MIRROR_MIN)),
+            None => Some(CLOUD_MIRROR_REFRESH),
+        }
+    })
+}
 
 /// How long a freshly spawned agent CLI is given to draw its input box
 /// before a task's first prompt is pasted at it. The CLIs boot a full TUI;
@@ -79,46 +124,6 @@ struct LoopState {
     last_progress_at: i64,
 }
 
-/// The transient, per-launch half of a spawn — everything that is not a
-/// persisted `Agent` field. Grouped rather than passed as three more
-/// positional arguments, all of which would be `None`/`false` at most call
-/// sites.
-#[derive(Default)]
-struct SpawnOpts<'a> {
-    /// Makes this a Claude Cloud launch (initial dispatch, or an
-    /// attach/teleport of the session it created).
-    cloud: Option<CloudLaunch<'a>>,
-    /// A first turn the CLI submits on its own (the relocation notice a
-    /// `nebula worktree` respawn opens with).
-    initial_prompt: Option<&'a str>,
-    /// Launch with the CLI's skip-permissions flag because nothing is
-    /// watching to answer a prompt (a task marked unattended).
-    unattended: bool,
-}
-
-/// Argv-shaping flags that aren't properties of the Agent row.
-#[derive(Debug, Clone, Copy, Default)]
-struct LaunchFlags {
-    /// Append nebula's worktree guidance to Claude's system prompt.
-    guidance: bool,
-    /// Skip permission prompts: `--dangerously-skip-permissions` for Claude,
-    /// which is the only kind that doesn't already skip them.
-    unattended: bool,
-}
-
-impl LaunchFlags {
-    /// A session a person is sitting in front of: guidance on, permissions
-    /// enforced. Production builds always spell the flags out at the one
-    /// call site that has them; this is the shorthand the argv tests use.
-    #[cfg(test)]
-    fn interactive() -> Self {
-        Self {
-            guidance: true,
-            unattended: false,
-        }
-    }
-}
-
 pub(crate) struct CreateAgentSpec {
     pub worktree: WorktreeId,
     pub name: String,
@@ -127,6 +132,9 @@ pub(crate) struct CreateAgentSpec {
     pub effort: Option<String>,
     pub auto_title: bool,
     pub cloud_prompt: Option<String>,
+    /// The CLI's positional first prompt (an AGENT PRESET launch). Request-only.
+    pub starting_prompt: Option<String>,
+    pub pr_url: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -147,7 +155,7 @@ struct PrewarmEntry {
 }
 
 /// Wall-clock epoch ms, matching the store's `status_changed_at` stamps.
-fn epoch_ms() -> i64 {
+pub(crate) fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -163,6 +171,11 @@ pub struct Daemon {
     pub store: Arc<Store>,
     /// Entity/status deltas fanned out to every subscribed client.
     pub events: broadcast::Sender<ServerEvent>,
+    /// Every session the registry installs — a spawn, a respawn, a prewarm
+    /// adoption — by ref, the moment it is in `sessions`. A client's forward
+    /// task (`attach.rs`) listens so a kill-and-respawn behind an attached
+    /// pane rebinds it to the new PTY instead of leaving it on a dead one.
+    pub session_installs: broadcast::Sender<SessionRef>,
     pub shutdown: tokio_util::sync::CancellationToken,
     /// Serializes worktree create/delete with the background auto-sync so
     /// a checkout is never adopted twice while its row is mid-insert.
@@ -185,6 +198,11 @@ pub struct Daemon {
     /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
     /// can finish the re-home once the row exists.
     last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
+    /// Where each Claude agent's transcript (and beside it, the session
+    /// title `/rename` persists) lives, from its hook payloads. Read by
+    /// the CLAUDE TITLE SYNC (`session_title.rs`) when the PTY's window
+    /// title changes, which no hook reports.
+    pub(crate) transcripts: Mutex<HashMap<AgentId, crate::session_title::TranscriptRef>>,
     /// Agents that ran `nebula worktree` and are waiting for their turn to
     /// end: the row already sits under the target worktree while the PTY
     /// still runs in the old checkout. Drained by `complete_pending_move`
@@ -198,17 +216,38 @@ pub struct Daemon {
     /// lost. Keyed by the run's agent, since that is what the turn-end hook
     /// names.
     task_loops: Mutex<HashMap<AgentId, LoopState>>,
+    /// Set the first time `claude --cloud <id>` refuses to attach ("not
+    /// enabled for your account"). Live attach is a server-side rollout, so
+    /// once it has been refused every later re-entry teleports straight
+    /// away rather than flashing the same error again. Deliberately not
+    /// persisted: a fresh daemon re-probes, so the day the rollout lands
+    /// nebula picks it up without anyone clearing a flag.
+    cloud_attach_gated: AtomicBool,
+    /// Cloud rows currently being mirrored (periodic re-teleport). Keyed by
+    /// agent so a second follow request replaces rather than doubles up.
+    cloud_mirrors: Mutex<HashMap<AgentId, Arc<tokio_util::sync::CancellationToken>>>,
+    /// Serializes the check-and-spawn inside [`Daemon::ensure_session`].
+    /// Attach (the request loop) and the worktree prewarm sweep (its own
+    /// task) can both reach for the same dead session; without this they
+    /// would both miss the registry and fork two CLIs, orphaning one.
+    spawn_gate: Mutex<()>,
+    /// The worktree prewarm sweep currently running, so a newer one can
+    /// cancel it. Stepping through the Workspaces column fires a sweep per
+    /// row, and only the row the cursor rests on is worth warming.
+    prewarm_sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
     pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
+        let (session_installs, _) = broadcast::channel(64);
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             status_machines: Mutex::new(HashMap::new()),
             hook_env,
             store,
             events,
+            session_installs,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             prewarmed: Mutex::new(HashMap::new()),
@@ -216,8 +255,13 @@ impl Daemon {
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
+            transcripts: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
             task_loops: Mutex::new(HashMap::new()),
+            cloud_attach_gated: AtomicBool::new(false),
+            cloud_mirrors: Mutex::new(HashMap::new()),
+            spawn_gate: Mutex::new(()),
+            prewarm_sweep: Mutex::new(None),
         })
     }
 
@@ -333,13 +377,41 @@ impl Daemon {
         self.sessions.lock().unwrap().contains_key(sref)
     }
 
-    /// (session, child pid) for every live PTY — the metrics reading's input.
-    pub fn session_pids(&self) -> Vec<(SessionRef, u32)> {
+    /// (session, child pid, prewarm-pool home) for every live PTY — the
+    /// metrics reading's input. A pool spare has no agent row, so the only
+    /// way a client can name or place it is the home reported here.
+    pub fn session_pids(&self) -> Vec<(SessionRef, u32, Option<PrewarmInfo>)> {
+        // Snapshot the pool first and drop its lock: `prewarm_agent` holds
+        // the pool lock while it asks the sessions map, so the two are
+        // never held together here in the other order.
+        let prewarmed: HashMap<AgentId, PrewarmInfo> = self
+            .prewarmed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((worktree, kind), e)| {
+                (
+                    e.agent_id.clone(),
+                    PrewarmInfo {
+                        worktree: worktree.clone(),
+                        kind: *kind,
+                        model: e.model.clone(),
+                    },
+                )
+            })
+            .collect();
         self.sessions
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(sref, s)| s.child_pid.map(|pid| (sref.clone(), pid)))
+            .filter_map(|(sref, s)| {
+                let pid = s.child_pid?;
+                let prewarm = match sref {
+                    SessionRef::Agent(id) => prewarmed.get(id).cloned(),
+                    SessionRef::Terminal(_) => None,
+                };
+                Some((sref.clone(), pid, prewarm))
+            })
             .collect()
     }
 
@@ -403,10 +475,8 @@ impl Daemon {
     /// walked-away-from sessions cost. "In view" = the worktree holding any
     /// attached session; in-view sessions get their stamps refreshed
     /// instead, so the full timeout starts only when the user leaves.
-    /// Spared regardless of age: pinned agents (the user's "never kill
-    /// this" mark — a running schedule or background job is invisible to
-    /// the status machine), agents that are running or waiting on feedback,
-    /// terminals with a command running, and prewarm-pool sessions
+    /// Spared regardless of age: agents that are running or waiting on
+    /// feedback, terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
     /// attach or prewarm; agents resume their conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
@@ -445,16 +515,16 @@ impl Daemon {
                 continue;
             }
             let spared = match &sref {
+                // A task run is invisible to the status machine between its
+                // turns — Idle is exactly what it looks like while it waits
+                // for the next iteration — so the loop, not the status, is
+                // what says the session is still wanted.
+                SessionRef::Agent(id) if self.task_loops.lock().unwrap().contains_key(id) => true,
                 SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
-                    // Pinned = the user marked it worth keeping (schedules,
-                    // loops, long jobs the status can't see) — never reap.
-                    Some(agent) => {
-                        agent.pinned
-                            || matches!(
-                                agent.status,
-                                AgentStatus::Running | AgentStatus::NeedsFeedback
-                            )
-                    }
+                    Some(agent) => matches!(
+                        agent.status,
+                        AgentStatus::Running | AgentStatus::NeedsFeedback
+                    ),
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
                 },
@@ -524,7 +594,26 @@ impl Daemon {
     fn agent_entity(&self, id: &AgentId) -> Result<Agent> {
         let mut agent = self.store.get_agent(id)?.context("agent not found")?;
         agent.alive = self.is_alive(&SessionRef::Agent(id.clone()));
+        agent.cloud_mirroring = self.cloud_mirror_active(id);
         Ok(agent)
+    }
+
+    /// Push the agent's current row — liveness and mirror flags included —
+    /// to every subscriber. The tail of every mutation that changes how
+    /// the row renders; fails only when the row is gone.
+    fn broadcast_agent(&self, id: &AgentId) -> Result<()> {
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
+    /// [`Self::broadcast_agent`] for the best-effort sites — background
+    /// tasks and post-respawn refreshes — where a row deleted meanwhile is
+    /// not an error: nothing to show, so nothing to say.
+    pub(crate) fn try_broadcast_agent(&self, id: &AgentId) {
+        let _ = self.broadcast_agent(id);
     }
 
     fn terminal_entity(&self, id: &TerminalId) -> Result<TerminalTab> {
@@ -691,12 +780,7 @@ impl Daemon {
                 repo_path.display()
             );
         }
-        let name = name.unwrap_or_else(|| {
-            repo_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "project".into())
-        });
+        let name = name.unwrap_or_else(|| Project::folder_name(&repo_path));
         let project = Project {
             id: ProjectId::generate(),
             name,
@@ -720,7 +804,6 @@ impl Daemon {
                 is_main: entry.path == repo_path,
                 path: entry.path.clone(),
                 branch: entry.branch,
-                pinned: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -731,6 +814,25 @@ impl Daemon {
         Ok(EntityId::Project(project.id))
     }
 
+    /// Retitle a project's row. Cosmetic only — the checkout on disk is never
+    /// renamed, and every worktree under the project keeps its own path. An
+    /// empty name resets the row to the folder's name, which is the only way
+    /// back once a project has been renamed.
+    pub fn rename_project(self: &Arc<Self>, id: &ProjectId, name: &str) -> Result<()> {
+        let mut project = self.store.get_project(id)?.context("project not found")?;
+        let name = name.trim();
+        project.name = if name.is_empty() {
+            Project::folder_name(&project.repo_path)
+        } else {
+            name.to_string()
+        };
+        self.store.rename_project(id, &project.name)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Project(project),
+        });
+        Ok(())
+    }
+
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
@@ -739,58 +841,12 @@ impl Daemon {
             .filter(|w| &w.project_id == id)
             .map(|w| w.id)
             .collect();
-        for a in agents.iter().filter(|a| wt_ids.contains(&a.worktree_id)) {
-            self.kill_session(&SessionRef::Agent(a.id.clone()));
-        }
-        for t in terminals.iter().filter(|t| wt_ids.contains(&t.worktree_id)) {
-            self.kill_session(&SessionRef::Terminal(t.id.clone()));
-        }
-        self.kill_prewarmed_in(&wt_ids);
+        self.kill_sessions_in(&wt_ids, &agents, &terminals);
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Project(id.clone()),
         });
-        Ok(())
-    }
-
-    /// Move a project `delta` rows in the displayed list (clamped at the
-    /// edges). Sort orders are rewritten to the display index for every
-    /// project, which also normalizes legacy all-zero orders on first use.
-    pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
-        let (all_projects, _, _, _) = self.store.load_tree()?;
-        // Reorders happen within the project's workspace — the list clients
-        // actually see. Other workspaces' rows keep their sort orders; the
-        // rewrite below only renumbers this workspace's slice, which stays
-        // correctly interleaved because clients filter before ordering.
-        let workspace = all_projects
-            .iter()
-            .find(|p| &p.id == id)
-            .map(|p| p.workspace_id.clone());
-        let mut projects: Vec<Project> = all_projects
-            .into_iter()
-            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
-            .collect();
-        let Some(pos) = projects.iter().position(|p| &p.id == id) else {
-            bail!("project not found");
-        };
-        let target = (pos as i64 + delta).clamp(0, projects.len() as i64 - 1) as usize;
-        if target == pos {
-            return Ok(());
-        }
-        let moved = projects.remove(pos);
-        projects.insert(target, moved);
-        for (index, project) in projects.iter_mut().enumerate() {
-            let sort_order = index as i64;
-            if project.sort_order == sort_order {
-                continue;
-            }
-            project.sort_order = sort_order;
-            self.store.set_project_position(project)?;
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Project(project.clone()),
-            });
-        }
         Ok(())
     }
 
@@ -805,30 +861,98 @@ impl Daemon {
         if branch.trim().is_empty() {
             bail!("branch name is empty");
         }
-        let _ops = self.worktree_ops.lock().await;
+        let ops = self.worktree_ops.lock().await;
         let project = self
             .store
             .get_project(project_id)?
             .context("project not found")?;
-        let path = git::add_worktree(&project.repo_path, branch, base).await?;
+        // A base the caller named (`nebula worktree --base`) is resolved
+        // against the fetched origin — `main` means `origin/main`, never
+        // this checkout's local branch; every other new WORKTREE — `n` in
+        // the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's
+        // auto-created one — starts at the `worktree_base_branch` SETTING
+        // when one is set (`master`, resolved the same way), else at the
+        // fetched `origin/HEAD`; never at this checkout's HEAD.
+        let path = match base {
+            Some(base) => git::add_worktree_off_ref(&project.repo_path, branch, base).await?,
+            None => match crate::config::Config::load().worktree_base_branch() {
+                Some(configured) => {
+                    git::add_worktree_off_configured(&project.repo_path, branch, configured).await?
+                }
+                None => git::add_worktree_off_default(&project.repo_path, branch).await?,
+            },
+        };
+        let worktree = self.register_worktree(project_id, path, branch)?;
+        // The row is out; the WORKTREE HOOK runs still under the lock, so
+        // it is ordered with the operation it belongs to — a delete of
+        // this path waits for it, two hooks never overlap — and the Ack
+        // waits for it, so whatever it provisions is in place before
+        // anything is launched in the checkout. The hook timeout bounds
+        // what that holds the lock for.
+        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
+            .await;
+        drop(ops);
+        Ok(EntityId::Worktree(worktree.id))
+    }
+
+    /// The checkout every PR SESSION for pull request `number` runs in: the
+    /// PROJECT's worktree already on its head branch `head` (the ROOT
+    /// WORKTREE only when the branch is checked out there — git allows a
+    /// branch in one checkout at a time), or a new one under the WORKTREE
+    /// DIR with the branch fetched from `origin` (`git::add_pr_worktree`).
+    /// Serialized with the other worktree ops, so two PR SESSIONS launched
+    /// together get one checkout, not a race to create it.
+    pub(crate) async fn pr_worktree(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        number: u64,
+        head: &str,
+    ) -> Result<Worktree> {
+        let ops = self.worktree_ops.lock().await;
+        let project = self
+            .store
+            .get_project(project_id)?
+            .context("project not found")?;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        if let Some(existing) = worktrees
+            .into_iter()
+            .find(|w| &w.project_id == project_id && w.branch == head)
+        {
+            return Ok(existing);
+        }
+        let path = git::add_pr_worktree(&project.repo_path, number, head).await?;
+        let worktree = self.register_worktree(project_id, path, head)?;
+        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
+            .await;
+        drop(ops);
+        Ok(worktree)
+    }
+
+    /// Record a checkout git just made as a worktree row and tell every
+    /// client. Callers hold `worktree_ops`.
+    fn register_worktree(
+        &self,
+        project_id: &ProjectId,
+        path: PathBuf,
+        branch: &str,
+    ) -> Result<Worktree> {
         let worktree = Worktree {
             id: WorktreeId::generate(),
             project_id: project_id.clone(),
             path,
             branch: branch.to_string(),
             is_main: false,
-            pinned: false,
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Worktree(worktree.clone()),
         });
-        Ok(EntityId::Worktree(worktree.id))
+        Ok(worktree)
     }
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
-        let _ops = self.worktree_ops.lock().await;
+        let ops = self.worktree_ops.lock().await;
         let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
         if worktree.is_main {
             bail!("cannot delete the main checkout — remove the project instead");
@@ -840,29 +964,50 @@ impl Daemon {
 
         // Kill sessions living in this worktree.
         let (_, _, agents, terminals) = self.store.load_tree()?;
-        for a in agents.iter().filter(|a| &a.worktree_id == id) {
-            self.kill_session(&SessionRef::Agent(a.id.clone()));
-        }
-        for t in terminals.iter().filter(|t| &t.worktree_id == id) {
-            self.kill_session(&SessionRef::Terminal(t.id.clone()));
-        }
-        self.kill_prewarmed_in(std::slice::from_ref(id));
+        self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
 
         git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
         self.store.delete_worktree(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
         });
+        // The delete has happened as far as git and every client are
+        // concerned; the WORKTREE HOOK only releases what the checkout
+        // owned elsewhere, so it runs after, and its failure is a warning
+        // — never an Error for this request, which would put the rows
+        // back in the TUI. Still under the lock: a create of the same path
+        // waits until the hook has released what it is about to claim,
+        // and the hook's "still on disk" check sees the delete's result,
+        // not a recreate's.
+        self.run_worktree_hook(WorktreeHook::Delete, &project.repo_path, &worktree)
+            .await;
+        drop(ops);
         Ok(())
     }
 
-    pub fn set_worktree_pinned(self: &Arc<Self>, id: &WorktreeId, pinned: bool) -> Result<()> {
-        self.store.set_worktree_pinned(id, pinned)?;
-        let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Worktree(worktree),
+    /// Run the repository's WORKTREE HOOK for `hook`, if it configures
+    /// one, and turn anything it has to say into a client warning.
+    async fn run_worktree_hook(&self, hook: WorktreeHook, repo: &Path, worktree: &Worktree) {
+        let ctx = HookContext {
+            repo,
+            worktree: &worktree.path,
+            branch: &worktree.branch,
+            id: &worktree.id,
+        };
+        if let Err(e) = worktree_hooks::run(hook, ctx).await {
+            self.warn_clients(format!("{e:#}"));
+        }
+    }
+
+    /// Tell every client about something that went wrong after a request
+    /// had already succeeded. Rides `ServerEvent::Error` with no `req_id`,
+    /// which the TUI shows as a flash and ties to no pending intent.
+    fn warn_clients(&self, message: String) {
+        tracing::warn!("{message}");
+        self.broadcast(ServerEvent::Error {
+            req_id: None,
+            message,
         });
-        Ok(())
     }
 
     /// Reconcile a project's worktree rows with `git worktree list` so
@@ -931,7 +1076,6 @@ impl Daemon {
                 is_main: is_root(&entry.path),
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
-                pinned: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -972,27 +1116,31 @@ impl Daemon {
             effort,
             auto_title,
             cloud_prompt,
+            starting_prompt,
+            pr_url,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
                 bail!("cloud launch is only supported for Claude")
             }
             Some(prompt) => {
-                let prompt = prompt.trim().to_string();
-                if prompt.is_empty() {
-                    bail!("Claude Cloud needs a task");
-                }
-                if prompt.contains('\0') {
-                    bail!("Claude Cloud task cannot contain NUL bytes");
-                }
-                if prompt.len() > MAX_CLOUD_PROMPT_BYTES {
-                    bail!(
-                        "Claude Cloud task is too long (max {} KiB)",
-                        MAX_CLOUD_PROMPT_BYTES / 1024
-                    );
-                }
+                let prompt = validate_cloud_text(&prompt, "task")?;
                 Some(prompt)
             }
+            None => None,
+        };
+        let starting_prompt = match starting_prompt {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("a starting prompt is not supported for Claude Cloud")
+            }
+            Some(prompt) => Some(validate_starting_prompt(&prompt)?),
+            None => None,
+        };
+        let pr_url = match pr_url {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("PR launch context is not supported for Claude Cloud")
+            }
+            Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
         let worktree = self
@@ -1001,10 +1149,10 @@ impl Daemon {
             .context("worktree not found")?;
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
-        // name, so the create feels instant.
-        let adopted = cloud_prompt
-            .is_none()
-            .then(|| self.take_prewarmed(&worktree_id, kind, &model, &effort))
+        // name, so the create feels instant. A starting prompt rides the
+        // CLI's argv, and a spare already booted bare cannot be handed one.
+        let adopted = (cloud_prompt.is_none() && pr_url.is_none() && starting_prompt.is_none())
+            .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
             .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
@@ -1027,7 +1175,6 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind,
             model,
@@ -1037,20 +1184,21 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         self.store
-            .insert_agent_with_auto_title(&agent, auto_title)?;
+            .insert_agent_with_launch_context(&agent, auto_title, pr_url.as_deref())?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             let spawned = self.spawn_agent_session_with(
                 &agent,
                 &worktree,
-                80,
-                24,
-                SpawnOpts {
-                    cloud: cloud_prompt.as_deref().map(CloudLaunch::Create),
-                    ..SpawnOpts::default()
-                },
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                cloud_prompt.as_deref().map(CloudLaunch::Create),
+                starting_prompt.as_deref(),
+                false,
             );
             self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         }
@@ -1133,7 +1281,6 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind,
             model: model.clone(),
@@ -1143,8 +1290,10 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
-        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+        self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
         let replaced = self.prewarmed.lock().unwrap().insert(
             (worktree_id.clone(), kind),
@@ -1172,8 +1321,8 @@ impl Daemon {
         &self,
         worktree_id: &WorktreeId,
         kind: AgentKind,
-        model: &Option<String>,
-        effort: &Option<String>,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> Option<PrewarmEntry> {
         let entry = self
             .prewarmed
@@ -1183,22 +1332,31 @@ impl Daemon {
         if !self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
             return None;
         }
-        if entry.model != *model || entry.effort != *effort {
+        if entry.model.as_deref() != model || entry.effort.as_deref() != effort {
             self.kill_session(&SessionRef::Agent(entry.agent_id));
             return None;
         }
         Some(entry)
     }
 
-    /// Drop warm sessions that died or sat unclaimed past the max age
-    /// (runs on the daemon's periodic tick).
+    /// Drop warm sessions that died or sat unclaimed past the max age —
+    /// and, once `prewarm_agents` is switched off, every one of them: a
+    /// spare is a real CLI process the user can see (Claude's `/list-agents`
+    /// names it beside their own sessions), so the toggle takes it away on
+    /// the next sweep rather than leaving it to age out over 15 minutes.
+    /// Runs on the daemon's periodic tick.
     pub fn reap_prewarmed(&self) {
+        self.reap_prewarmed_with(&crate::config::Config::load());
+    }
+
+    fn reap_prewarmed_with(&self, config: &crate::config::Config) {
         let doomed: Vec<AgentId> = {
             let mut pool = self.prewarmed.lock().unwrap();
             let expired: Vec<_> = pool
                 .iter()
                 .filter(|(_, e)| {
-                    e.spawned_at.elapsed() > PREWARM_MAX_AGE
+                    !config.prewarm_agents
+                        || e.spawned_at.elapsed() > PREWARM_MAX_AGE
                         || !self.is_alive(&SessionRef::Agent(e.agent_id.clone()))
                 })
                 .map(|(k, _)| k.clone())
@@ -1213,6 +1371,30 @@ impl Daemon {
             tracing::debug!(agent = %id, "reaping prewarmed session");
             self.kill_session(&SessionRef::Agent(id));
         }
+    }
+
+    /// Kill every live agent and terminal PTY homed in these worktrees, and
+    /// the warm spares with them — the prelude to dropping their rows
+    /// (worktree delete, project remove).
+    fn kill_sessions_in(
+        &self,
+        worktree_ids: &[WorktreeId],
+        agents: &[Agent],
+        terminals: &[TerminalTab],
+    ) {
+        for a in agents
+            .iter()
+            .filter(|a| worktree_ids.contains(&a.worktree_id))
+        {
+            self.kill_session(&SessionRef::Agent(a.id.clone()));
+        }
+        for t in terminals
+            .iter()
+            .filter(|t| worktree_ids.contains(&t.worktree_id))
+        {
+            self.kill_session(&SessionRef::Terminal(t.id.clone()));
+        }
+        self.kill_prewarmed_in(worktree_ids);
     }
 
     /// Kill warm sessions homed in any of these worktrees (worktree delete,
@@ -1240,7 +1422,7 @@ impl Daemon {
     /// gets picked up quickly. Probe trouble (timeout, spawn error) fails
     /// open — a doomed warm spawn is still graceful.
     async fn cli_available(&self, kind: AgentKind) -> bool {
-        if std::env::var("NEBULA_AGENT_CMD").is_ok() {
+        if std::env::var(env::AGENT_CMD).is_ok() {
             return true; // test override is spawned verbatim
         }
         const OK_TTL: Duration = Duration::from_secs(3600);
@@ -1278,7 +1460,8 @@ impl Daemon {
         let check = format!("command -v '{}' >/dev/null 2>&1", kind.cli_program());
         let mut probe = tokio::process::Command::new(user_shell());
         probe
-            .args(["-l", "-i", "-c", &check])
+            .args(LOGIN_SHELL_ARGS)
+            .arg(&check)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1294,7 +1477,7 @@ impl Daemon {
                 Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
             });
         }
-        let status = tokio::time::timeout(Duration::from_secs(5), probe.status()).await;
+        let status = tokio::time::timeout(CLI_PROBE_TIMEOUT, probe.status()).await;
         match status {
             Ok(Ok(status)) => {
                 let ok = status.success();
@@ -1313,10 +1496,7 @@ impl Daemon {
             bail!("name is empty");
         }
         self.store.rename_agent(id, name.trim())?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
@@ -1337,10 +1517,7 @@ impl Daemon {
                 agent.name
             );
         }
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
@@ -1369,14 +1546,11 @@ impl Daemon {
         self.last_cwd.lock().unwrap().remove(id);
         self.store.set_agent_worktree(id, worktree_id)?;
         if was_alive {
-            if let Err(e) = self.spawn_agent_session(&agent, &target, 80, 24) {
+            if let Err(e) = self.spawn_agent_session(&agent, &target, DEFAULT_COLS, DEFAULT_ROWS) {
                 tracing::warn!(agent = %id, error = %e, "respawn after move failed");
             }
         }
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
@@ -1453,10 +1627,7 @@ impl Daemon {
                 .insert(id.clone(), target.clone());
         }
         self.store.set_agent_worktree(id, &target.id)?;
-        let entity = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(entity),
-        });
+        self.broadcast_agent(id)?;
         let outcome = if alive {
             EnterOutcome::Relocating
         } else {
@@ -1468,10 +1639,11 @@ impl Daemon {
     /// The turn an agent ran `nebula worktree` in has ended: make the
     /// process match its row. Kill it and respawn it resumed in the target,
     /// with a prompt naming the checkout it now runs in so the conversation
-    /// carries straight on (Claude takes that prompt as an argument; codex
-    /// and cursor resume silent and wait for the user). Gated on the
-    /// turn-end hooks — Stop, and the idle notification a Stop-less end
-    /// still fires — so a Bash hook from the same turn never triggers it.
+    /// carries straight on (Claude, codex and pi take that prompt as an
+    /// argument; cursor resumes silent and waits for the user — see
+    /// `relocation_prompt`). Gated on the turn-end hooks — Stop, and the
+    /// idle notification a Stop-less end still fires — so a Bash hook from
+    /// the same turn never triggers it.
     pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
         let turn_over = match event {
             HookEvent::Stop => true,
@@ -1501,24 +1673,19 @@ impl Daemon {
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
-        let prompt = relocation_prompt(&target);
+        let prompt = relocation_prompt(agent.kind, &target);
         if let Err(e) = self.spawn_agent_session_with(
             &agent,
             &target,
-            80,
-            24,
-            SpawnOpts {
-                initial_prompt: Some(&prompt),
-                ..SpawnOpts::default()
-            },
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            None,
+            prompt.as_deref(),
+            false,
         ) {
             tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
         }
-        if let Ok(entity) = self.agent_entity(id) {
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Agent(entity),
-            });
-        }
+        self.try_broadcast_agent(id);
     }
 
     /// Whether `id` is between `enter_worktree` and its respawn.
@@ -1533,10 +1700,7 @@ impl Daemon {
     /// interrupt a live conversation for nothing.
     fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.store.set_agent_worktree(id, worktree_id)?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
@@ -1677,28 +1841,13 @@ impl Daemon {
     pub fn archive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.store.set_agent_archived(id, true)?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.store.set_agent_archived(id, false)?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
-        Ok(())
-    }
-
-    pub fn set_agent_pinned(self: &Arc<Self>, id: &AgentId, pinned: bool) -> Result<()> {
-        self.store.set_agent_pinned(id, pinned)?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
+        self.broadcast_agent(id)?;
         Ok(())
     }
 
@@ -1708,10 +1857,7 @@ impl Daemon {
     /// already clear — re-attaching to a session you've read is free.
     pub fn mark_agent_seen(&self, id: &AgentId) -> Result<()> {
         if self.store.mark_agent_seen(id)? {
-            let agent = self.agent_entity(id)?;
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Agent(agent),
-            });
+            self.broadcast_agent(id)?;
         }
         Ok(())
     }
@@ -1736,7 +1882,14 @@ impl Daemon {
         // resume here: a plain restart would boot a bare CLI with no link
         // to the work. Re-enter the cloud session instead. Once a teleport
         // has produced a local session id, restarts resume that.
-        if agent.cloud_session_id.is_some() && agent.session_id.is_none() {
+        // A teleport leaves a local session id on the row, so `session_id`
+        // alone stops distinguishing "never entered the cloud session" from
+        // "mirroring it". While the mirror is live the row is still the
+        // cloud session's window: restart re-enters it rather than resuming
+        // whatever the last pull happened to snapshot.
+        if agent.cloud_session_id.is_some()
+            && (agent.session_id.is_none() || self.cloud_mirror_active(id))
+        {
             return self.attach_cloud_agent(id).await;
         }
         let worktree = self
@@ -1744,7 +1897,7 @@ impl Daemon {
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
         self.kill_session(&SessionRef::Agent(id.clone()));
-        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+        self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -1753,15 +1906,23 @@ impl Daemon {
         Ok(())
     }
 
-    /// Re-enter the Claude Cloud session a row launched. The live attach
-    /// (`claude --cloud <id>`) is tried first; on an account without that
-    /// rollout the CLI refuses and dies, and the fallback armed by the
-    /// spawn teleports the session into a local one instead (same branch
-    /// and transcript, minus the live link). Either CLI switches the
-    /// checkout to the cloud branch — and teleport refuses a dirty tree
-    /// outright — so a row still sitting in the main checkout is first
-    /// re-homed into a worktree of its own; the user's checkout is never
-    /// the one that gets switched.
+    /// Re-enter the Claude Cloud session a row launched, and keep the pane
+    /// current from there on.
+    ///
+    /// The live attach (`claude --cloud <id>`) is tried first, but only
+    /// until this daemon has seen it refused once: it is a server-side
+    /// rollout, so the second attempt on a gated account would just flash
+    /// the same red error at the user. After a refusal every re-entry goes
+    /// straight to `--teleport`, which fetches the session's transcript and
+    /// branch and renders it locally. Either CLI switches the checkout to
+    /// the cloud branch — and teleport refuses a dirty tree outright — so a
+    /// row still sitting in the main checkout is first re-homed into a
+    /// worktree of its own; the user's checkout is never the one that gets
+    /// switched.
+    ///
+    /// A teleport is a snapshot, not a live link, so the pane it produces is
+    /// registered as a *mirror*: [`Self::start_cloud_mirror`] re-teleports it
+    /// on a timer until the user types into it.
     pub async fn attach_cloud_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if agent.archived {
@@ -1770,44 +1931,283 @@ impl Daemon {
         let Some(cloud_id) = agent.cloud_session_id.clone() else {
             bail!("session was not launched in Claude Cloud");
         };
-        let mut worktree = self
-            .store
-            .get_worktree(&agent.worktree_id)?
-            .context("worktree not found")?;
-        if worktree.is_main {
-            let branch = cloud_worktree_branch(&cloud_id);
-            let EntityId::Worktree(target) = self
-                .create_worktree(&worktree.project_id, &branch, None)
-                .await?
-            else {
-                bail!("worktree create returned a non-worktree entity");
-            };
-            worktree = self
-                .store
-                .get_worktree(&target)?
-                .context("worktree not found")?;
-            // Same invalidation as a deliberate move: the remembered hook
-            // cwd points at the old checkout and would sync the row back.
-            self.last_cwd.lock().unwrap().remove(id);
-            self.store.set_agent_worktree(id, &target)?;
-            tracing::info!(agent = %id, branch, "cloud row re-homed into its own worktree");
-        }
+        let worktree = self.cloud_worktree_for(&agent, &cloud_id).await?;
         self.kill_session(&SessionRef::Agent(id.clone()));
+        let launch =
+            cloud_reentry_launch(&cloud_id, self.cloud_attach_gated.load(Ordering::Relaxed));
         self.spawn_agent_session_with(
             &agent,
             &worktree,
-            80,
-            24,
-            SpawnOpts {
-                cloud: Some(CloudLaunch::Attach(&cloud_id)),
-                ..SpawnOpts::default()
-            },
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            Some(launch),
+            None,
+            false,
         )?;
-        let entity = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(entity),
-        });
+        self.start_cloud_mirror(id.clone());
+        self.broadcast_agent(id)?;
         Ok(())
+    }
+
+    /// The checkout a Cloud row re-enters its session in. A row sitting in
+    /// the main checkout is re-homed into a `cloud-<id>` worktree first —
+    /// both the attach and the teleport check the cloud branch out where
+    /// they run, and the user's main checkout must never be that place.
+    async fn cloud_worktree_for(
+        self: &Arc<Self>,
+        agent: &Agent,
+        cloud_id: &str,
+    ) -> Result<Worktree> {
+        let worktree = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        if !worktree.is_main {
+            return Ok(worktree);
+        }
+        let branch = cloud_worktree_branch(cloud_id);
+        let EntityId::Worktree(target) = self
+            .create_worktree(&worktree.project_id, &branch, None)
+            .await?
+        else {
+            bail!("worktree create returned a non-worktree entity");
+        };
+        let moved = self
+            .store
+            .get_worktree(&target)?
+            .context("worktree not found")?;
+        // Same invalidation as a deliberate move: the remembered hook cwd
+        // points at the old checkout and would sync the row back.
+        self.last_cwd.lock().unwrap().remove(&agent.id);
+        self.store.set_agent_worktree(&agent.id, &target)?;
+        tracing::info!(agent = %agent.id, branch, "cloud row re-homed into its own worktree");
+        Ok(moved)
+    }
+
+    /// Follow a Cloud row's session: re-teleport its pane every
+    /// [`CLOUD_MIRROR_REFRESH`] so turns the cloud agent has taken since the
+    /// last pull show up without anyone opening a browser.
+    ///
+    /// The mirror stops for good the moment the pane is typed into. A
+    /// teleport is a full kill-and-respawn of the local CLI, so refreshing
+    /// under someone mid-sentence would eat their turn — the first keystroke
+    /// is the handover: from then on the pane is an ordinary local session
+    /// that happens to have started from a cloud transcript.
+    fn start_cloud_mirror(self: &Arc<Self>, id: AgentId) {
+        let Some(cadence) = cloud_mirror_refresh() else {
+            return;
+        };
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        if let Some(previous) = self
+            .cloud_mirrors
+            .lock()
+            .unwrap()
+            .insert(id.clone(), token.clone())
+        {
+            previous.cancel();
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(cadence) => {}
+                }
+                match daemon.refresh_cloud_mirror(&id).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::warn!(agent = %id, error = %e, "cloud mirror refresh failed");
+                        break;
+                    }
+                }
+            }
+            // Only clear the slot if it is still ours: a newer mirror may
+            // have replaced (and cancelled) this one already.
+            let ours = {
+                let mut mirrors = daemon.cloud_mirrors.lock().unwrap();
+                let ours = mirrors.get(&id).is_some_and(|t| Arc::ptr_eq(t, &token));
+                if ours {
+                    mirrors.remove(&id);
+                }
+                ours
+            };
+            // The row wears a "following" badge while this task runs, so
+            // its end is news: re-broadcast so the badge goes back to a
+            // plain `cloud` instead of promising refreshes nobody is doing.
+            if ours && !daemon.shutdown.is_cancelled() {
+                daemon.try_broadcast_agent(&id);
+            }
+        });
+    }
+
+    /// Cancel a row's mirror, if it has one. Called whenever the row is
+    /// respawned as something other than a cloud re-entry — a plain restart,
+    /// an archive, a delete — so a pending tick cannot teleport over it.
+    fn stop_cloud_mirror(&self, id: &AgentId) {
+        if let Some(token) = self.cloud_mirrors.lock().unwrap().remove(id) {
+            token.cancel();
+        }
+    }
+
+    pub fn cloud_mirror_active(&self, id: &AgentId) -> bool {
+        self.cloud_mirrors.lock().unwrap().contains_key(id)
+    }
+
+    /// One mirror tick. `Ok(false)` means stop following: the row was typed
+    /// into, archived, deleted, or lost its cloud session id.
+    async fn refresh_cloud_mirror(self: &Arc<Self>, id: &AgentId) -> Result<bool> {
+        let Some(agent) = self.store.get_agent(id)? else {
+            return Ok(false);
+        };
+        if agent.archived {
+            return Ok(false);
+        }
+        let Some(cloud_id) = agent.cloud_session_id.clone() else {
+            return Ok(false);
+        };
+        let sref = SessionRef::Agent(id.clone());
+        let live = self.sessions.lock().unwrap().get(&sref).cloned();
+        match live {
+            Some(session) if session.input_seen() => {
+                tracing::info!(agent = %id, "cloud mirror adopted — the pane has been typed into");
+                return Ok(false);
+            }
+            Some(_) => {}
+            // The pane this mirror last spawned is gone. Either the idle
+            // reaper took it — nobody has looked at this row in a long
+            // time, and respawning it every tick would make cloud rows the
+            // one kind of session that can never be reaped — or the
+            // teleport itself died, in which case retrying it forever is
+            // the wrong answer too. Stop; opening the row re-enters the
+            // session and starts a fresh mirror.
+            None => {
+                tracing::info!(agent = %id, "cloud mirror stopping — its pane is gone");
+                return Ok(false);
+            }
+        }
+        let worktree = self.cloud_worktree_for(&agent, &cloud_id).await?;
+        self.kill_session(&sref);
+        self.spawn_agent_session_with(
+            &agent,
+            &worktree,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            Some(CloudLaunch::Teleport(&cloud_id)),
+            None,
+            false,
+        )?;
+        self.try_broadcast_agent(id);
+        Ok(true)
+    }
+
+    /// Queue a message on a Cloud session without leaving nebula.
+    /// `claude -p <msg> --cloud <id>` is fire-and-forget — the CLI prints
+    /// "Sent to cloud session." and returns, the reply only ever shows up in
+    /// the transcript — so the send is followed by an immediate mirror
+    /// refresh, and the answer lands in the pane on a later tick.
+    pub async fn send_cloud_message(self: &Arc<Self>, id: &AgentId, message: &str) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        let Some(cloud_id) = agent.cloud_session_id.clone() else {
+            bail!("session was not launched in Claude Cloud");
+        };
+        let message = validate_cloud_text(message, "message")?;
+        let worktree = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+
+        let cmd_override = std::env::var(env::AGENT_CMD).ok();
+        let (program, args) = match cmd_override.as_deref() {
+            Some(over) => (over.to_string(), Vec::new()),
+            None => login_shell_wrap(
+                &user_shell(),
+                "claude",
+                &[
+                    "-p".to_string(),
+                    message.clone(),
+                    format!("--cloud={cloud_id}"),
+                ],
+            ),
+        };
+        let output = tokio::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&worktree.path)
+            .output()
+            .await
+            .context("run claude -p --cloud")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim().lines().last().unwrap_or("").to_string();
+            bail!(
+                "claude could not reach the cloud session{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            );
+        }
+        tracing::info!(agent = %id, cloud_session = %cloud_id, bytes = message.len(), "message sent to cloud session");
+        // Pull the transcript now so the send is visibly acknowledged, and
+        // make sure the row keeps following from here even if it had been
+        // sitting dead since a create.
+        if !self.cloud_mirror_active(id) {
+            self.start_cloud_mirror(id.clone());
+        }
+        let _ = self.refresh_cloud_mirror(id).await;
+        Ok(())
+    }
+
+    /// A `claude --cloud <task>` create prints the new session's id and
+    /// exits — on this rollout it never stays attached. Left alone the row
+    /// is a dead pane whose last line is "Resume with: claude --teleport
+    /// …", which tells the user to go somewhere else to watch their own
+    /// agent work. So: capture the id off the output, wait for the create
+    /// to finish, and re-enter the session, which leaves the row mirroring
+    /// the cloud transcript.
+    ///
+    /// The id is persisted here as well as in `watch_for_exit` (both listen
+    /// to the same broadcast, in no fixed order) so the re-entry cannot read
+    /// a row the other task has not written yet. Both writes are the same
+    /// value, so whichever lands second is a no-op.
+    fn arm_cloud_follow(self: &Arc<Self>, id: AgentId, session: Arc<PtySession>) {
+        let daemon = self.clone();
+        let mut rx = session.events.subscribe();
+        tokio::spawn(async move {
+            let mut cloud_id: Option<String> = None;
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::CloudSession { id }) => cloud_id = Some(id),
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // No id means the create failed (bad task, no auth, offline).
+            // Its error text is the most useful thing the pane can show.
+            let Some(cloud_id) = cloud_id else { return };
+            if daemon.shutdown.is_cancelled() {
+                return;
+            }
+            match daemon.store.get_agent(&id) {
+                Ok(Some(agent)) if !agent.archived => {}
+                _ => return,
+            }
+            if let Err(e) = daemon
+                .store
+                .set_agent_cloud_session_id(&id, Some(&cloud_id))
+            {
+                tracing::warn!(agent = %id, error = %e, "cloud session id not persisted");
+                return;
+            }
+            tracing::info!(agent = %id, cloud_session = %cloud_id, "created — re-entering to mirror it");
+            if let Err(e) = daemon.attach_cloud_agent(&id).await {
+                tracing::warn!(agent = %id, error = %e, "cloud follow failed");
+            }
+        });
     }
 
     /// `claude --cloud <id>` on an account without the attach rollout
@@ -1842,6 +2242,9 @@ impl Daemon {
             if !rejected {
                 return;
             }
+            // Live attach is a server-side rollout, not a per-row accident:
+            // remember the refusal so no later re-entry shows it again.
+            daemon.cloud_attach_gated.store(true, Ordering::Relaxed);
             // Archived, deleted, or moved inside the window: leave it be.
             match daemon.store.get_agent(&agent.id) {
                 Ok(Some(current)) if !current.archived && current.worktree_id == worktree.id => {}
@@ -1853,17 +2256,13 @@ impl Daemon {
                 &worktree,
                 cols,
                 rows,
-                SpawnOpts {
-                    cloud: Some(CloudLaunch::Teleport(&cloud_id)),
-                    ..SpawnOpts::default()
-                },
+                Some(CloudLaunch::Teleport(&cloud_id)),
+                None,
+                false,
             ) {
                 Ok(_) => {
-                    if let Ok(entity) = daemon.agent_entity(&agent.id) {
-                        daemon.broadcast(ServerEvent::EntityUpserted {
-                            entity: Entity::Agent(entity),
-                        });
-                    }
+                    daemon.start_cloud_mirror(agent.id.clone());
+                    daemon.try_broadcast_agent(&agent.id);
                 }
                 Err(e) => tracing::warn!(agent = %agent.id, error = %e, "teleport spawn failed"),
             }
@@ -1893,7 +2292,7 @@ impl Daemon {
             alive: false,
         };
         self.store.insert_terminal(&terminal)?;
-        self.spawn_terminal_session(&terminal, &worktree, 80, 24)?;
+        self.spawn_terminal_session(&terminal, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         let mut broadcast_term = terminal.clone();
         broadcast_term.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -2313,16 +2712,14 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            // A task's session is invisible to the status machine between
-            // turns and must outlive `session_idle_timeout` — which is
-            // exactly what pinning already means (see `reap_idle_sessions`).
-            pinned: true,
             unseen: false,
             kind: task.kind,
             model: task.model.clone(),
             effort: task.effort.clone(),
             session_id: None,
             cloud_session_id: None,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
@@ -2333,12 +2730,11 @@ impl Daemon {
         let spawned = self.spawn_agent_session_with(
             &agent,
             &worktree,
-            80,
-            24,
-            SpawnOpts {
-                unattended: task.unattended,
-                ..SpawnOpts::default()
-            },
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            None,
+            None,
+            task.unattended,
         );
         self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         self.task_loops.lock().unwrap().insert(
@@ -2479,7 +2875,9 @@ impl Daemon {
             }
             // The flag does not cover this one at all: asking the user a
             // question is a tool, not a permission.
-            HookEvent::PreToolUse { tool_name } => tool_name.as_deref() == Some("AskUserQuestion"),
+            HookEvent::PreToolUse { tool_name, .. } => {
+                tool_name.as_deref() == Some("AskUserQuestion")
+            }
             _ => false,
         };
         if !asked {
@@ -2690,6 +3088,13 @@ impl Daemon {
         if let Some(s) = self.session(sref) {
             return Ok(s);
         }
+        // Hold the gate across the whole check-and-install: an Attach and the
+        // prewarm sweep racing the same dead session must produce one CLI,
+        // not two. Re-check under it — the winner installed while we waited.
+        let _gate = self.spawn_gate.lock().unwrap();
+        if let Some(s) = self.session(sref) {
+            return Ok(s);
+        }
         match sref {
             SessionRef::Agent(id) => {
                 let agent = self.store.get_agent(id)?.context("agent not found")?;
@@ -2739,10 +3144,32 @@ impl Daemon {
         if !crate::config::Config::load().prewarm_sessions {
             return;
         }
+        let daemon = self.clone();
+        let worktree_id = worktree_id.clone();
+        let handle = tokio::spawn(async move {
+            daemon.run_worktree_prewarm(&worktree_id, cols, rows).await;
+        });
+        // Supersede whatever sweep was still warming the worktree the user
+        // has now left; its remaining boots are wasted work.
+        if let Some(old) = self.prewarm_sweep.lock().unwrap().replace(handle) {
+            old.abort();
+        }
+    }
+
+    /// The sweep itself: boot the worktree's dead sessions one at a time,
+    /// [`PREWARM_STAGGER`] apart. Deliberately off the connection's request
+    /// loop — it used to run inline, which stalled that client's Input and
+    /// Attach frames for as long as the whole burst of forks took.
+    async fn run_worktree_prewarm(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        cols: u16,
+        rows: u16,
+    ) {
         let Ok((_, _, agents, terminals)) = self.store.load_tree() else {
             return;
         };
-        let srefs = agents
+        let srefs: Vec<SessionRef> = agents
             .iter()
             .filter(|a| &a.worktree_id == worktree_id && !a.archived)
             .map(|a| SessionRef::Agent(a.id.clone()))
@@ -2751,14 +3178,32 @@ impl Daemon {
                     .iter()
                     .filter(|t| &t.worktree_id == worktree_id)
                     .map(|t| SessionRef::Terminal(t.id.clone())),
-            );
+            )
+            .collect();
         for sref in srefs {
             // The prewarm doubles as a "user is looking here" signal for
             // the idle reaper, for alive sessions as much as fresh spawns.
             self.touch_session(&sref);
-            if let Err(e) = self.ensure_session(&sref, cols, rows) {
-                tracing::debug!(session = ?sref, error = %e, "session prewarm failed");
+            // Already warm — most importantly the one the user just
+            // attached to, which Attach spawned a moment ago.
+            if self.is_alive(&sref) {
+                continue;
             }
+            let daemon = self.clone();
+            let target = sref.clone();
+            // fork/exec blocks; keep it off the async worker threads.
+            let spawned = tokio::task::spawn_blocking(move || {
+                daemon.ensure_session(&target, cols, rows).map(|_| ())
+            })
+            .await;
+            match spawned {
+                Ok(Err(e)) => {
+                    tracing::debug!(session = ?sref, error = %e, "session prewarm failed")
+                }
+                Err(e) => tracing::debug!(session = ?sref, error = %e, "session prewarm panicked"),
+                Ok(Ok(())) => {}
+            }
+            tokio::time::sleep(PREWARM_STAGGER).await;
         }
     }
 
@@ -2769,30 +3214,47 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
-        self.spawn_agent_session_with(agent, worktree, cols, rows, SpawnOpts::default())
+        self.spawn_agent_session_with(agent, worktree, cols, rows, None, None, false)
     }
 
-    /// The general spawn. Everything in `opts` is intentionally transient:
-    /// later restarts/resumes follow the persisted Agent fields — a Cloud
-    /// row's `cloud_session_id` routes a restart back through
-    /// `attach_cloud_agent`, everything else takes the plain local-session
-    /// path, and a task's unattended launch is re-derived from its Task row.
+    /// The general spawn: `cloud` makes it a Claude Cloud launch (the
+    /// initial dispatch, or a later attach/teleport of the session it
+    /// created), `initial_prompt` a first turn the CLI submits on its own
+    /// (the relocation notice a `nebula worktree` respawn opens with, or the
+    /// prefix + task + postfix an AGENT PRESET launch composes), and
+    /// `unattended` launches with the CLI's skip-permissions flag because
+    /// nothing is watching to answer a prompt (a task marked unattended).
+    /// All three are intentionally transient: later restarts/resumes follow
+    /// the persisted Agent fields — a Cloud row's `cloud_session_id` routes a
+    /// restart back through `attach_cloud_agent`, everything else takes the
+    /// plain local-session path, and a task's unattended launch is
+    /// re-derived from its Task row.
+    // Eight, one past clippy's default — the same allow `agent_spawn_command_with`
+    // below already carries, and for the same reason: these are the spawn's
+    // inputs, and grouping them into a struct only moves the list.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_agent_session_with(
         self: &Arc<Self>,
         agent: &Agent,
         worktree: &Worktree,
         cols: u16,
         rows: u16,
-        opts: SpawnOpts<'_>,
+        cloud: Option<CloudLaunch<'_>>,
+        initial_prompt: Option<&str>,
+        unattended: bool,
     ) -> Result<Arc<PtySession>> {
-        let SpawnOpts {
-            cloud,
-            initial_prompt,
-            unattended,
-        } = opts;
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
+        // A spawn that isn't a cloud re-entry replaces the pane for good —
+        // a pending mirror tick must not teleport over it. (The re-entries
+        // re-arm their own mirror; a create arms one once it has an id.)
+        if !matches!(
+            cloud,
+            Some(CloudLaunch::Attach(_)) | Some(CloudLaunch::Teleport(_))
+        ) {
+            self.stop_cloud_mirror(&agent.id);
+        }
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
@@ -2808,13 +3270,46 @@ impl Daemon {
             // hook dialect has no context-injection channel.
             AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
                 .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
+            // Pi runs TypeScript extensions, not shell hooks: one managed
+            // extension in its global agent dir (loaded without the trust
+            // prompt a worktree-local `.pi/extensions/` would raise) serves
+            // every worktree.
+            AgentKind::Pi => hooks::pi_extension::install(&hooks::pi_extension::pi_agent_dir()),
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
         }
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
-        let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
+        let cmd_override = std::env::var(env::AGENT_CMD).ok();
+        // A PR SESSION's rule rides Claude's system prompt, or opens a
+        // Codex / Cursor cold spawn as its first prompt (see `pr_scope`).
+        // Rebuilt from the row's *current* worktree on every spawn, so a
+        // relocated PR SESSION is told where it now works.
+        let pr_url = if cloud.is_none() {
+            self.store.agent_pr_url(&agent.id)?
+        } else {
+            None
+        };
+        let root = match &pr_url {
+            Some(_) if !worktree.is_main => self
+                .store
+                .get_project(&worktree.project_id)?
+                .map(|p| p.repo_path),
+            _ => None,
+        };
+        let scope = pr_url.as_deref().map(|url| crate::pr_scope::PrScope {
+            url,
+            worktree: &worktree.path,
+            branch: &worktree.branch,
+            root: root.as_deref(),
+        });
+        let prompts = crate::pr_scope::launch_prompts(
+            agent.kind,
+            agent.session_id.is_some(),
+            scope.as_ref(),
+            initial_prompt,
+        );
         let (program, args, resumed) = match cloud {
             Some(launch) => claude_cloud_spawn_command(
                 launch,
@@ -2825,19 +3320,21 @@ impl Daemon {
             None => agent_spawn_command_with(
                 agent.kind,
                 agent.session_id.as_deref(),
+                Some(&worktree.path),
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
-                initial_prompt,
-                LaunchFlags {
-                    guidance: true,
-                    unattended,
-                },
+                prompts.initial.as_deref(),
+                prompts.system.as_deref(),
+                true,
+                unattended,
             ),
         };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
-        // path_helper) instead of the daemon's inherited-at-boot env.
+        // path_helper) instead of the daemon's inherited-at-boot env, and
+        // resolves the CLI the way a typed command would — an alias or
+        // function in those files wins over the binary on PATH.
         // Overrides (tests) stay verbatim.
         let (program, args) = if cmd_override.is_some() {
             (program, args)
@@ -2850,14 +3347,14 @@ impl Daemon {
             args,
             cwd: worktree.path.clone(),
             env: vec![
-                ("NEBULA_AGENT_ID".into(), agent.id.to_string()),
+                (env::AGENT_ID.into(), agent.id.to_string()),
                 (
-                    "NEBULA_API_URL".into(),
+                    env::API_URL.into(),
                     format!("http://127.0.0.1:{}", self.hook_env.port),
                 ),
-                ("NEBULA_API_TOKEN".into(), self.hook_env.token.clone()),
+                (env::API_TOKEN.into(), self.hook_env.token.clone()),
             ],
-            scrub_env: scrubbed_env_names(),
+            scrub_env: env::AGENT_SESSION_VARS,
             cols,
             rows,
         };
@@ -2869,8 +3366,13 @@ impl Daemon {
         }
         match cloud {
             // The create prints the session id and (on accounts without
-            // the attach rollout) exits at once: capture it off the output.
-            Some(CloudLaunch::Create(_)) => session.arm_cloud_scan(),
+            // the attach rollout) exits at once: capture it off the output,
+            // then re-enter the session it just made so the row shows the
+            // cloud agent's work instead of a "resume with" hint.
+            Some(CloudLaunch::Create(_)) => {
+                session.arm_cloud_scan();
+                self.arm_cloud_follow(agent.id.clone(), session.clone());
+            }
             Some(CloudLaunch::Attach(id)) => {
                 session.arm_cloud_scan();
                 self.arm_cloud_attach_fallback(
@@ -2890,7 +3392,8 @@ impl Daemon {
     /// A resumed session (`claude --resume` / `codex resume` /
     /// `cursor-agent --resume`) dies fast when
     /// it is stale/deleted — fall back to a fresh session instead of leaving
-    /// a dead pane.
+    /// a dead pane. (`pi --session-id` creates a missing id instead of
+    /// dying, so pi never takes this path; arming it is harmless.)
     fn arm_resume_fallback(
         self: &Arc<Self>,
         agent: Agent,
@@ -2951,7 +3454,7 @@ impl Daemon {
             args: vec!["-l".into()],
             cwd: worktree.path.clone(),
             env: vec![],
-            scrub_env: scrubbed_env_names(),
+            scrub_env: env::AGENT_SESSION_VARS,
             cols,
             rows,
         };
@@ -2967,6 +3470,8 @@ impl Daemon {
             .lock()
             .unwrap()
             .insert(session.sref.clone(), session.clone());
+        // After the insert: a forward task woken by this looks the ref up.
+        let _ = self.session_installs.send(session.sref.clone());
         self.watch_for_exit(session);
     }
 
@@ -3033,6 +3538,14 @@ impl Daemon {
                             daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
                         }
                     }
+                    // The window title carries Claude's session name, and
+                    // `/rename` fires no hook — this is the cue to read the
+                    // title it persisted (see `session_title`).
+                    Ok(PtyEvent::Title { title }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            daemon.on_pty_title(id, &title);
+                        }
+                    }
                     // The Cloud session this row launched, read off the
                     // `claude --cloud` output. Persisted at once — the child
                     // is typically gone within milliseconds of printing it —
@@ -3043,11 +3556,7 @@ impl Daemon {
                             match daemon.store.set_agent_cloud_session_id(id, Some(&cloud_id)) {
                                 Ok(()) => {
                                     tracing::info!(agent = %id, cloud_session = %cloud_id, "cloud session id captured");
-                                    if let Ok(agent) = daemon.agent_entity(id) {
-                                        daemon.broadcast(ServerEvent::EntityUpserted {
-                                            entity: Entity::Agent(agent),
-                                        });
-                                    }
+                                    daemon.try_broadcast_agent(id);
                                 }
                                 Err(e) => {
                                     tracing::warn!(agent = %id, error = %e, "cloud session id not persisted")
@@ -3078,18 +3587,34 @@ impl Daemon {
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
-/// cursor always get their skip-permissions flag (`--yolo` / `--force`),
-/// appended after the resume args — same convention as Mission Control.
+/// `codex resume <sid> --cd <cwd>` (subcommand, so resume args must lead;
+/// the `--cd` because codex reopens a resumed session in the directory its
+/// transcript recorded — or asks which to use — unless told one, and a
+/// relocated session must land in its new worktree, not the old checkout);
+/// pi takes `pi --session-id <sid>`, which resumes the id where it exists
+/// and creates it where it doesn't (a relocated session's new cwd). `cwd`
+/// is the checkout every local spawn boots in, and None for a Cloud launch,
+/// which has no local one. Codex and cursor always get their
+/// skip-permissions flag (`--yolo` / `--force`), appended after the resume
+/// args — same convention as Mission Control; pi has no permission gate to
+/// skip.
 /// Model/effort choices follow: `claude --model m --effort e`,
-/// `codex --model m -c model_reasoning_effort=e` (cursor has neither knob).
-/// Claude then gets nebula's worktree guidance appended to its system
-/// prompt, and an `initial_prompt` — the relocation notice a `nebula
-/// worktree` respawn opens with — goes last, as Claude's positional prompt
-/// (codex and cursor take none; their resumes wait for the user).
+/// `codex -m m -c model_reasoning_effort=e`, `pi --model m --thinking e`,
+/// and for cursor one flat id
+/// joined from the two — `cursor-agent --model m-e` (`--model m` when
+/// effort is None; the CLI's catalogue bakes the effort into the id and
+/// rejects the `m[effort=e]` form its `--help` advertises).
+/// Claude and pi then get nebula's worktree guidance appended to the system
+/// prompt, any persisted PR scope is composed into that same system-prompt
+/// argument, and an `initial_prompt` — the relocation notice a `nebula
+/// worktree` respawn opens with, or the starting prompt an AGENT PRESET
+/// launch composes — goes last, as the CLI's trailing positional prompt
+/// (`claude [prompt]`, `codex [PROMPT]`, `cursor-agent [prompt...]`,
+/// `pi [messages...]`).
 ///
-/// The plain shape, as every restart/resume spawns it: no initial prompt,
-/// guidance on. Tests assert against this; the daemon calls the full form.
+/// The plain shape, as every restart/resume spawns it: booted in
+/// `TEST_CWD`, no initial prompt, guidance on. Tests assert against this;
+/// the daemon calls the full form.
 #[cfg(test)]
 fn agent_spawn_command(
     kind: AgentKind,
@@ -3101,11 +3626,14 @@ fn agent_spawn_command(
     agent_spawn_command_with(
         kind,
         session_id,
+        Some(Path::new(TEST_CWD)),
         model,
         effort,
         cmd_override,
         None,
-        LaunchFlags::interactive(),
+        None,
+        true,
+        false,
     )
 }
 
@@ -3114,8 +3642,9 @@ fn agent_spawn_command(
 /// of Claude's own EnterWorktree tool, whose checkout lands under
 /// `<repo>/.claude/worktrees/` on a `worktree-*` branch — a layout the
 /// worktree list only adopts after the fact, and not where a nebula user
-/// keeps their worktrees. Claude only: codex and cursor have no
-/// system-prompt flag, and no EnterWorktree to steer away from.
+/// keeps their worktrees. Claude and pi (both take `--append-system-prompt`;
+/// pi has no EnterWorktree, but does run `git worktree add` on its own
+/// unless told otherwise): codex and cursor have no system-prompt flag.
 pub const CLAUDE_WORKTREE_GUIDANCE: &str = "[nebula] This session runs inside nebula, which \
 manages this project's git worktrees. When the user asks you to work in a worktree (\"do this in a \
 worktree\", \"in a new worktree\", \"branch this off in its own checkout\"), do not use the \
@@ -3128,16 +3657,25 @@ tell the user in one line that the session is moving into the worktree, and make
 calls or edits — you will be resumed inside the worktree with a prompt to carry on there. If the \
 command fails, report the error and carry on in the current checkout.";
 
-/// The prompt a relocated Claude session is resumed with: it names the
-/// checkout the process now runs in and asks for the work to pick back up
-/// there, so the user never has to type "continue".
-fn relocation_prompt(worktree: &Worktree) -> String {
-    format!(
-        "[nebula] This session now runs inside the worktree `{}` at {} — your working \
-         directory is that checkout. Continue the user's most recent request there.",
-        worktree.branch,
-        worktree.path.display()
-    )
+/// The prompt a relocated session is resumed with: it names the checkout
+/// the process now runs in and asks for the work to pick back up there, so
+/// the user never has to type "continue". Only for the CLIs verified to
+/// open a resumed session on a trailing prompt — `claude --resume <sid>
+/// "<prompt>"`, `codex resume <sid> [PROMPT]` (the positional its `--help`
+/// documents; submitted as the next turn, verified live on codex 0.153.4)
+/// and `pi --session-id <sid> "<prompt>"`. Whether `cursor-agent --resume
+/// <id> [prompt...]` submits one is not, so a relocated cursor session
+/// resumes silent and waits for the user.
+fn relocation_prompt(kind: AgentKind, worktree: &Worktree) -> Option<String> {
+    match kind {
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => Some(format!(
+            "[nebula] This session now runs inside the worktree `{}` at {} — your working \
+             directory is that checkout. Continue the user's most recent request there.",
+            worktree.branch,
+            worktree.path.display()
+        )),
+        AgentKind::Cursor => None,
+    }
 }
 
 /// Branch a `NewWorktree` task runs in. Derived from the task's name so a
@@ -3215,14 +3753,24 @@ fn mins_label(secs: u32) -> String {
     }
 }
 
+/// The checkout the test wrapper boots every spawn in.
+#[cfg(test)]
+const TEST_CWD: &str = "/nebula-test/p-feat";
+
+// Nine positional knobs are two over clippy's line; the callers are the two
+// thin wrappers above and the tests, so a builder would only add ceremony.
+#[allow(clippy::too_many_arguments)]
 fn agent_spawn_command_with(
     kind: AgentKind,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
     initial_prompt: Option<&str>,
-    flags: LaunchFlags,
+    additional_system_prompt: Option<&str>,
+    guidance: bool,
+    unattended: bool,
 ) -> (String, Vec<String>, bool) {
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -3235,8 +3783,15 @@ fn agent_spawn_command_with(
     let program = kind.cli_program().to_string();
     let (mut args, resumed) = match (kind, session_id) {
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
-        (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
+        (AgentKind::Codex, Some(sid)) => {
+            let mut args = vec!["resume".to_string(), sid.to_string()];
+            if let Some(cwd) = cwd {
+                args.extend(["--cd".to_string(), cwd.to_string_lossy().into_owned()]);
+            }
+            (args, true)
+        }
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
+        (AgentKind::Pi, Some(sid)) => (vec!["--session-id".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
     };
     // Codex and cursor always skip permission prompts (nebula has never
@@ -3247,40 +3802,111 @@ fn agent_spawn_command_with(
         AgentKind::Codex => args.push("--yolo".to_string()),
         AgentKind::Cursor => args.push("--force".to_string()),
         AgentKind::Claude => {
-            if flags.unattended {
+            // Codex and cursor always skip permission prompts; Claude only
+            // when the launch is explicitly unattended, where a prompt would
+            // stall the run forever with nobody there to see it.
+            if unattended {
                 args.push("--dangerously-skip-permissions".to_string());
             }
         }
+        AgentKind::Pi => {}
+    }
+    // Claude, codex and pi spell the model flag the same way, and it
+    // follows the skip-permissions flag (`codex --yolo --model …`). Cursor
+    // composes its own below: family and effort become one id.
+    if let (Some(m), AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) = (model, kind) {
+        args.extend(["--model".to_string(), m.to_string()]);
     }
     match kind {
         AgentKind::Claude => {
-            if let Some(m) = model {
-                args.extend(["--model".to_string(), m.to_string()]);
-            }
             if let Some(e) = effort {
                 args.extend(["--effort".to_string(), e.to_string()]);
             }
-            if flags.guidance {
-                args.extend([
-                    "--append-system-prompt".to_string(),
-                    CLAUDE_WORKTREE_GUIDANCE.to_string(),
-                ]);
+            push_system_prompt(&mut args, guidance, additional_system_prompt);
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
             }
+        }
+        AgentKind::Pi => {
+            // pi's reasoning knob is `--thinking <off|minimal|…|max>`.
+            if let Some(e) = effort {
+                args.extend(["--thinking".to_string(), e.to_string()]);
+            }
+            push_system_prompt(&mut args, guidance, additional_system_prompt);
+            // `pi [options] [--] [@files...] [messages...]` — trailing.
             if let Some(p) = initial_prompt {
                 args.push(p.to_string());
             }
         }
         AgentKind::Codex => {
-            if let Some(m) = model {
-                args.extend(["--model".to_string(), m.to_string()]);
-            }
             if let Some(e) = effort {
                 args.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
             }
+            // `codex [OPTIONS] [PROMPT]` — the trailing positional.
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
+            }
         }
-        AgentKind::Cursor => {}
+        AgentKind::Cursor => {
+            // `--model <family>-<effort>`: the TUI keeps the family and the
+            // effort suffix apart (`claude-opus-5` + `high`) and only sends
+            // an effort the family ships; an effort without a family has
+            // nothing to hang off and is dropped.
+            if let Some(m) = model {
+                let id = match effort {
+                    Some(e) => format!("{m}-{e}"),
+                    None => m.to_string(),
+                };
+                args.extend(["--model".to_string(), id]);
+            }
+            // `cursor-agent [options] [prompt...]` — the trailing positional.
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
+            }
+        }
     }
     (program, args, resumed)
+}
+
+/// One `--append-system-prompt` carrying nebula's guidance (worktree, spawn,
+/// then open) and whatever else the launch adds (the PR scope), for the CLIs
+/// that take the flag — Claude and pi.
+fn push_system_prompt(args: &mut Vec<String>, guidance: bool, additional: Option<&str>) {
+    let mut system_prompt = Vec::new();
+    if guidance {
+        system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
+        system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
+        system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
+    }
+    if let Some(prompt) = additional {
+        system_prompt.push(prompt);
+    }
+    if !system_prompt.is_empty() {
+        args.extend([
+            "--append-system-prompt".to_string(),
+            system_prompt.join("\n\n"),
+        ]);
+    }
+}
+
+/// Validate an AGENT PRESET's composed starting prompt before it becomes the
+/// CLI's positional argument. Same bounds as a cloud task — it crosses the
+/// same login-shell `-c` string and argv — with its own wording.
+fn validate_starting_prompt(raw: &str) -> Result<String> {
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        bail!("starting prompt is empty");
+    }
+    if text.contains('\0') {
+        bail!("starting prompt cannot contain NUL bytes");
+    }
+    if text.len() > MAX_CLOUD_PROMPT_BYTES {
+        bail!(
+            "starting prompt is too long (max {} KiB)",
+            MAX_CLOUD_PROMPT_BYTES / 1024
+        );
+    }
+    Ok(text)
 }
 
 /// How a Claude PTY enters the Cloud: dispatch a fresh task, attach live
@@ -3290,6 +3916,41 @@ enum CloudLaunch<'a> {
     Create(&'a str),
     Attach(&'a str),
     Teleport(&'a str),
+}
+
+/// How a Cloud row re-enters its session. The live attach is worth one
+/// try per daemon — it is a server-side rollout, so the answer can change
+/// between runs — but not a second, because a gated account answers with a
+/// red `not enabled for your account` in the user's pane every time.
+fn cloud_reentry_launch(cloud_id: &str, attach_gated: bool) -> CloudLaunch<'_> {
+    if attach_gated {
+        CloudLaunch::Teleport(cloud_id)
+    } else {
+        CloudLaunch::Attach(cloud_id)
+    }
+}
+
+/// Trim and bounds-check text handed to the Claude CLI as one argv item —
+/// a Cloud task on create, a message queued on an existing session. Both
+/// ride the login shell's `-c` string as well as Claude's argv: quoting
+/// stops injection, but a NUL would truncate the command and an unbounded
+/// string would blow the argv limit, so both are rejected here rather than
+/// at the shell.
+fn validate_cloud_text(raw: &str, what: &str) -> Result<String> {
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        bail!("Claude Cloud needs a {what}");
+    }
+    if text.contains('\0') {
+        bail!("Claude Cloud {what} cannot contain NUL bytes");
+    }
+    if text.len() > MAX_CLOUD_PROMPT_BYTES {
+        bail!(
+            "Claude Cloud {what} is too long (max {} KiB)",
+            MAX_CLOUD_PROMPT_BYTES / 1024
+        );
+    }
+    Ok(text)
 }
 
 /// Branch (and so directory) of the worktree a Cloud row is re-homed into
@@ -3322,13 +3983,14 @@ fn claude_cloud_spawn_command(
     let (program, mut args, resumed) = agent_spawn_command_with(
         AgentKind::Claude,
         None,
+        None,
         model,
         effort,
         cmd_override,
         None,
-        // Cloud launches carry no worktree guidance (the cloud runner owns
-        // the checkout) and never skip permissions locally.
-        LaunchFlags::default(),
+        None,
+        false,
+        false,
     );
     if cmd_override.is_none() {
         let flag = match launch {
@@ -3344,7 +4006,7 @@ fn claude_cloud_spawn_command(
 /// Normalize an agent-supplied title: control characters become spaces,
 /// whitespace collapses, and over-long titles are cut — models occasionally
 /// hand over a whole sentence no matter what the instruction says.
-fn sanitize_title(raw: &str) -> String {
+pub(crate) fn sanitize_title(raw: &str) -> String {
     const MAX_CHARS: usize = 60;
     let cleaned: String = raw
         .chars()
@@ -3388,7 +4050,7 @@ fn shell_has_children(session: &PtySession) -> bool {
 /// scheme-less value gets https://. Anything else — another scheme, or no
 /// host at all — is refused rather than stored: the TUI hands these to
 /// `open(1)`, and only http(s) may ever reach it.
-fn normalize_url(url: &str) -> Result<String> {
+pub(crate) fn normalize_url(url: &str) -> Result<String> {
     let url = url.trim();
     if url.is_empty() {
         bail!("link URL is empty");
@@ -3435,43 +4097,92 @@ fn cli_missing_message(kind: AgentKind) -> String {
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'exec …'`) so the child gets the user's real environment — ~/.zprofile
-/// and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps the child
-/// as the PTY's direct process (exit codes and signals pass through).
+/// 'unset …; export …; prog args'`) so the child gets the user's real
+/// environment — ~/.zprofile and ~/.zshrc on zsh — rather than the daemon's.
+///
+/// The command word goes in bare, so the shell resolves it the way a typed
+/// command line would: an alias or function from the rc files wins over the
+/// binary on PATH. That is where a work setup reroutes `claude` through a
+/// wrapper (another backend, another login), and the earlier `exec env …
+/// 'claude'` form skipped it — `env` looks the name up on PATH, and neither
+/// zsh nor bash expands the word after an `exec` either — so every session
+/// landed on the raw CLI. Without an `exec` the shell stays in charge of the
+/// launch: zsh execs a plain last command itself, so the agent is still the
+/// PTY's direct child there; bash, and any command that resolves to a
+/// function, run it as a job under the shell instead, in a process group of
+/// its own — which is why `PtySession::kill` sweeps the whole tree rather
+/// than one group.
+///
+/// The prelude restates what the pane is *after* those files have run:
+/// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
+/// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
+/// login-only profile that exports `NO_COLOR` reaches a session here and
+/// nowhere else (foot and Ghostty on Linux start non-login shells), and
+/// Claude Code takes it as "no colour": its whole UI in the default
+/// foreground while the TUI around it stays coloured (#37). The spawn sets
+/// the same three against the daemon's inherited environment; this covers
+/// the profile's.
 fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec");
-    for part in std::iter::once(program).chain(args.iter().map(String::as_str)) {
-        cmdline.push_str(" '");
-        cmdline.push_str(&part.replace('\'', "'\\''"));
-        cmdline.push('\'');
+    let mut cmdline = String::from("unset");
+    for name in env::PANE_COLOR_OVERRIDES {
+        cmdline.push(' ');
+        cmdline.push_str(name);
     }
-    (
-        shell.to_string(),
-        vec!["-l".into(), "-i".into(), "-c".into(), cmdline],
-    )
+    cmdline.push_str("; export TERM=");
+    cmdline.push_str(env::PANE_TERM);
+    cmdline.push_str(" COLORTERM=");
+    cmdline.push_str(env::PANE_COLORTERM);
+    cmdline.push_str("; ");
+    cmdline.push_str(&command_word(program));
+    for arg in args {
+        cmdline.push(' ');
+        cmdline.push_str(&shell_quote(arg));
+    }
+    let args = LOGIN_SHELL_ARGS
+        .iter()
+        .map(|s| s.to_string())
+        .chain([cmdline])
+        .collect();
+    (shell.to_string(), args)
 }
 
-/// Env vars that must never leak into plain terminals (and are re-set
-/// explicitly for agent PTYs).
-pub fn scrubbed_env_names() -> Vec<String> {
-    vec![
-        "NEBULA_AGENT_ID".into(),
-        "NEBULA_API_URL".into(),
-        "NEBULA_API_TOKEN".into(),
-    ]
+/// `program` as the command word of a shell line: bare when it is a plain
+/// name (letters, digits, `-`, `_`, `.`, `/`), since a quoted word is exempt
+/// from alias expansion in every shell; single-quoted otherwise.
+fn command_word(program: &str) -> String {
+    let plain = !program.is_empty()
+        && program
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
+    if plain {
+        program.to_string()
+    } else {
+        shell_quote(program)
+    }
+}
+
+/// Single-quote `arg` for a POSIX shell; the only escape needed is `'`.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Claude argv: `args`, then nebula's appended worktree guidance.
+    /// Claude argv: `args`, then nebula's appended guidance (worktree and
+    /// spawn, one `--append-system-prompt`).
     fn guided(args: &[&str]) -> Vec<String> {
         args.iter()
             .map(|s| s.to_string())
             .chain([
                 "--append-system-prompt".to_string(),
-                CLAUDE_WORKTREE_GUIDANCE.to_string(),
+                [
+                    CLAUDE_WORKTREE_GUIDANCE,
+                    crate::sibling::CLAUDE_SPAWN_GUIDANCE,
+                    crate::open_files::CLAUDE_OPEN_GUIDANCE,
+                ]
+                .join("\n\n"),
             ])
             .collect()
     }
@@ -3493,12 +4204,27 @@ mod tests {
             agent_spawn_command(AgentKind::Cursor, None, None, None, None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
         );
+        // Pi has no permission gate to skip and takes the same guidance as
+        // Claude (it has the system-prompt flag).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, None, None, None),
+            ("pi".into(), guided(&[]), false)
+        );
+        // Pi resumes by exact id — one that is missing is created, so a
+        // relocated session's new cwd never dies on a stale id.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None),
+            ("pi".into(), guided(&["--session-id", "sid-4"]), true)
+        );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
             ("claude".into(), guided(&["--resume", "sid-1"]), true)
         );
-        // Skip-permissions flags trail the resume args.
+        // Skip-permissions flags trail the resume args. A codex resume is
+        // told its checkout (`--cd`): without it codex reopens the session
+        // in the directory its transcript recorded, which for a relocated
+        // session is the old one.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, Some("sid-2"), None, None, None),
             (
@@ -3506,6 +4232,8 @@ mod tests {
                 vec![
                     "resume".to_string(),
                     "sid-2".to_string(),
+                    "--cd".to_string(),
+                    TEST_CWD.to_string(),
                     "--yolo".to_string()
                 ],
                 true
@@ -3570,6 +4298,20 @@ mod tests {
                 false
             )
         );
+        // Pi: `--model <pattern>` plus `--thinking <level>`, ahead of the
+        // guidance like Claude's.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, Some("sonnet"), Some("high"), None),
+            (
+                "pi".into(),
+                guided(&["--model", "sonnet", "--thinking", "high"]),
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, None, Some("off"), None),
+            ("pi".into(), guided(&["--thinking", "off"]), false)
+        );
         // Resume keeps the model/effort flags (a fallback fresh spawn needs
         // them, and the CLIs accept them alongside resume).
         assert_eq!(
@@ -3580,9 +4322,43 @@ mod tests {
                 true
             )
         );
-        // Cursor has no model/effort knobs — choices are ignored.
+        // Cursor joins family and effort into the CLI's one flat id; a
+        // family alone is passed bare, an effort alone has nothing to
+        // join and is dropped.
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, None, Some("m"), Some("e"), None),
+            agent_spawn_command(
+                AgentKind::Cursor,
+                None,
+                Some("claude-opus-5-thinking"),
+                Some("high"),
+                None
+            ),
+            (
+                "cursor-agent".into(),
+                vec![
+                    "--force".to_string(),
+                    "--model".to_string(),
+                    "claude-opus-5-thinking-high".to_string()
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, Some("sid"), Some("auto"), None, None),
+            (
+                "cursor-agent".into(),
+                vec![
+                    "--resume".to_string(),
+                    "sid".to_string(),
+                    "--force".to_string(),
+                    "--model".to_string(),
+                    "auto".to_string()
+                ],
+                true
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, None, None, Some("high"), None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
         );
         // Override still wins over everything.
@@ -3593,61 +4369,241 @@ mod tests {
     }
 
     #[test]
-    fn spawn_command_initial_prompt_is_claudes_positional_argument() {
+    fn spawn_command_initial_prompt_is_the_trailing_positional_argument() {
         // The relocation notice trails everything, guidance included.
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
             Some("sid"),
+            Some(Path::new(TEST_CWD)),
             Some("opus"),
             None,
             None,
             Some("carry on"),
-            LaunchFlags::interactive(),
+            None,
+            true,
+            false,
         );
         assert!(resumed);
         let mut expected = guided(&["--resume", "sid", "--model", "opus"]);
         expected.push("carry on".into());
         assert_eq!(args, expected);
-        // Codex and cursor take no such argument — their resumes stay plain.
+        // Codex and cursor take it as their trailing positional too.
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Codex,
                 Some("sid"),
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
                 Some("carry on"),
-                LaunchFlags::interactive()
+                None,
+                true,
+                false,
             )
             .1,
-            vec!["resume", "sid", "--yolo"]
+            vec!["resume", "sid", "--cd", TEST_CWD, "--yolo", "carry on"]
+        );
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Cursor,
+                Some("sid"),
+                Some(Path::new(TEST_CWD)),
+                None,
+                None,
+                None,
+                Some("carry on"),
+                None,
+                true,
+                false,
+            )
+            .1,
+            vec!["--resume", "sid", "--force", "carry on"]
+        );
+        // A fresh spawn with a starting prompt (an AGENT PRESET launch):
+        // model, effort and system prompt all precede it.
+        let mut expected = guided(&["--model", "opus", "--effort", "high"]);
+        expected.push("fix auth".into());
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Claude,
+                None,
+                Some(Path::new(TEST_CWD)),
+                Some("opus"),
+                Some("high"),
+                None,
+                Some("fix auth"),
+                None,
+                true,
+                false,
+            )
+            .1,
+            expected
+        );
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Codex,
+                None,
+                Some(Path::new(TEST_CWD)),
+                Some("gpt-5.5"),
+                Some("high"),
+                None,
+                Some("fix auth"),
+                None,
+                true,
+                false,
+            )
+            .1,
+            vec![
+                "--yolo",
+                "--model",
+                "gpt-5.5",
+                "-c",
+                "model_reasoning_effort=high",
+                "fix auth"
+            ]
         );
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Cursor,
                 None,
+                Some(Path::new(TEST_CWD)),
+                None,
+                None,
+                None,
+                Some("fix auth"),
+                None,
+                true,
+                false,
+            )
+            .1,
+            vec!["--force", "fix auth"]
+        );
+        // Pi: the prompt trails the resume id and the guidance, as pi's
+        // `[messages...]` positional.
+        let mut expected = guided(&["--session-id", "sid"]);
+        expected.push("carry on".into());
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Pi,
+                Some("sid"),
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
                 Some("carry on"),
-                LaunchFlags::interactive()
+                None,
+                true,
+                false,
             )
             .1,
-            vec!["--force"]
+            expected
         );
         // An override is verbatim: no guidance, no prompt.
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Claude,
                 None,
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 Some("/bin/sh -i"),
                 Some("carry on"),
-                LaunchFlags::interactive()
+                None,
+                true,
+                false,
             ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
+    }
+
+    /// The relocation notice reaches the CLIs whose resume submits a
+    /// trailing prompt — Claude, codex and pi — and names the checkout;
+    /// cursor's is unverified, so its relocated session reopens silent.
+    /// (Codex was gated out until #39: `codex resume <id> --yolo` sat at
+    /// Ready in the worktree until the user typed "continue".)
+    #[test]
+    fn relocation_prompt_reaches_every_kind_but_cursor() {
+        let feat = Worktree {
+            id: WorktreeId("feat".into()),
+            project_id: ProjectId("p".into()),
+            path: "/nebula-test/p-feat".into(),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 0,
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
+            let prompt = relocation_prompt(kind, &feat).unwrap_or_else(|| panic!("{kind:?}"));
+            assert!(prompt.contains("`feat`"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("/nebula-test/p-feat"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("Continue the user's most recent request"));
+        }
+        assert_eq!(relocation_prompt(AgentKind::Cursor, &feat), None);
+
+        // And the codex respawn it feeds: resumed, re-rooted in the
+        // worktree, and opening on the notice.
+        let notice = relocation_prompt(AgentKind::Codex, &feat).unwrap();
+        let (program, args, resumed) = agent_spawn_command_with(
+            AgentKind::Codex,
+            Some("sid"),
+            Some(&feat.path),
+            None,
+            None,
+            None,
+            Some(&notice),
+            None,
+            true,
+            false,
+        );
+        assert_eq!(program, "codex");
+        assert!(resumed);
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "sid",
+                "--cd",
+                "/nebula-test/p-feat",
+                "--yolo",
+                notice.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_command_keeps_pr_scope_and_url_in_claudes_system_prompt() {
+        let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
+        let pr_prompt = crate::pr_scope::rule(&crate::pr_scope::PrScope {
+            url: pr_url,
+            worktree: Path::new("/w/nebula-worktrees/fix"),
+            branch: "fix",
+            root: Some(Path::new("/w/nebula")),
+        });
+        let (_, args, resumed) = agent_spawn_command_with(
+            AgentKind::Claude,
+            Some("sid"),
+            Some(Path::new(TEST_CWD)),
+            None,
+            None,
+            None,
+            None,
+            Some(&pr_prompt),
+            true,
+            false,
+        );
+        assert!(resumed);
+        let prompts = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--append-system-prompt")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 1, "Claude gets one composed system prompt");
+        assert!(prompts[0].contains(CLAUDE_WORKTREE_GUIDANCE));
+        assert!(prompts[0].contains(crate::sibling::CLAUDE_SPAWN_GUIDANCE));
+        assert!(prompts[0].contains(crate::open_files::CLAUDE_OPEN_GUIDANCE));
+        assert!(prompts[0].contains("All work in this session must be scoped"));
+        assert!(prompts[0].contains(pr_url));
+        assert!(prompts[0].contains("/w/nebula-worktrees/fix"));
     }
 
     #[test]
@@ -3732,7 +4688,44 @@ mod tests {
     }
 
     #[test]
-    fn login_shell_wrap_quotes_and_execs() {
+    fn cloud_reentry_tries_attach_once_then_teleports() {
+        let id = "session_abc";
+        assert_eq!(cloud_reentry_launch(id, false), CloudLaunch::Attach(id));
+        // Once the account has refused, every later re-entry teleports —
+        // retrying the attach only reprints the refusal in the user's pane.
+        assert_eq!(cloud_reentry_launch(id, true), CloudLaunch::Teleport(id));
+    }
+
+    #[test]
+    fn cloud_text_is_trimmed_and_bounded() {
+        assert_eq!(
+            validate_cloud_text("  fix auth  ", "task").unwrap(),
+            "fix auth"
+        );
+        // Newlines are part of a multi-row task/message; only the ends go.
+        assert_eq!(
+            validate_cloud_text("\nline one\nline two\n", "message").unwrap(),
+            "line one\nline two"
+        );
+        for bad in ["", "   ", "\n"] {
+            assert!(validate_cloud_text(bad, "task").is_err(), "{bad:?}");
+        }
+        // A NUL would truncate the login shell's -c string.
+        assert!(validate_cloud_text("fix\0auth", "task").is_err());
+        assert!(validate_cloud_text(&"x".repeat(MAX_CLOUD_PROMPT_BYTES), "task").is_ok());
+        assert!(validate_cloud_text(&"x".repeat(MAX_CLOUD_PROMPT_BYTES + 1), "task").is_err());
+        // The label rides into the message the user sees.
+        let err = validate_cloud_text("", "message").unwrap_err().to_string();
+        assert!(err.contains("message"), "{err}");
+    }
+
+    /// What every agent launch runs once the login shell's files have run,
+    /// ahead of the command itself.
+    const PANE_ENV: &str =
+        "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
+
+    #[test]
+    fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
         let (program, args) = login_shell_wrap(
             "/bin/zsh",
             "claude",
@@ -3741,11 +4734,120 @@ mod tests {
         assert_eq!(program, "/bin/zsh");
         assert_eq!(
             args,
-            vec!["-l", "-i", "-c", "exec 'claude' '--resume' 'sid-1'"]
+            vec![
+                "-l",
+                "-i",
+                "-c",
+                &format!("{PANE_ENV} claude '--resume' 'sid-1'")
+            ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
-        assert_eq!(args[3], r"exec 'echo' 'it'\''s'");
+        assert_eq!(args[3], format!(r"{PANE_ENV} echo 'it'\''s'"));
+        // A command word that isn't a plain name is quoted like an argument.
+        let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
+        assert_eq!(args[3], format!("{PANE_ENV} 'my tool'"));
+    }
+
+    /// The command word resolves through the shell, so an alias or function
+    /// from the rc files takes precedence over the binary on PATH — the
+    /// reason a launch goes through the login shell at all. A function
+    /// stands in for the alias: every POSIX sh honours one in a `-c` string,
+    /// and the old `exec env` form bypassed both alike.
+    #[test]
+    fn login_shell_wrap_lets_the_shell_resolve_the_command() {
+        let (_, args) = login_shell_wrap(
+            "/bin/sh",
+            "claude",
+            &["--resume".to_string(), "sid-1".to_string()],
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
+                args[3]
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "routed --resume sid-1",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The shape of the report itself: zsh, `-l -i -c`, and an alias in
+    /// `.zshrc` that reroutes `claude`. Skipped where there is no zsh.
+    #[test]
+    fn login_shell_wrap_honours_a_zshrc_alias() {
+        use std::os::unix::process::CommandExt;
+        if std::process::Command::new("zsh")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zshrc"), "alias claude='echo routed'\n").unwrap();
+        let (program, args) = login_shell_wrap(
+            "zsh",
+            "claude",
+            &["--resume".to_string(), "sid-1".to_string()],
+        );
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&args)
+            .env("ZDOTDIR", home.path())
+            .stdin(std::process::Stdio::null());
+        // Own session, as the daemon's CLI probe does: an interactive zsh
+        // must not make itself the foreground of the terminal running the
+        // tests.
+        unsafe {
+            cmd.pre_exec(|| match nix::unistd::setsid() {
+                Ok(_) => Ok(()),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            "routed --resume sid-1",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The command line's `env` really does undo a profile's colour
+    /// overrides and restate the pane: run it through a plain `sh -c` with
+    /// `NO_COLOR` and a foreign `TERM` already exported, as a `.profile`
+    /// would leave them, and read back what the program sees.
+    #[test]
+    fn login_shell_wrap_restates_the_pane_after_the_profile() {
+        let (_, args) = login_shell_wrap(
+            "/bin/sh",
+            "sh",
+            &[
+                "-c".to_string(),
+                r#"printf '%s|%s|%s|%s' "$TERM" "$COLORTERM" "${NO_COLOR-unset}" "${FORCE_COLOR-unset}""#
+                    .to_string(),
+            ],
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&args[3])
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .env("TERM", "foot")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "xterm-256color|truecolor|unset|unset",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn test_daemon() -> Arc<Daemon> {
@@ -4127,6 +5229,7 @@ mod tests {
             &agent,
             &HookEvent::PreToolUse {
                 tool_name: Some("AskUserQuestion".into()),
+                subagent_id: None,
             },
         );
         assert_eq!(daemon.task_loop_progress(&agent), None);
@@ -4165,6 +5268,7 @@ mod tests {
             &agent,
             &HookEvent::PreToolUse {
                 tool_name: Some("AskUserQuestion".into()),
+                subagent_id: None,
             },
         );
         assert_eq!(daemon.task_loop_progress(&agent), Some((3, 5)));
@@ -4499,12 +5603,18 @@ mod tests {
     /// change nothing when off.
     #[test]
     fn unattended_adds_claudes_skip_permissions_flag() {
-        let unattended = LaunchFlags {
-            guidance: false,
-            unattended: true,
-        };
-        let (_, args, _) =
-            agent_spawn_command_with(AgentKind::Claude, None, None, None, None, None, unattended);
+        let (_, args, _) = agent_spawn_command_with(
+            AgentKind::Claude,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
         assert_eq!(args, vec!["--dangerously-skip-permissions"]);
 
         // Off by default: an interactive session is untouched.
@@ -4515,7 +5625,10 @@ mod tests {
             None,
             None,
             None,
-            LaunchFlags::default(),
+            None,
+            None,
+            false,
+            false,
         );
         assert!(
             args.is_empty(),
@@ -4530,7 +5643,10 @@ mod tests {
             None,
             None,
             None,
-            unattended,
+            None,
+            None,
+            false,
+            true,
         );
         assert!(resumed);
         assert_eq!(
@@ -4540,8 +5656,9 @@ mod tests {
 
         // Codex and cursor already skip; the flag must not double up.
         for kind in [AgentKind::Codex, AgentKind::Cursor] {
-            let (_, args, _) =
-                agent_spawn_command_with(kind, None, None, None, None, None, unattended);
+            let (_, args, _) = agent_spawn_command_with(
+                kind, None, None, None, None, None, None, None, false, true,
+            );
             assert!(
                 !args.iter().any(|a| a.contains("dangerously")),
                 "{kind:?} should keep its own flag, got {args:?}"
@@ -4604,6 +5721,8 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some(" \n ".into()),
+                starting_prompt: None,
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -4618,6 +5737,8 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("fix\0auth".into()),
+                starting_prompt: None,
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -4632,6 +5753,8 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1)),
+                starting_prompt: None,
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -4646,10 +5769,190 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("Fix auth".into()),
+                starting_prompt: None,
+                pr_url: None,
             })
             .await
             .unwrap_err();
         assert!(wrong_kind.to_string().contains("only supported for Claude"));
+    }
+
+    #[tokio::test]
+    async fn pr_launch_context_is_accepted_for_every_kind_but_never_with_cloud() {
+        let daemon = test_daemon();
+        let spec = |kind: AgentKind, cloud: Option<&str>| CreateAgentSpec {
+            worktree: WorktreeId("unused".into()),
+            name: "pr".into(),
+            kind,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: cloud.map(String::from),
+            starting_prompt: None,
+            pr_url: Some("https://github.com/o/r/pull/7".into()),
+        };
+        for kind in AgentKind::ALL {
+            // Validation passes for every harness; the missing worktree is
+            // what stops this spec, one check later.
+            let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{kind:?}: {err}"
+            );
+        }
+        let cloud = daemon
+            .create_agent(spec(AgentKind::Claude, Some("Fix auth")))
+            .await
+            .unwrap_err();
+        assert!(cloud.to_string().contains("not supported for Claude Cloud"));
+        let not_a_pr = CreateAgentSpec {
+            pr_url: Some("https://github.com/o/r/issues/7".into()),
+            ..spec(AgentKind::Codex, None)
+        };
+        let err = daemon.create_agent(not_a_pr).await.unwrap_err();
+        assert!(err.to_string().contains("not a pull request URL"), "{err}");
+    }
+
+    /// A PR SESSION's checkout is made once for the PR's head branch —
+    /// fetched from `origin`, under the WORKTREE DIR, never the ROOT
+    /// WORKTREE — and every later launch for that PR finds the same row.
+    /// Only a PR whose branch the root itself has checked out runs there.
+    #[tokio::test]
+    async fn pr_worktree_is_created_once_and_shared_by_later_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git_in(&origin, &["init", "--bare", "-b", "main"]);
+        git_in(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&repo, &["push", "-u", "origin", "main"]);
+        git_in(&repo, &["branch", "feat-x", "main"]);
+        git_in(&repo, &["push", "origin", "feat-x"]);
+        git_in(&repo, &["branch", "-D", "feat-x"]);
+
+        let daemon = test_daemon();
+        let EntityId::Project(project) =
+            daemon.add_project(&repo, None, false, None).await.unwrap()
+        else {
+            panic!("expected a project id");
+        };
+        let mut events = daemon.events.subscribe();
+
+        let first = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
+        assert!(!first.is_main, "never the ROOT WORKTREE");
+        assert_eq!(first.branch, "feat-x");
+        assert_eq!(first.path, git::worktree_dir(&repo, "feat-x"));
+        assert!(first.path.join(".git").exists(), "a real checkout");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Ok(ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(w)
+                }) if w.id == first.id
+            ),
+            "clients hear about the new row before the agent lands in it"
+        );
+
+        let again = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
+        assert_eq!(
+            again.id, first.id,
+            "one checkout per PR, shared by every launch"
+        );
+        assert!(events.try_recv().is_err(), "nothing new to broadcast");
+
+        let on_main = daemon.pr_worktree(&project, 8, "main").await.unwrap();
+        assert!(
+            on_main.is_main,
+            "a PR whose branch the root has checked out is already there"
+        );
+
+        // A bad head never reaches git — it is refused ahead of the lookup.
+        let err = daemon
+            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
+                project: project.clone(),
+                name: "pr".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                pr_url: "https://github.com/o/r/pull/7".into(),
+                head: "--force".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a branch name"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn starting_prompt_is_validated_and_never_adopts_a_warm_cli() {
+        let daemon = test_daemon();
+        let spec = |kind: AgentKind, cloud: Option<&str>, starting: Option<&str>| CreateAgentSpec {
+            worktree: WorktreeId("unused".into()),
+            name: "preset".into(),
+            kind,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: cloud.map(String::from),
+            starting_prompt: starting.map(String::from),
+            pr_url: None,
+        };
+        // Validation runs before the worktree lookup, so an unknown
+        // worktree is fine here and every failure is the prompt's own.
+        for (kind, starting, needle) in [
+            (AgentKind::Claude, " \n ", "is empty"),
+            (AgentKind::Codex, "fix\0auth", "NUL"),
+            (
+                AgentKind::Cursor,
+                &*"x".repeat(MAX_CLOUD_PROMPT_BYTES + 1),
+                "too long",
+            ),
+        ] {
+            let err = daemon
+                .create_agent(spec(kind, None, Some(starting)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(needle), "{kind:?}: {err}");
+        }
+        let with_cloud = daemon
+            .create_agent(spec(AgentKind::Claude, Some("Fix auth"), Some("Fix auth")))
+            .await
+            .unwrap_err();
+        assert!(with_cloud
+            .to_string()
+            .contains("not supported for Claude Cloud"));
+
+        // A starting prompt rides the CLI's argv, so a warm spare (booted
+        // bare) is never adopted: the pool entry survives the create.
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w1", "/tmp", true);
+        let key = (WorktreeId("w1".into()), AgentKind::Claude);
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: AgentId("warm-1".into()),
+                spawned_at: Instant::now(),
+                model: None,
+                effort: None,
+                buffered_hooks: Vec::new(),
+            },
+        );
+        let mut preset = spec(AgentKind::Claude, None, Some("Fix auth"));
+        preset.worktree = WorktreeId("w1".into());
+        // Without a CLI on this box the cold path fails at the probe; the
+        // result is beside the point — adoption would have emptied the pool.
+        let _ = daemon.create_agent(preset).await;
+        assert!(
+            daemon.prewarmed.lock().unwrap().contains_key(&key),
+            "a starting-prompt create must not adopt the warm spare"
+        );
     }
 
     #[test]
@@ -4683,31 +5986,6 @@ mod tests {
         }
     }
 
-    /// Project names in display order.
-    fn names(daemon: &Daemon) -> Vec<String> {
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        projects.into_iter().map(|p| p.name).collect()
-    }
-
-    #[test]
-    fn move_project_reorders_and_normalizes_sort_orders() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b", "c", "d"]);
-
-        daemon.move_project(&ProjectId("d".into()), -2).unwrap();
-        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        assert_eq!(
-            projects.iter().map(|p| p.sort_order).collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-
-        // Edge moves clamp to no-ops.
-        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
-        daemon.move_project(&ProjectId("c".into()), 5).unwrap();
-        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
-    }
-
     fn seed_worktree(daemon: &Daemon, project: &str, id: &str, path: &str, is_main: bool) {
         daemon
             .store
@@ -4717,7 +5995,6 @@ mod tests {
                 path: path.into(),
                 branch: id.into(),
                 is_main,
-                pinned: false,
                 sort_order: 0,
             })
             .unwrap();
@@ -4733,7 +6010,6 @@ mod tests {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
-                pinned: false,
                 unseen: false,
                 kind: AgentKind::Claude,
                 model: None,
@@ -4743,6 +6019,8 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             })
             .unwrap();
     }
@@ -4851,6 +6129,7 @@ mod tests {
             &a1,
             &HookEvent::PostToolUse {
                 tool_name: Some("Bash".into()),
+                subagent_id: None,
             },
         );
         assert!(
@@ -4916,7 +6195,6 @@ mod tests {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
@@ -4926,6 +6204,8 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 },
                 true,
             )
@@ -5153,6 +6433,44 @@ mod tests {
         assert_eq!(agent_worktree(&daemon, "a2"), "q-root");
     }
 
+    /// Renaming a project relabels its row and nothing else: the checkout on
+    /// disk keeps its name, `repo_path` keeps pointing at it, and an empty
+    /// name puts the row back on the folder's own name — the only way back
+    /// once a project has been renamed.
+    #[tokio::test]
+    async fn rename_project_relabels_the_row_and_leaves_the_folder_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("acme-api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let daemon = test_daemon();
+        let id = match daemon.add_project(&repo, None, false, None).await.unwrap() {
+            EntityId::Project(id) => id,
+            other => panic!("expected a project id, got {other:?}"),
+        };
+        let named = |daemon: &Arc<Daemon>| daemon.store.get_project(&id).unwrap().unwrap();
+        assert_eq!(named(&daemon).name, "acme-api", "named after the folder");
+
+        daemon.rename_project(&id, "  Acme API  ").unwrap();
+        let project = named(&daemon);
+        assert_eq!(project.name, "Acme API", "trimmed and stored");
+        assert_eq!(project.repo_path, repo, "the folder is untouched");
+        assert!(repo.exists(), "and still on disk under its own name");
+        assert_eq!(
+            project.folder_subtitle().as_deref(),
+            Some("acme-api"),
+            "a renamed row still shows where it lives"
+        );
+
+        daemon.rename_project(&id, "   ").unwrap();
+        let project = named(&daemon);
+        assert_eq!(project.name, "acme-api", "empty resets to the folder name");
+        assert_eq!(project.folder_subtitle(), None, "nothing left to show");
+    }
+
     /// `git rev-parse --show-toplevel` answers with the checkout it ran in, so
     /// `nebula add .` from inside a linked worktree used to make the worktree
     /// the project: named after the branch directory, `repo_path` pointing at
@@ -5312,6 +6630,253 @@ mod tests {
         assert!(rt.is_main, "the surviving root row keeps the badge");
     }
 
+    /// A fresh repo with one commit, at a canonical path (the macOS
+    /// tempdir is a symlink, and git reports worktrees canonically).
+    fn init_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    fn hook_script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("hook.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn project_at(daemon: &Daemon, repo: &Path) -> Project {
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.to_path_buf(),
+            sort_order: 0,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(daemon, "p", "rt", &repo.to_string_lossy(), true);
+        project
+    }
+
+    /// Every `Error` a daemon broadcast with no `req_id` — the warnings a
+    /// WORKTREE HOOK raises after its request already succeeded.
+    fn drain_warnings(events: &mut broadcast::Receiver<ServerEvent>) -> Vec<String> {
+        let mut warnings = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let ServerEvent::Error {
+                req_id: None,
+                message,
+            } = ev
+            {
+                warnings.push(message);
+            }
+        }
+        warnings
+    }
+
+    /// The create hook runs once the checkout exists and its row is out,
+    /// with the main repo and the new checkout as its arguments and the
+    /// branch in its environment.
+    #[tokio::test]
+    async fn create_worktree_runs_the_create_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "printf '%s %s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" \"$NEBULA_WORKTREE_BRANCH\" > '{}'",
+                log.display()
+            ),
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "nebula.worktreeCreateHook",
+                &hook.to_string_lossy(),
+            ],
+        );
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+        let mut events = daemon.events.subscribe();
+
+        let created = daemon
+            .create_worktree(&project.id, "feat", None)
+            .await
+            .unwrap();
+        let EntityId::Worktree(id) = created else {
+            panic!("a worktree id: {created:?}");
+        };
+        let worktree = daemon.store.get_worktree(&id).unwrap().unwrap();
+        assert!(worktree.path.exists(), "the checkout is real");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "worktree-create {} {} feat\n",
+                repo.display(),
+                worktree.path.display()
+            )
+        );
+        assert!(
+            drain_warnings(&mut events).is_empty(),
+            "a clean run warns nobody"
+        );
+    }
+
+    /// The delete hook runs after the checkout is gone and the row is
+    /// dropped, sees the deleted path, and its failure is a broadcast
+    /// warning: the request still succeeds and the row stays gone.
+    #[tokio::test]
+    async fn delete_worktree_runs_the_delete_hook_and_survives_its_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "printf '%s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" > '{}'\n\
+                 [ -e \"$2\" ] && echo 'still there' >&2\n\
+                 echo 'slot 7 was not ours' >&2\n\
+                 exit 2",
+                log.display()
+            ),
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "nebula.worktreeDeleteHook",
+                &hook.to_string_lossy(),
+            ],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        daemon
+            .delete_worktree(&WorktreeId("feat".into()), false)
+            .await
+            .unwrap();
+
+        assert!(!wt.exists(), "the checkout is gone");
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert!(
+            worktrees.iter().all(|w| w.id.as_str() != "feat"),
+            "the row stays deleted despite the hook: {worktrees:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("worktree-delete {} {}\n", repo.display(), wt.display())
+        );
+        let warnings = drain_warnings(&mut events);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("worktree-delete hook")
+                && warnings[0].contains("exited 2: slot 7 was not ours"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// A create of the path a delete hook is still releasing waits for
+    /// that hook: the delete hook sees the checkout gone (no "still on
+    /// disk" skip), then the create hook runs, in that order.
+    #[tokio::test]
+    async fn recreating_a_path_waits_for_its_delete_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "[ \"$NEBULA_HOOK\" = worktree-delete ] && sleep 0.5\n\
+                 echo \"$NEBULA_HOOK $2\" >> '{}'",
+                log.display()
+            ),
+        );
+        for key in ["nebula.worktreeCreateHook", "nebula.worktreeDeleteHook"] {
+            git_in(&repo, &["config", key, &hook.to_string_lossy()]);
+        }
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        let deleting = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .delete_worktree(&WorktreeId("feat".into()), false)
+                    .await
+            })
+        };
+        // Let the delete get into its hook, then ask for the same path back.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        daemon
+            .create_worktree(&project.id, "feat", None)
+            .await
+            .unwrap();
+        deleting.await.unwrap().unwrap();
+
+        let got = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            got,
+            format!(
+                "worktree-delete {wt}\nworktree-create {wt}\n",
+                wt = wt.display()
+            ),
+            "delete hook first, create hook second"
+        );
+        assert!(wt.exists(), "the recreated checkout is there");
+        assert!(
+            drain_warnings(&mut events).is_empty(),
+            "neither hook was skipped or failed"
+        );
+    }
+
+    /// No hook configured: a delete is exactly what it was.
+    #[tokio::test]
+    async fn delete_worktree_without_a_hook_warns_nobody() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        daemon
+            .delete_worktree(&WorktreeId("feat".into()), false)
+            .await
+            .unwrap();
+
+        assert!(!wt.exists());
+        assert!(drain_warnings(&mut events).is_empty());
+    }
+
     fn git_in(repo: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .arg("-C")
@@ -5393,6 +6958,7 @@ mod tests {
         assert!(cli_missing_message(AgentKind::Cursor).starts_with("cursor-agent was not found"));
         assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
         assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
+        assert!(cli_missing_message(AgentKind::Pi).starts_with("pi was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's
         // login shell, so a fresh install is picked up on the next try.
         for kind in AgentKind::ALL {
@@ -5463,7 +7029,7 @@ mod tests {
         // No live PTY backs the entry, so take() refuses it (create falls
         // back to a cold spawn) and reap clears it out.
         assert!(daemon
-            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, &None, &None)
+            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, None, None)
             .is_none());
         assert!(daemon.prewarmed.lock().unwrap().is_empty());
 
@@ -5479,6 +7045,60 @@ mod tests {
         );
         daemon.reap_prewarmed();
         assert!(daemon.prewarmed.lock().unwrap().is_empty());
+    }
+
+    /// Switching `prewarm_agents` off drains the pool on the next sweep. A
+    /// spare is a real CLI process the user can see — Claude's own
+    /// `/list-agents` lists it beside their sessions, named after the
+    /// directory (issue #15) — so the toggle has to take it away now, not
+    /// when it ages out.
+    #[tokio::test]
+    async fn reap_prewarmed_drains_the_pool_once_prewarming_is_off() {
+        let daemon = test_daemon();
+        let key = (WorktreeId("w1".into()), AgentKind::Claude);
+        let id = AgentId("warm-1".into());
+        let sref = SessionRef::Agent(id.clone());
+        let session = PtySession::spawn(
+            sref.clone(),
+            SpawnSpec {
+                program: "sleep".into(),
+                args: vec!["30".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap();
+        daemon.install_session(session);
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: id.clone(),
+                spawned_at: Instant::now(),
+                model: None,
+                effort: None,
+                buffered_hooks: Vec::new(),
+            },
+        );
+        let with_pool = |on: bool| crate::config::Config {
+            prewarm_agents: on,
+            ..crate::config::Config::default()
+        };
+
+        // Live, young and wanted: the ordinary sweep keeps it.
+        daemon.reap_prewarmed_with(&with_pool(true));
+        assert!(daemon.prewarmed.lock().unwrap().contains_key(&key));
+        assert!(daemon.is_alive(&sref), "a kept spare keeps its PTY");
+
+        // Off: the same sweep takes it, PTY and all.
+        daemon.reap_prewarmed_with(&with_pool(false));
+        assert!(daemon.prewarmed.lock().unwrap().is_empty());
+        assert!(
+            !daemon.is_alive(&sref),
+            "a drained spare's PTY goes with it"
+        );
     }
 
     #[test]
@@ -5582,38 +7202,6 @@ mod tests {
         );
         // An empty, closed workspace deletes cleanly.
         daemon.remove_workspace(&empty).unwrap();
-    }
-
-    /// Reorders only see the project's own workspace: a move never swaps
-    /// across workspaces, and other workspaces' sort orders stay untouched.
-    #[test]
-    fn move_project_is_scoped_to_the_workspace() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]); // default ws, sort 0 and 1
-        let EntityId::Workspace(other) = daemon.add_workspace("other").unwrap() else {
-            panic!("add returns the workspace id");
-        };
-        daemon
-            .store
-            .insert_project(&Project {
-                workspace_id: other.clone(),
-                id: ProjectId("x".into()),
-                name: "x".into(),
-                repo_path: "/tmp/x".into(),
-                sort_order: 1, // interleaves between a and b globally
-            })
-            .unwrap();
-
-        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        let default_order: Vec<&str> = projects
-            .iter()
-            .filter(|p| p.workspace_id.as_str() == "default")
-            .map(|p| p.name.as_str())
-            .collect();
-        assert_eq!(default_order, ["b", "a"], "a swapped with b, not x");
-        let x = projects.iter().find(|p| p.name == "x").unwrap();
-        assert_eq!(x.sort_order, 1, "other workspace untouched");
     }
 
     /// The status broadcast carries the flag it persisted: a live turn

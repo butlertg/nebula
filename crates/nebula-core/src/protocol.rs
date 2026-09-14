@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -95,11 +95,13 @@ pub enum ClientRequest {
         req_id: u64,
         id: ProjectId,
     },
-    /// Move a project `delta` slots in the list (clamped at the edges).
-    MoveProject {
+    /// Retitle a project's row. Purely cosmetic: `repo_path` — the folder on
+    /// disk — is never touched. An empty name resets the row to the folder's
+    /// own name, which is the only way back from a rename.
+    RenameProject {
         req_id: u64,
         id: ProjectId,
-        delta: i64,
+        name: String,
     },
     CreateWorktree {
         req_id: u64,
@@ -111,12 +113,6 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
-    },
-    /// Pin/unpin the worktree in the worktrees list (pure metadata).
-    SetWorktreePinned {
-        req_id: u64,
-        id: WorktreeId,
-        pinned: bool,
     },
     CreateAgent {
         req_id: u64,
@@ -135,6 +131,41 @@ pub enum ClientRequest {
         /// deliberately request-only: prompts are not persisted with Agent.
         #[serde(default)]
         cloud_prompt: Option<String>,
+        /// The first turn handed to the CLI as its positional prompt
+        /// (`claude "<text>"`, `codex "<text>"`, `cursor-agent "<text>"`) —
+        /// what an AGENT PRESET launch composes from its prefix, the task
+        /// and its postfix. Request-only like `cloud_prompt`: never
+        /// persisted, so a RESUME can never replay it. Skips PREWARM POOL
+        /// adoption, since a spare booted bare cannot be handed one.
+        #[serde(default)]
+        starting_prompt: Option<String>,
+    },
+    /// Create a local AGENT of any kind from an OPEN PRS row — a PR
+    /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the
+    /// PROJECT's worktree checked out on the PR's head branch, or creates
+    /// one (fetching the branch from `origin`, or the PR ref for a fork),
+    /// and every PR SESSION for that PR shares it. The PR URL is persisted
+    /// as launch context so every cold spawn and RESUME rebuilds the same
+    /// PR-scoped rule — naming that worktree — as Claude's appended system
+    /// prompt, or the first prompt a Codex / Cursor cold spawn opens with.
+    /// Separate from CreateAgent so ordinary callers cannot accidentally
+    /// opt into a partial PR launch. The reply's `created` is the AGENT;
+    /// a created worktree arrives as its own `EntityUpserted` first.
+    CreatePrAgent {
+        req_id: u64,
+        /// The PROJECT whose repo the pull request is open on.
+        project: ProjectId,
+        name: String,
+        kind: AgentKind,
+        /// Model the CLI launches with; None = the CLI's own default.
+        model: Option<String>,
+        /// Reasoning effort the CLI launches with; None = default.
+        effort: Option<String>,
+        auto_title: bool,
+        pr_url: String,
+        /// The pull request's head branch (`gh`'s `headRefName`): the
+        /// branch the PR SESSION's worktree is checked out on.
+        head: String,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
@@ -199,6 +230,30 @@ pub enum ClientRequest {
         branch: String,
         base: Option<String>,
     },
+    /// `nebula spawn "<task>"`, run by the agent from inside its own
+    /// session: start a new AGENT beside it — same WORKTREE, and the same
+    /// AGENT KIND / MODEL / EFFORT unless `kind` names another harness —
+    /// with `starting_prompt` as the new CLI's first prompt, so it begins
+    /// the task at once. The caller's own process is untouched. Answered
+    /// with `Ack { created: Some(EntityId::Agent(..)) }`; the row reaches
+    /// every TUI as an ordinary `EntityUpserted`.
+    SpawnSiblingAgent {
+        req_id: u64,
+        id: AgentId,
+        kind: Option<AgentKind>,
+        starting_prompt: String,
+    },
+    /// `nebula open <file>…`, run by the agent from inside its own session:
+    /// show these files to the user in every attached TUI's FILE TABS —
+    /// one tab per file, the focused one previewed, Enter editing it.
+    /// Paths are absolute (the CLI resolves them against its own cwd, which
+    /// is the agent's). Answered with `Ack`; the files reach every
+    /// subscriber as `FilesOpened`.
+    OpenFiles {
+        req_id: u64,
+        id: AgentId,
+        paths: Vec<PathBuf>,
+    },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
         req_id: u64,
@@ -207,12 +262,6 @@ pub enum ClientRequest {
     UnarchiveAgent {
         req_id: u64,
         id: AgentId,
-    },
-    /// Pin/unpin the agent in the sessions list (pure metadata; PTY untouched).
-    SetAgentPinned {
-        req_id: u64,
-        id: AgentId,
-        pinned: bool,
     },
     DeleteAgent {
         req_id: u64,
@@ -233,6 +282,17 @@ pub enum ClientRequest {
     AttachCloudAgent {
         req_id: u64,
         id: AgentId,
+    },
+    /// Queue a message on the Claude Cloud session a row launched
+    /// (`claude -p <message> --cloud <id>`), then pull the transcript so the
+    /// send is visible. Fire-and-forget by nature: the CLI acknowledges the
+    /// send and returns, and the reply only ever appears in a later pull.
+    /// Rejected for rows without a `cloud_session_id`, and bounded by
+    /// [`MAX_CLOUD_PROMPT_BYTES`] like the launch task.
+    SendCloudMessage {
+        req_id: u64,
+        id: AgentId,
+        message: String,
     },
     CreateTerminal {
         req_id: u64,
@@ -352,6 +412,20 @@ pub struct SessionMetrics {
     pub rss_bytes: u64,
     /// Live processes in the subtree, the root included.
     pub procs: u32,
+    /// Set when the session is a prewarm-pool spare: an agent CLI the
+    /// daemon booted ahead of time for this worktree, waiting for the next
+    /// new-agent request there to adopt it. It has no agent row yet, so
+    /// this is the only handle a client has for naming and placing it.
+    #[serde(default)]
+    pub prewarm: Option<PrewarmInfo>,
+}
+
+/// Where a prewarm-pool spare is homed and what it booted as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrewarmInfo {
+    pub worktree: WorktreeId,
+    pub kind: AgentKind,
+    pub model: Option<String>,
 }
 
 /// Daemon-side half of the metrics modal's data; the client stacks its own
@@ -472,6 +546,16 @@ pub enum ServerEvent {
         /// turn just finished, cleared when it left `finished`.
         #[serde(default)]
         unseen: bool,
+    },
+
+    /// `nebula open` from an agent session: the files the user asked to
+    /// see, for every subscriber to raise its FILE TABS on. `root` is the
+    /// agent's worktree checkout — the editor's cwd, and what the tab
+    /// labels are relative to.
+    FilesOpened {
+        agent: AgentId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
     },
 
     // -- PTY plane (only to clients attached to that session) --

@@ -1,14 +1,24 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
-//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`, and
-//! `/api/hooks/cursor`). Codex mirrors Claude's hook events and payload
-//! shape; cursor speaks its own dialect, but its installer translates event
-//! names into the `hookEvent` query param and the payload fields are aliased
-//! here (`conversation_id`, `subagent_id`, `workspace_roots`), so one
-//! handler serves all three. Fail-soft on both sides — a malformed payload
-//! still gets a 200 so a broken hook never faults the user's agent turn.
+//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`,
+//! `/api/hooks/cursor`, and `/api/hooks/pi`). Codex mirrors Claude's hook
+//! events and payload shape; cursor speaks its own dialect, but its
+//! installer translates event names into the `hookEvent` query param and
+//! the payload fields are aliased here (`conversation_id`, `subagent_id`,
+//! `workspace_roots`); pi has no shell hooks at all — its managed extension
+//! (`pi_extension.rs`) maps pi's events onto the same names and POSTs
+//! Claude-shaped payloads — so one handler serves all four. Fail-soft on
+//! both sides — a malformed payload still gets a 200 so a broken hook never
+//! faults the user's agent turn.
+//!
+//! The Claude `UserPromptSubmit` reply is also the one channel back into
+//! the CLI: its `hookSpecificOutput` carries the AUTO-TITLE instruction
+//! while a session is untitled, and a `sessionTitle` whenever the row's
+//! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
 pub mod installer;
+pub mod pi_extension;
 
+use crate::session_title::TranscriptRef;
 use crate::status::HookEvent;
 use crate::store::Store;
 use axum::extract::{Query, State};
@@ -37,13 +47,65 @@ the request. Don't mention the rename to the user.";
 /// strict — bare text is discarded); Claude Code documents the same shape
 /// as the equivalent of bare text, so both CLIs share one body.
 pub fn auto_title_injection() -> String {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": AUTO_TITLE_INSTRUCTION,
+    user_prompt_reply(true, None)
+}
+
+/// The UserPromptSubmit reply body: the AUTO-TITLE instruction when one is
+/// due, a `sessionTitle` for Claude to take as its own session name when
+/// the row's name differs from it (verified on Claude Code 2.1.261: it
+/// renames and persists exactly as `/rename` does), or nothing at all —
+/// an empty body is the only other thing that may reach the CLI's stdout.
+pub fn user_prompt_reply(instruction: bool, session_title: Option<&str>) -> String {
+    if !instruction && session_title.is_none() {
+        return String::new();
+    }
+    let mut output = serde_json::Map::new();
+    output.insert("hookEventName".into(), "UserPromptSubmit".into());
+    if instruction {
+        output.insert("additionalContext".into(), AUTO_TITLE_INSTRUCTION.into());
+    }
+    if let Some(title) = session_title {
+        output.insert("sessionTitle".into(), title.into());
+    }
+    serde_json::json!({ "hookSpecificOutput": output }).to_string()
+}
+
+/// Diagnostic bodies for the route whose responses a hook discards. Never
+/// sent where a body would reach the model's context (see `HookDialect`).
+pub const HOOK_OK: &str = r#"{"ok": true}"#;
+pub const HOOK_NOT_OK: &str = r#"{"ok": false}"#;
+
+/// What a CLI's hook command does with this server's response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookDialect {
+    /// Claude and Codex: the UserPromptSubmit hook pipes the body to the
+    /// CLI's stdout, where it lands in the model's context — so on that
+    /// event the body must be empty or the instruction, never diagnostics.
+    /// Pi's extension reads the same body out of the envelope and appends
+    /// it to the run's system prompt.
+    Injectable,
+    /// Cursor: every hook answers with its own gating JSON and drops the
+    /// body, so the `{"ok": …}` diagnostics can stay.
+    Plain,
+}
+
+/// Which CLI a route serves. Beyond the dialect, only Claude persists a
+/// session title of its own and reads `sessionTitle` from a hook reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCli {
+    Claude,
+    Codex,
+    Cursor,
+    Pi,
+}
+
+impl HookCli {
+    fn dialect(self) -> HookDialect {
+        match self {
+            HookCli::Claude | HookCli::Codex | HookCli::Pi => HookDialect::Injectable,
+            HookCli::Cursor => HookDialect::Plain,
         }
-    })
-    .to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +132,13 @@ pub struct HookDelivery {
     /// sends it on every event); drives cwd-based agent re-homing. Absent
     /// when the CLI doesn't report it — re-homing simply never triggers.
     pub cwd: Option<String>,
+    /// Where Claude keeps this session's transcript — and beside it the
+    /// title `/rename` persists (see `session_title`). Claude route only.
+    pub transcript: Option<TranscriptRef>,
+    /// The submitted prompt, condensed for the row's RECENT PROMPTS
+    /// (`prompt_history::condense`). Only a `UserPromptSubmit` carries
+    /// one, and only when the payload had a non-blank, user-written one.
+    pub prompt: Option<String>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -80,6 +149,13 @@ pub struct HookDelivery {
 pub struct HookPayload {
     pub hook_event_name: Option<String>,
     pub session_id: Option<String>,
+    /// The prompt text on `UserPromptSubmit` — Claude, Codex and Cursor
+    /// (`beforeSubmitPrompt`) all name it `prompt`, and pi's extension
+    /// posts it under the same key.
+    pub prompt: Option<String>,
+    /// Claude's transcript file; its directory is where the session title
+    /// lives (`<dir>/<session_id>/custom-title.json`).
+    pub transcript_path: Option<String>,
     /// Cursor names the resumable chat id `conversation_id` (== its
     /// `session_id`, but only the alias is guaranteed on every event).
     pub conversation_id: Option<String>,
@@ -128,15 +204,19 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
         "SessionStart" => HookEvent::SessionStart {
             source: payload.source.clone(),
         },
-        "PermissionRequest" => HookEvent::PermissionRequest,
+        "PermissionRequest" => HookEvent::PermissionRequest {
+            subagent_id: payload.subagent_id(),
+        },
         "Notification" => HookEvent::Notification {
             notification_type: payload.notification_type.clone(),
         },
         "PreToolUse" => HookEvent::PreToolUse {
             tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
         },
         "PostToolUse" => HookEvent::PostToolUse {
             tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
         },
         "SubagentStart" => HookEvent::SubagentStart {
             subagent_id: payload.subagent_id(),
@@ -165,13 +245,15 @@ pub async fn start_hook_server(
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
     // body to the CLI's stdout, where it lands in the model's context —
-    // that's the auto-title instruction channel. Cursor's dialect has no
+    // that's the auto-title instruction channel; pi's extension carries
+    // the same body into its run's system prompt. Cursor's dialect has no
     // such channel (its hooks answer with their own gating JSON), so it
     // takes the plain route.
     let app = Router::new()
-        .route("/api/hooks/claude", post(receive_injectable_hook))
-        .route("/api/hooks/codex", post(receive_injectable_hook))
-        .route("/api/hooks/cursor", post(receive_plain_hook))
+        .route("/api/hooks/claude", post(receive_claude_hook))
+        .route("/api/hooks/codex", post(receive_codex_hook))
+        .route("/api/hooks/cursor", post(receive_cursor_hook))
+        .route("/api/hooks/pi", post(receive_pi_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -188,6 +270,151 @@ fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Claude route: the UserPromptSubmit hook command pipes this response's
+/// body to stdout, so it must be empty or the reply envelope — never
+/// diagnostic JSON.
+async fn receive_claude_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Claude, state, query, headers, body).await
+}
+
+/// Codex route: the same injectable dialect as Claude's, minus the
+/// session-title exchange Codex has no equivalent of.
+async fn receive_codex_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Codex, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_cursor_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Cursor, state, query, headers, body).await
+}
+
+/// `/api/hooks/pi`: pi's managed extension POSTs Claude-shaped payloads
+/// and unwraps the injectable reply body into the run's system prompt.
+async fn receive_pi_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Pi, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    cli: HookCli,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable =
+        cli.dialect() == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
+    let authorized = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false);
+    if !authorized {
+        return quiet_or(StatusCode::UNAUTHORIZED, HOOK_NOT_OK);
+    }
+
+    // Parse failures still 200 — never fault a hook.
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let Some(event) = parse_event(&query.hook_event, &payload) else {
+        return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+    };
+    let agent_id = AgentId(query.agent_id.clone());
+    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A subagent's tool traffic reports the payload's cwd too, but that is
+    // the Task's position, not the session's — an isolated subagent working
+    // in a scratch checkout must never drag the row out from under the
+    // conversation. Only foreground payloads carry a cwd onward.
+    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    // Only Claude persists a session title of its own beside a transcript.
+    let transcript = match cli {
+        HookCli::Claude => TranscriptRef::from_payload(
+            payload.transcript_path.as_deref(),
+            payload.session_id.as_deref(),
+        ),
+        HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
+    };
+    // The prompt rides only its own event, condensed here so the channel
+    // never carries a pasted file whole.
+    let prompt = match event {
+        HookEvent::UserPromptSubmit => payload
+            .prompt
+            .as_deref()
+            .and_then(crate::prompt_history::condense),
+        _ => None,
+    };
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id: agent_id.clone(),
+            event,
+            session_id: payload.session_id(),
+            cwd,
+            transcript,
+            prompt,
+        })
+        .await;
+
+    if injectable {
+        // Prompt submitted on a still-untitled session: hand the CLI the
+        // titling instruction. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let inject = state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false);
+        // A titled row whose name Claude doesn't hold yet: hand Claude the
+        // name as its own session title (Claude only — Codex has no such
+        // field). Never while the instruction is pending: the agent's
+        // `nebula rename` is about to settle the name.
+        let session_title = match cli {
+            HookCli::Claude => state
+                .store
+                .agent_title_state(&agent_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.to_push().map(str::to_string)),
+            HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
+        };
+        return (
+            StatusCode::OK,
+            user_prompt_reply(inject, session_title.as_deref()),
+        );
+    }
+    (StatusCode::OK, HOOK_OK.to_string())
 }
 
 #[cfg(test)]
@@ -238,7 +465,6 @@ mod tests {
                 path: "/tmp/p".into(),
                 branch: "main".into(),
                 is_main: true,
-                pinned: false,
                 sort_order: 0,
             })
             .unwrap();
@@ -249,7 +475,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: None,
@@ -259,12 +484,108 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)
             .unwrap();
         store.insert_agent(&agent("titled")).unwrap();
+        // A row the user (or AUTO-TITLE) named, that Claude doesn't hold yet.
         store
+            .insert_agent(&Agent {
+                name: "Fix Login".into(),
+                ..agent("named")
+            })
+            .unwrap();
+        store
+    }
+
+    /// The reply's `sessionTitle` is how a nebula-side name reaches
+    /// Claude: sent on the Claude route for a settled name Claude doesn't
+    /// hold, never for a default name, never on the Codex route, and no
+    /// longer once Claude holds it. The delivery carries the transcript
+    /// ref (Claude only) that the reverse direction reads from.
+    #[tokio::test]
+    async fn claude_prompt_reply_pushes_the_row_name_as_session_title() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1","transcript_path":"/t/p/s1.jsonl"}"#;
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, user_prompt_reply(false, Some("Fix Login")));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["sessionTitle"], "Fix Login");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            parsed["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none(),
+            "no instruction for a titled row: {body}"
+        );
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(
+            delivery.transcript,
+            TranscriptRef::from_payload(Some("/t/p/s1.jsonl"), Some("s1"))
+        );
+
+        // Codex: same dialect, but no title exchange and no transcript.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/codex?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+        assert!(rx.recv().await.unwrap().transcript.is_none());
+
+        // Other Claude events deliver the transcript too (the sync reads on
+        // every hook) but keep the diagnostic body.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=Stop",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, HOOK_OK);
+        assert!(rx.recv().await.unwrap().transcript.is_some());
+
+        // Once Claude holds the name, the reply goes quiet again.
+        store
+            .adopt_claude_title(&AgentId("named".into()), "Fix Login")
+            .unwrap();
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+
+        // A pending row still gets only the instruction — its name is the
+        // default, and the agent's `nebula rename` is about to replace it.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, auto_title_injection());
+        assert!(!body.contains("sessionTitle"), "{body}");
     }
 
     #[tokio::test]
@@ -292,15 +613,18 @@ mod tests {
         assert_eq!(delivery.agent_id.as_str(), "pending");
         assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
 
-        // Codex shares the injectable dialect.
-        let (_, body) = http_post(
-            env.port,
-            "/api/hooks/codex?agentId=pending&hookEvent=UserPromptSubmit",
-            &env.token,
-            payload,
-        )
-        .await;
-        assert_eq!(body, auto_title_injection());
+        // Codex shares the injectable dialect, and so does pi's extension,
+        // which unwraps the same envelope.
+        for route in ["codex", "pi"] {
+            let (_, body) = http_post(
+                env.port,
+                &format!("/api/hooks/{route}?agentId=pending&hookEvent=UserPromptSubmit"),
+                &env.token,
+                payload,
+            )
+            .await;
+            assert_eq!(body, auto_title_injection(), "{route}");
+        }
 
         // Titled session: strictly empty — anything else would leak into
         // the model's context.
@@ -331,7 +655,7 @@ mod tests {
             payload,
         )
         .await;
-        assert_eq!(body, r#"{"ok": true}"#);
+        assert_eq!(body, HOOK_OK);
 
         // Cursor's dialect can't inject — no instruction even while pending.
         let (_, body) = http_post(
@@ -341,7 +665,7 @@ mod tests {
             payload,
         )
         .await;
-        assert_eq!(body, r#"{"ok": true}"#);
+        assert_eq!(body, HOOK_OK);
 
         // Bad token on the injectable path: 401 and an EMPTY body, so a
         // misconfigured hook can't inject diagnostics as context.
@@ -375,7 +699,8 @@ mod tests {
         assert_eq!(
             delivery.event,
             HookEvent::PostToolUse {
-                tool_name: Some("Bash".into())
+                tool_name: Some("Bash".into()),
+                subagent_id: None,
             }
         );
 
@@ -392,6 +717,56 @@ mod tests {
         assert_eq!(status, 200);
         let delivery = rx.recv().await.unwrap();
         assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
+    /// The prompt reaches the drain loop condensed, on its own event
+    /// only, and never for a blank or nebula-written one.
+    #[tokio::test]
+    async fn user_prompt_submit_carries_the_condensed_prompt() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store).await.unwrap();
+        let post = |event: &'static str, body: &'static str| {
+            let port = env.port;
+            let token = env.token.clone();
+            async move {
+                http_post(
+                    port,
+                    &format!("/api/hooks/claude?agentId=titled&hookEvent={event}"),
+                    &token,
+                    body,
+                )
+                .await
+            }
+        };
+
+        post(
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","prompt":"  fix the\n\n login   redirect \n"}"#,
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await.unwrap().prompt.as_deref(),
+            Some("fix the login redirect")
+        );
+
+        // Blank, absent and nebula-authored prompts record nothing, but
+        // the status delivery still flows.
+        for body in [
+            r#"{"session_id":"s1","prompt":"   "}"#,
+            r#"{"session_id":"s1"}"#,
+            r#"{"session_id":"s1","prompt":"[nebula] This session now runs inside a worktree"}"#,
+        ] {
+            post("UserPromptSubmit", body).await;
+            let delivery = rx.recv().await.unwrap();
+            assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+            assert!(delivery.prompt.is_none(), "{body}");
+        }
+
+        // Another event with a prompt field is not a prompt.
+        post("Stop", r#"{"session_id":"s1","prompt":"leftover"}"#).await;
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.event, HookEvent::Stop);
+        assert!(delivery.prompt.is_none());
     }
 
     #[test]
@@ -434,96 +809,4 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-}
-
-/// Claude/Codex route: the UserPromptSubmit hook command pipes this
-/// response's body to stdout, so it must be empty or the injected
-/// instruction — never diagnostic JSON.
-async fn receive_injectable_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(true, state, query, headers, body).await
-}
-
-/// Cursor route: every hook command answers cursor with its own gating JSON
-/// and discards this body, so the `{"ok": ...}` diagnostics stay.
-async fn receive_plain_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(false, state, query, headers, body).await
-}
-
-async fn receive_hook(
-    inject_capable: bool,
-    state: Arc<HookServerState>,
-    query: HookQuery,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    // On this path the response body reaches the model's context, so every
-    // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
-    let quiet_or = |status: StatusCode, diag: &str| {
-        let body = if injectable {
-            String::new()
-        } else {
-            diag.to_string()
-        };
-        (status, body)
-    };
-
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
-        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
-    }
-
-    // Parse failures still 200 — never fault a hook.
-    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
-    let Some(event) = parse_event(&query.hook_event, &payload) else {
-        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
-    };
-    let agent_id = AgentId(query.agent_id.clone());
-    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
-    // A subagent's tool traffic reports the payload's cwd too, but that is
-    // the Task's position, not the session's — an isolated subagent working
-    // in a scratch checkout must never drag the row out from under the
-    // conversation. Only foreground payloads carry a cwd onward.
-    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
-    let _ = state
-        .tx
-        .send(HookDelivery {
-            agent_id: agent_id.clone(),
-            event,
-            session_id: payload.session_id(),
-            cwd,
-        })
-        .await;
-
-    if injectable {
-        // Prompt submitted on a still-untitled session: hand the CLI the
-        // titling instruction. Unknown ids (prewarm, stale env) and store
-        // errors degrade to no injection.
-        let inject = state
-            .store
-            .agent_auto_title_pending(&agent_id)
-            .unwrap_or(false);
-        let body = if inject {
-            auto_title_injection()
-        } else {
-            String::new()
-        };
-        return (StatusCode::OK, body);
-    }
-    (StatusCode::OK, r#"{"ok": true}"#.to_string())
 }

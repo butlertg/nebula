@@ -2,6 +2,7 @@ pub mod cloud;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
+pub mod title;
 
 use anyhow::{Context, Result};
 use cloud::CloudScanner;
@@ -9,7 +10,9 @@ use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
 use ring::ScrollbackRing;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
@@ -26,6 +29,77 @@ const READER_CHANNEL_BOUND: usize = 64;
 /// After the polite SIGHUP, how long the child gets to exit before its whole
 /// process group is SIGKILLed.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Size a session is spawned at when no client is attached to say better
+/// (prewarms, respawns after a move, restarts). The first attach resizes it
+/// to the real pane, so these only shape the child's first paint.
+pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_ROWS: u16 = 24;
+/// The two bytes every output scanner in this module keys on: ESC opens a
+/// CSI/OSC sequence, BEL is the classic OSC terminator.
+pub(crate) const ESC: u8 = 0x1b;
+pub(crate) const BEL: u8 = 0x07;
+
+/// A `PtySize` in cells only. Nothing here knows pixel dimensions, and
+/// leaving them zero is what every caller wants.
+fn pty_size(cols: u16, rows: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+/// Every process group with a member in `root`'s subtree, `root`'s own
+/// first (it leads its PTY session, so that group is its pid, and it is
+/// named even when the `ps` sweep fails). An interactive shell running the
+/// agent as a job puts it in a group of its own; SIGKILLing the leader's
+/// group alone would miss it. Taken while the tree is intact — see `kill`.
+fn process_groups_under(root: u32) -> Vec<u32> {
+    let table = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    process_groups_in_table(&table, root)
+}
+
+/// Pure core of [`process_groups_under`]: `table` is `ps -axo
+/// pid=,ppid=,pgid=` output, one process per line.
+fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut group_of: HashMap<u32, u32> = HashMap::new();
+    for line in table.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(pgid)) = (
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+        group_of.insert(pid, pgid);
+    }
+    let mut groups = vec![root];
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(&pgid) = group_of.get(&pid) {
+            if !groups.contains(&pgid) {
+                groups.push(pgid);
+            }
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    groups
+}
 
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
@@ -46,6 +120,12 @@ pub enum PtyEvent {
     /// end-of-turn signal after the user cancels, which fires no hook.
     Progress {
         busy: bool,
+    },
+    /// The child set its window title (OSC 0/2). Claude Code's carries the
+    /// session's name (`✳ Fix Login Redirect`), and `/rename` — which
+    /// fires no hook — shows up here first (see `pty::title`).
+    Title {
+        title: String,
     },
     /// The child printed the id of the Claude Cloud session it created or
     /// attached to. Only scanned for on `--cloud` launches (`arm_cloud_scan`).
@@ -68,8 +148,9 @@ pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
-    /// PTY session's leader — portable-pty does setsid — so pgid == pid)
-    /// and the metrics modal's process-tree sums.
+    /// PTY session's leader — portable-pty does setsid — so pgid == pid,
+    /// though an agent run as a job under a login shell sits in a group of
+    /// its own below it) and the metrics modal's process-tree sums.
     pub child_pid: Option<u32>,
     pub ring: Mutex<ScrollbackRing>,
     pub events: broadcast::Sender<PtyEvent>,
@@ -79,9 +160,16 @@ pub struct PtySession {
     kitty: Mutex<kitty::KittyScanner>,
     /// OSC 9;4 busy/idle tracking, likewise fed from live output.
     progress: Mutex<ProgressScanner>,
+    /// OSC 0/2 window-title tracking, likewise fed from live output.
+    title: Mutex<title::TitleScanner>,
     /// Claude Cloud session id / attach-refusal scanner; `None` until a
     /// `--cloud` launch arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
+    /// Set by the first `write_input`. A Cloud mirror stops re-teleporting
+    /// once its pane has been typed into: the moment the user talks to the
+    /// local session, replacing it under them would eat their turn.
+    /// Resizes and attaches deliberately do not count.
+    input_seen: AtomicBool,
 }
 
 pub struct SpawnSpec {
@@ -90,8 +178,9 @@ pub struct SpawnSpec {
     pub cwd: std::path::PathBuf,
     /// Extra env vars (NEBULA_* for agents). Plain terminals get none.
     pub env: Vec<(String, String)>,
-    /// Env var names to scrub from the inherited environment.
-    pub scrub_env: Vec<String>,
+    /// Env var names to scrub from the inherited environment. Only ever a
+    /// fixed list (the agent-session vars), so it is borrowed, not built.
+    pub scrub_env: &'static [&'static str],
     pub cols: u16,
     pub rows: u16,
 }
@@ -101,19 +190,22 @@ impl PtySession {
     pub fn spawn(sref: SessionRef, spec: SpawnSpec) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize {
-                rows: spec.rows,
-                cols: spec.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(pty_size(spec.cols, spec.rows))
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
         cmd.cwd(&spec.cwd);
-        cmd.env("TERM", "xterm-256color");
-        for name in &spec.scrub_env {
+        // The child paints nebula's grid, not the terminal the daemon was
+        // started from: name that grid and drop the colour overrides the
+        // daemon inherited. Agent launches restate all three after the
+        // login shell's profile too (`login_shell_wrap`).
+        cmd.env("TERM", nebula_core::env::PANE_TERM);
+        cmd.env("COLORTERM", nebula_core::env::PANE_COLORTERM);
+        for name in nebula_core::env::PANE_COLOR_OVERRIDES {
+            cmd.env_remove(name);
+        }
+        for name in spec.scrub_env {
             cmd.env_remove(name);
         }
         for (k, v) in &spec.env {
@@ -143,7 +235,9 @@ impl PtySession {
             last_size: Mutex::new((spec.cols, spec.rows)),
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
+            title: Mutex::new(title::TitleScanner::new()),
             cloud: Mutex::new(None),
+            input_seen: AtomicBool::new(false),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -153,6 +247,9 @@ impl PtySession {
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
+        if !data.is_empty() {
+            self.input_seen.store(true, Ordering::Relaxed);
+        }
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)?;
         w.flush()?;
@@ -161,12 +258,7 @@ impl PtySession {
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let master = self.master.lock().unwrap();
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        master.resize(pty_size(cols, rows))?;
         *self.last_size.lock().unwrap() = (cols, rows);
         Ok(())
     }
@@ -178,31 +270,27 @@ impl PtySession {
         let same = { *self.last_size.lock().unwrap() == (cols, rows) };
         if same && rows > 1 {
             let master = self.master.lock().unwrap();
-            master.resize(PtySize {
-                rows: rows - 1,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })?;
-            master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })?;
+            master.resize(pty_size(cols, rows - 1))?;
+            master.resize(pty_size(cols, rows))?;
             Ok(())
         } else {
             self.resize(cols, rows)
         }
     }
 
-    /// SIGHUP the child, then SIGKILL its whole process group if it hasn't
-    /// exited within [`KILL_GRACE`]. The group kill also reaps grandchildren
+    /// SIGHUP the child, then SIGKILL every process group under it if it
+    /// hasn't exited within [`KILL_GRACE`]. The sweep also reaps grandchildren
     /// that would otherwise hold the slave fd open (no EOF → reader thread,
-    /// pump task, and the 1MB ring all pinned forever).
+    /// pump task, and the 1MB ring all pinned forever) — including an agent
+    /// the login shell forked into a job group of its own, which a kill of
+    /// the leader's group alone would leave running with its pane gone.
     pub fn kill(&self) {
         // Subscribe before signalling so an immediate exit can't be missed.
         let mut rx = self.events.subscribe();
+        // Sweep before the polite signal: a shell that dies of it leaves the
+        // job it was running to init, where no walk from `pid` would find
+        // it afterwards. ~10ms, and a kill is rare.
+        let mut groups = self.child_pid.map(process_groups_under).unwrap_or_default();
         let _ = self.killer.lock().unwrap().kill();
         let Some(pid) = self.child_pid else { return };
         let sref = self.sref.clone();
@@ -211,28 +299,73 @@ impl PtySession {
         // called from.
         std::thread::Builder::new()
             .name("pty-kill-watchdog".into())
-            .stack_size(64 * 1024)
+            .stack_size(256 * 1024)
             .spawn(move || {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
                 let deadline = std::time::Instant::now() + KILL_GRACE;
-                let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+                let nix_pid = Pid::from_raw(pid as i32);
+                let mut child_gone = false;
                 while std::time::Instant::now() < deadline {
                     loop {
                         use tokio::sync::broadcast::error::TryRecvError;
                         match rx.try_recv() {
-                            Ok(PtyEvent::Exited { .. }) | Err(TryRecvError::Closed) => return,
+                            Ok(PtyEvent::Exited { .. }) | Err(TryRecvError::Closed) => {
+                                child_gone = true;
+                                break;
+                            }
                             Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
                             Err(TryRecvError::Empty) => break,
                         }
                     }
                     // Reaped (ESRCH) strictly precedes the Exited broadcast,
                     // so this also covers an Exited lost to channel lag.
-                    if nix::sys::signal::kill(nix_pid, None).is_err() {
-                        return;
+                    if child_gone || nix::sys::signal::kill(nix_pid, None).is_err() {
+                        child_gone = true;
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                tracing::warn!(session = ?sref, pid, "child ignored SIGHUP — SIGKILLing its process group");
-                let _ = nix::sys::signal::killpg(nix_pid, nix::sys::signal::Signal::SIGKILL);
+                if child_gone {
+                    // A shell that exited on its own hung up its jobs first;
+                    // one the signal took outright left them to init (and on
+                    // macOS the leader's death revokes the slave, so the
+                    // session reads as exited with the job still running).
+                    // Any group of the sweep still standing is the latter:
+                    // it gets the hangup the shell owed it, and its own
+                    // grace period.
+                    let orphans: Vec<Pid> = groups
+                        .iter()
+                        .filter(|&&g| g != pid)
+                        .map(|&g| Pid::from_raw(g as i32))
+                        .filter(|&g| killpg(g, None).is_ok())
+                        .collect();
+                    if orphans.is_empty() {
+                        return;
+                    }
+                    for g in &orphans {
+                        let _ = killpg(*g, Signal::SIGHUP);
+                    }
+                    let deadline = std::time::Instant::now() + KILL_GRACE;
+                    while std::time::Instant::now() < deadline
+                        && orphans.iter().any(|&g| killpg(g, None).is_ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if orphans.iter().all(|&g| killpg(g, None).is_err()) {
+                        return;
+                    }
+                }
+                // Whatever appeared since the first sweep, then the lot.
+                for pgid in process_groups_under(pid) {
+                    if !groups.contains(&pgid) {
+                        groups.push(pgid);
+                    }
+                }
+                tracing::warn!(session = ?sref, pid, ?groups, "still running after SIGHUP — SIGKILLing its process groups");
+                for pgid in groups {
+                    let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+                }
             })
             .expect("spawn pty kill watchdog");
     }
@@ -258,6 +391,17 @@ impl PtySession {
     /// Output that already landed in the ring is scanned first, so arming
     /// a moment after spawn cannot miss a fast-printing child; sightings
     /// then arrive as `PtyEvent::CloudSession` / `CloudAttachRejected`.
+    /// Whether anything has been typed into this session. Drives the
+    /// Cloud mirror's "stop refreshing once it's yours" rule.
+    pub fn input_seen(&self) -> bool {
+        self.input_seen.load(Ordering::Relaxed)
+    }
+
+    /// The child's current window title, or `None` if it never set one.
+    pub fn window_title(&self) -> Option<String> {
+        self.title.lock().unwrap().title().map(str::to_string)
+    }
+
     pub fn arm_cloud_scan(&self) {
         let mut scanner = CloudScanner::new();
         let (_, replay) = self.snapshot(None);
@@ -318,6 +462,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         let busy_edge = session.progress.lock().unwrap().feed(pending);
+        let title_change = session.title.lock().unwrap().feed(pending);
         let cloud_sightings = match session.cloud.lock().unwrap().as_mut() {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
@@ -334,6 +479,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         if let Some(busy) = busy_edge {
             tracing::debug!(session = ?session.sref, busy, "child progress state changed");
             let _ = session.events.send(PtyEvent::Progress { busy });
+        }
+        if let Some(title) = title_change {
+            tracing::debug!(session = ?session.sref, %title, "child window title changed");
+            let _ = session.events.send(PtyEvent::Title { title });
         }
         for sighting in cloud_sightings {
             tracing::info!(session = ?session.sref, ?sighting, "cloud sighting in child output");
@@ -375,4 +524,158 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         flush(&session, &mut pending);
     }
     tracing::info!(session = ?session.sref, "pty pump ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::AgentId;
+
+    fn echo_session() -> Arc<PtySession> {
+        PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/cat".into(),
+                args: vec![],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The Cloud mirror stops refreshing a pane once its user has typed
+    /// into it, so `input_seen` must track keystrokes only — an attach's
+    /// resize jiggle happens without anyone touching the keyboard.
+    #[tokio::test]
+    async fn input_seen_tracks_keystrokes_not_resizes() {
+        let session = echo_session();
+        assert!(!session.input_seen());
+        session.resize_with_jiggle(100, 30).unwrap();
+        session.resize(80, 24).unwrap();
+        assert!(!session.input_seen(), "a resize is not input");
+        session.write_input(b"").unwrap();
+        assert!(!session.input_seen(), "an empty write is not input");
+        session.write_input(b"x").unwrap();
+        assert!(session.input_seen());
+        session.kill();
+    }
+
+    /// A window title set by the child reaches subscribers as its own
+    /// event, and the session remembers it.
+    #[tokio::test]
+    async fn window_title_is_read_off_the_output() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\033]0;✳ Fix Login\\007'; sleep 2".into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        let title = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Title { title }) => break title,
+                    Ok(PtyEvent::Exited { .. }) => panic!("child exited before setting a title"),
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("title event within 10s");
+        assert_eq!(title, "✳ Fix Login");
+        assert_eq!(session.window_title().as_deref(), Some("✳ Fix Login"));
+        session.kill();
+    }
+
+    /// The pane is nebula's grid, not the terminal the daemon was started
+    /// from: every child hears `TERM`/`COLORTERM` for that grid, and a
+    /// `NO_COLOR` or `FORCE_COLOR` the daemon inherited never reaches it.
+    #[tokio::test]
+    async fn child_is_told_the_pane_is_a_truecolor_terminal() {
+        // The daemon's own environment is the base the child is built from,
+        // so the overrides have to sit there for the scrub to be exercised.
+        // Only this test sets them, and only until the spawn has read them;
+        // whatever was there before is put back.
+        let before: Vec<(&str, Option<std::ffi::OsString>)> = ["NO_COLOR", "FORCE_COLOR", "TERM"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("FORCE_COLOR", "0");
+        std::env::set_var("TERM", "foot");
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r#"printf 'env=%s|%s|%s|%s' "$TERM" "$COLORTERM" "${NO_COLOR-unset}" "${FORCE_COLOR-unset}""#
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        for (name, value) in before {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let mut rx = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child exits within 10s");
+        let (_, bytes) = session.snapshot(None);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.contains("env=xterm-256color|truecolor|unset|unset"),
+            "child saw: {out:?}"
+        );
+    }
+
+    /// The kill escalation must reach an agent the login shell forked into
+    /// a job group of its own, not just the PTY leader's group.
+    #[test]
+    fn process_groups_cover_a_job_the_shell_forked_into_its_own_group() {
+        // shell 20 leads its session (group 20); the agent 21 is a job in
+        // group 21 with a worker 22; 30 is another session, 99 unrelated.
+        let table = "\
+ 20    10    20
+ 21    20    21
+ 22    21    21
+ 30    10    30
+ 99     1    99
+";
+        assert_eq!(process_groups_in_table(table, 20), vec![20, 21]);
+        // A failed sweep still names the leader's own group.
+        assert_eq!(process_groups_in_table("", 20), vec![20]);
+    }
 }

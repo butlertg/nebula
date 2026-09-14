@@ -1,6 +1,6 @@
 use crate::ids::{AgentId, LinkId, ProjectId, TaskId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,18 +52,28 @@ pub enum AgentKind {
     Claude,
     Codex,
     Cursor,
+    /// pi.dev's coding agent: the `pi` CLI (npm
+    /// `@earendil-works/pi-coding-agent`). Status comes from a managed
+    /// TypeScript extension rather than shell hooks.
+    Pi,
 }
 
 impl AgentKind {
     /// Every kind, for callers that must cover all of them (menus, the
     /// boot-time CLI probe warm) and should fail to compile if one is added.
-    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor",
+            AgentKind::Pi => "pi",
         }
     }
 
@@ -72,6 +82,7 @@ impl AgentKind {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
             "cursor" => AgentKind::Cursor,
+            "pi" => AgentKind::Pi,
             _ => return None,
         })
     }
@@ -83,6 +94,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
+            AgentKind::Pi => "pi",
         }
     }
 }
@@ -109,6 +121,25 @@ pub struct Project {
     pub sort_order: i64,
 }
 
+impl Project {
+    /// The name a project takes from disk: the last component of its repo
+    /// path. This is the default `name`, and it stays the truth about where
+    /// the project lives no matter what the row is later renamed to.
+    pub fn folder_name(repo_path: &Path) -> String {
+        repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".into())
+    }
+
+    /// The folder name to show beneath a renamed row, or None while the row
+    /// still carries the folder's own name and repeating it would be noise.
+    pub fn folder_subtitle(&self) -> Option<String> {
+        let folder = Self::folder_name(&self.repo_path);
+        (folder != self.name).then_some(folder)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worktree {
     pub id: WorktreeId,
@@ -116,9 +147,6 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub is_main: bool,
-    /// Pinned worktrees sort into their own PINNED group in the worktrees list.
-    #[serde(default)]
-    pub pinned: bool,
     pub sort_order: i64,
 }
 
@@ -133,9 +161,6 @@ pub struct Agent {
     /// this field existed). Orders the ARCHIVED group newest-first.
     #[serde(default)]
     pub archived_at: i64,
-    /// Pinned agents sort into their own PINNED group in the sessions list.
-    #[serde(default)]
-    pub pinned: bool,
     /// Finished a turn (running or needs-feedback → finished) that no client
     /// has looked at since. The Projects and Worktrees rows count these so
     /// the user knows how many terminals to go read; the pane landing on
@@ -169,6 +194,35 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
+    /// True while the daemon is following this row's Claude Cloud session —
+    /// re-teleporting the pane on a timer so turns taken in the cloud show
+    /// up here. Runtime state like `alive`, never persisted: it ends the
+    /// moment the pane is typed into (the session is then the user's) and
+    /// does not survive a daemon restart.
+    #[serde(default)]
+    pub cloud_mirroring: bool,
+    /// The last few prompts typed into this session, oldest first — what
+    /// the `UserPromptSubmit` hook carried, condensed to one line each
+    /// (RECENT PROMPTS). Capped at [`RECENT_PROMPTS_KEPT`] by the daemon;
+    /// the TUI shows however many its setting asks for, the newest at
+    /// the bottom. Empty for every row that predates the capture.
+    #[serde(default)]
+    pub recent_prompts: Vec<PromptEntry>,
+}
+
+/// How many prompts the daemon keeps per session: the most a TUI can be
+/// asked to show, with room to spare so a raised setting has history to
+/// draw from at once.
+pub const RECENT_PROMPTS_KEPT: usize = 10;
+
+/// One prompt in a session's RECENT PROMPTS history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptEntry {
+    /// The prompt as one line: whitespace runs collapsed, clipped with an
+    /// ellipsis past the daemon's cap. Never empty.
+    pub text: String,
+    /// Epoch ms when the prompt was submitted (the hook's arrival).
+    pub submitted_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

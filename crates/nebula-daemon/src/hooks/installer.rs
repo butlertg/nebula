@@ -1,7 +1,8 @@
 //! Managed-hook installation into the agent CLI's config:
 //! `<worktree>/.claude/settings.local.json` (Claude Code),
 //! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
-//! (Cursor CLI).
+//! (Cursor CLI). Pi has no hook file — its managed TypeScript extension is
+//! `pi_extension.rs`, which shares this module's atomic writer.
 //!
 //! Claude and Codex share one hooks dialect (PascalCase event names, groups
 //! of `{"hooks": [{"type": "command", ...}]}`). Cursor speaks its own
@@ -33,8 +34,24 @@
 //! env-guarded, so they remain inert in codex sessions outside nebula.
 
 use anyhow::{bail, Context, Result};
+use nebula_core::env::{AGENT_ID, API_TOKEN, API_URL};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
+
+/// The hooks file's name under codex's home and cursor's per-worktree dir.
+/// Claude keeps its hooks in its settings file instead.
+const HOOKS_FILE: &str = "hooks.json";
+/// Claude Code's per-checkout settings: hooks and permission rules both.
+const CLAUDE_SETTINGS_FILE: &str = "settings.local.json";
+/// The CLIs' config directories: `.claude` and `.cursor` are per-worktree;
+/// `.codex` is both the worktree-local one an older nebula wrote (pruned
+/// now) and the name under `$HOME` when `$CODEX_HOME` is unset.
+const CLAUDE_DIR: &str = ".claude";
+const CURSOR_DIR: &str = ".cursor";
+const CODEX_DIR: &str = ".codex";
+/// How long a hook waits on the daemon. Hooks run inline in the agent's
+/// turn, so a hung daemon has to cost seconds, not a stuck session.
+const HOOK_CURL_TIMEOUT_SECS: u32 = 3;
 
 /// (hook event, optional matcher)
 const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
@@ -48,16 +65,17 @@ const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     // that arrives when a turn ends without a Stop. See status.rs.
     ("Notification", None),
     ("PreToolUse", Some("AskUserQuestion")),
-    ("PostToolUse", Some("AskUserQuestion")),
-    // Not a status signal — a position one. Claude reports the session's
-    // working directory on every hook payload, and these are the tools that
-    // change it: EnterWorktree/ExitWorktree relocate the whole session (what
-    // "do this in a worktree" actually runs), and a Bash `cd` moves it too.
-    // Hooking them re-homes the row seconds after the session moves instead
-    // of at the turn's Stop, which can be many minutes later. Matchers are
-    // regexes, so one group covers all three.
-    // See registry::reparent_agent_by_cwd.
-    ("PostToolUse", Some("Bash|EnterWorktree|ExitWorktree")),
+    // Every tool's end, unmatched. Three signals ride it: the answer to an
+    // `AskUserQuestion` (the row leaves red); the approval of a permission
+    // prompt, which fires no hook of its own — the gated tool simply runs,
+    // and its PostToolUse is the first word that the user said yes, for
+    // Edit and WebFetch as much as for Bash (see status.rs); and the
+    // session's position — Claude reports its working directory on every
+    // payload, and EnterWorktree/ExitWorktree (what "do this in a
+    // worktree" actually runs) or a Bash `cd` move it, so the row re-homes
+    // seconds after the move instead of at the turn's Stop, which can be
+    // many minutes later (see registry::reparent_agent_by_cwd).
+    ("PostToolUse", None),
     ("SubagentStart", None),
     ("SubagentStop", None),
 ];
@@ -85,6 +103,24 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
     ("subagentStop", "SubagentStop"),
 ];
 
+/// The shell test every hook opens with. Outside nebula (a bare `claude`
+/// in the same checkout) the session env is absent and the hook must be
+/// inert — exit before curl ever runs.
+fn env_guard() -> String {
+    format!("[ -z \"${AGENT_ID}\" ] || [ -z \"${API_URL}\" ]")
+}
+
+/// The POST itself, identical for every dialect: bearer auth, the hook's
+/// stdin payload passed straight through, and the agent id plus event
+/// name on the query string so the daemon needs nothing else to route it.
+fn hook_curl(endpoint: &str, event: &str) -> String {
+    format!(
+        "curl -sS -m {HOOK_CURL_TIMEOUT_SECS} -X POST -H \"Authorization: Bearer ${API_TOKEN}\" \
+         -H \"Content-Type: application/json\" --data-binary @- \
+         \"${API_URL}/api/hooks/{endpoint}?agentId=${AGENT_ID}&hookEvent={event}\""
+    )
+}
+
 fn hook_command(endpoint: &str, event: &str) -> String {
     // UserPromptSubmit passes the daemon's response body through to stdout:
     // Claude Code (and Codex, same dialect) add a hook's stdout to the
@@ -97,37 +133,39 @@ fn hook_command(endpoint: &str, event: &str) -> String {
         ">/dev/null 2>&1"
     };
     format!(
-        "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then exit 0; fi; \
-         curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
-         -H \"Content-Type: application/json\" --data-binary @- \
-         \"$NEBULA_API_URL/api/hooks/{endpoint}?agentId=$NEBULA_AGENT_ID&hookEvent={event}\" \
-         {silence} || true"
+        "if {}; then exit 0; fi; {} {silence} || true",
+        env_guard(),
+        hook_curl(endpoint, event)
     )
 }
 
 /// Permission rules letting Claude Code run nebula's own commands without a
 /// permission prompt: the auto-title `nebula rename`, and the `nebula
-/// worktree` relocation its appended system prompt tells it to use
-/// (codex/cursor run with their skip-permissions flags).
-const CLAUDE_ALLOW_RULES: &[&str] = &["Bash(nebula rename:*)", "Bash(nebula worktree:*)"];
+/// worktree` relocation, `nebula spawn` sibling and `nebula open` file tabs
+/// its appended system prompt tells it to use (codex/cursor run with their
+/// skip-permissions flags).
+const CLAUDE_ALLOW_RULES: &[&str] = &[
+    "Bash(nebula rename:*)",
+    "Bash(nebula worktree:*)",
+    "Bash(nebula spawn:*)",
+    "Bash(nebula open:*)",
+];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
 /// events (beforeSubmitPrompt) flowing and is ignored by the rest.
 fn cursor_hook_command(event: &str) -> String {
     format!(
-        "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then \
-         printf '{{\"continue\": true}}\\n'; exit 0; fi; \
-         curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
-         -H \"Content-Type: application/json\" --data-binary @- \
-         \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent={event}\" \
-         >/dev/null 2>&1 || true; printf '{{\"continue\": true}}\\n'"
+        "if {}; then printf '{{\"continue\": true}}\\n'; exit 0; fi; \
+         {} >/dev/null 2>&1 || true; printf '{{\"continue\": true}}\\n'",
+        env_guard(),
+        hook_curl("cursor", event)
     )
 }
 
 fn is_nebula_command(cmd: Option<&Value>) -> bool {
     cmd.and_then(Value::as_str)
-        .map(|c| c.contains("/api/hooks/") && c.contains("NEBULA_AGENT_ID"))
+        .map(|c| c.contains("/api/hooks/") && c.contains(AGENT_ID))
         .unwrap_or(false)
 }
 
@@ -164,20 +202,13 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 /// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
 /// the auto-title `nebula rename` run unprompted.
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
-    let dir = cwd.join(".claude");
-    let path = dir.join("settings.local.json");
-    let mut root = load_hooks_root(&path)?;
-    let Some(root_obj) = root.as_object_mut() else {
-        bail!(
-            "{} is not a JSON object — refusing to modify it",
-            path.display()
-        );
-    };
-    merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
-    for rule in CLAUDE_ALLOW_RULES {
-        ensure_permission_allow(root_obj, rule, &path)?;
-    }
-    write_hooks_root(&dir, "settings.local.json", &root)
+    install_managed_hooks(
+        &cwd.join(CLAUDE_DIR),
+        CLAUDE_SETTINGS_FILE,
+        "claude",
+        CLAUDE_EVENTS,
+        CLAUDE_ALLOW_RULES,
+    )
 }
 
 /// Idempotently add one entry to `permissions.allow`, preserving everything
@@ -188,37 +219,66 @@ fn ensure_permission_allow(
     path: &Path,
 ) -> Result<()> {
     let perms = root_obj.entry("permissions").or_insert_with(|| json!({}));
-    let Some(perms_obj) = perms.as_object_mut() else {
-        bail!(
-            "\"permissions\" in {} is not an object — refusing to modify it",
-            path.display()
-        );
-    };
+    let perms_obj = object_mut(perms, "\"permissions\"", path)?;
     let allow = perms_obj.entry("allow").or_insert_with(|| json!([]));
-    let Some(allow_arr) = allow.as_array_mut() else {
-        bail!(
-            "permissions.allow in {} is not an array — refusing to modify it",
-            path.display()
-        );
-    };
+    let allow_arr = array_mut(allow, "permissions.allow", path)?;
     if !allow_arr.iter().any(|v| v.as_str() == Some(entry)) {
         allow_arr.push(json!(entry));
     }
     Ok(())
 }
 
+/// The abort-don't-clobber gate on a config file's root: anything but an
+/// object is not a config nebula understands, so it is left exactly as
+/// found and the install fails instead.
+fn root_object_mut<'a>(root: &'a mut Value, path: &Path) -> Result<&'a mut Map<String, Value>> {
+    match root.as_object_mut() {
+        Some(obj) => Ok(obj),
+        None => bail!(
+            "{} is not a JSON object — refusing to modify it",
+            path.display()
+        ),
+    }
+}
+
+/// `v` as a mutable object, or the same refusal naming the field (`what`,
+/// spelled as the message should show it) inside `path`.
+fn object_mut<'a>(v: &'a mut Value, what: &str, path: &Path) -> Result<&'a mut Map<String, Value>> {
+    match v.as_object_mut() {
+        Some(obj) => Ok(obj),
+        None => bail!(
+            "{what} in {} is not an object — refusing to modify it",
+            path.display()
+        ),
+    }
+}
+
+/// Array twin of [`object_mut`].
+fn array_mut<'a>(v: &'a mut Value, what: &str, path: &Path) -> Result<&'a mut Vec<Value>> {
+    match v.as_array_mut() {
+        Some(arr) => Ok(arr),
+        None => bail!(
+            "{what} in {} is not an array — refusing to modify it",
+            path.display()
+        ),
+    }
+}
+
 /// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
 /// one trust approval covers every worktree. See the module header.
 pub fn codex_home() -> PathBuf {
-    match std::env::var("CODEX_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex"),
-    }
+    nebula_core::env::non_empty("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            nebula_core::env::home_dir()
+                .unwrap_or_default()
+                .join(CODEX_DIR)
+        })
 }
 
 /// Merge nebula's managed hooks for Codex into `<codex_home>/hooks.json`.
 pub fn install_codex_hooks(codex_home: &Path) -> Result<()> {
-    install_managed_hooks(codex_home, "hooks.json", "codex", CODEX_EVENTS)
+    install_managed_hooks(codex_home, HOOKS_FILE, "codex", CODEX_EVENTS, &[])
 }
 
 /// Drop the per-worktree `.codex/hooks.json` groups an older nebula wrote:
@@ -227,8 +287,8 @@ pub fn install_codex_hooks(codex_home: &Path) -> Result<()> {
 /// a file left holding nothing at all is removed, and so is a `.codex`
 /// directory that existed only for it.
 pub fn prune_codex_worktree_hooks(cwd: &Path) -> Result<()> {
-    let dir = cwd.join(".codex");
-    let path = dir.join("hooks.json");
+    let dir = cwd.join(CODEX_DIR);
+    let path = dir.join(HOOKS_FILE);
     if !path.exists() {
         return Ok(());
     }
@@ -241,12 +301,7 @@ pub fn prune_codex_worktree_hooks(cwd: &Path) -> Result<()> {
         return Ok(());
     };
     let before = hooks_obj.len();
-    for (_, groups) in hooks_obj.iter_mut() {
-        if let Some(arr) = groups.as_array_mut() {
-            arr.retain(|g| !is_nebula_group(g));
-        }
-    }
-    hooks_obj.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    purge_nebula_groups(hooks_obj);
     let emptied = hooks_obj.is_empty();
     if emptied && before > 0 && root.as_object().map(|o| o.len()) == Some(1) {
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -254,7 +309,21 @@ pub fn prune_codex_worktree_hooks(cwd: &Path) -> Result<()> {
         let _ = std::fs::remove_dir(&dir);
         return Ok(());
     }
-    write_hooks_root(&dir, "hooks.json", &root)
+    write_hooks_root(&dir, HOOKS_FILE, &root)
+}
+
+/// Strip nebula's groups from under EVERY event key of a loaded hooks
+/// object (not just the ones about to be reinstalled: stale keys from an
+/// older install shape must go, and events nebula may drop in the future
+/// must not linger), then drop the keys that emptied. User groups are left
+/// exactly as found.
+fn purge_nebula_groups(hooks_obj: &mut Map<String, Value>) {
+    for (_, groups) in hooks_obj.iter_mut() {
+        if let Some(arr) = groups.as_array_mut() {
+            arr.retain(|g| !is_nebula_group(g));
+        }
+    }
+    hooks_obj.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
 }
 
 /// Merge nebula's managed hooks for Cursor into `<cwd>/.cursor/hooks.json`,
@@ -262,53 +331,31 @@ pub fn prune_codex_worktree_hooks(cwd: &Path) -> Result<()> {
 /// older nebula wrote there (events Cursor never fires — the original
 /// "cursor status never updates" bug).
 pub fn install_cursor_hooks(cwd: &Path) -> Result<()> {
-    let dir = cwd.join(".cursor");
-    let path = dir.join("hooks.json");
+    let dir = cwd.join(CURSOR_DIR);
+    let path = dir.join(HOOKS_FILE);
     let mut root = load_hooks_root(&path)?;
 
-    let Some(root_obj) = root.as_object_mut() else {
-        bail!(
-            "{} is not a JSON object — refusing to modify it",
-            path.display()
-        );
-    };
+    let root_obj = root_object_mut(&mut root, &path)?;
     // Cursor requires a top-level version; never overwrite an existing one.
     root_obj.entry("version").or_insert(json!(1));
     let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks_obj) = hooks.as_object_mut() else {
-        bail!(
-            "\"hooks\" in {} is not an object — refusing to modify it",
-            path.display()
-        );
-    };
+    let hooks_obj = object_mut(hooks, "\"hooks\"", &path)?;
 
-    // Purge nebula groups under EVERY key (not just the ones we reinstall):
-    // stale PascalCase keys from the old Claude-shaped install must go, and
-    // event keys we may drop in the future must not linger.
-    for (_, groups) in hooks_obj.iter_mut() {
-        if let Some(arr) = groups.as_array_mut() {
-            arr.retain(|g| !is_nebula_group(g));
-        }
-    }
-    hooks_obj.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    // The stale PascalCase keys from the old Claude-shaped install go here.
+    purge_nebula_groups(hooks_obj);
 
     for (cursor_event, nebula_event) in CURSOR_EVENTS {
         let groups = hooks_obj
             .entry(cursor_event.to_string())
             .or_insert_with(|| json!([]));
-        let Some(groups_arr) = groups.as_array_mut() else {
-            bail!(
-                "hooks.{cursor_event} in {} is not an array — refusing to modify it",
-                path.display()
-            );
-        };
+        let groups_arr = array_mut(groups, &format!("hooks.{cursor_event}"), &path)?;
         groups_arr.push(json!({
             "command": cursor_hook_command(nebula_event),
             "_nebulaManaged": true,
         }));
     }
 
-    write_hooks_root(&dir, "hooks.json", &root)
+    write_hooks_root(&dir, HOOKS_FILE, &root)
 }
 
 fn load_hooks_root(path: &Path) -> Result<Value> {
@@ -332,7 +379,7 @@ fn write_hooks_root(dir: &Path, file_name: &str, root: &Value) -> Result<()> {
     write_text_atomic(dir, file_name, &serde_json::to_string_pretty(root)?)
 }
 
-fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
+pub(super) fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     // Atomic write: tmp + rename.
     let tmp = dir.join(format!(".{file_name}.nebula-tmp"));
@@ -342,22 +389,26 @@ fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load `<dir>/<file_name>`, strip-and-rebuild nebula's groups for `events`
+/// in the Claude/Codex dialect, make sure each of `allow_rules` is in
+/// `permissions.allow`, and write it back. Claude's settings file carries
+/// hooks and permissions both, so the one pass serves it and codex's
+/// hooks-only file alike (codex passes no rules).
 fn install_managed_hooks(
     dir: &Path,
     file_name: &str,
     endpoint: &str,
     events: &[(&str, Option<&str>)],
+    allow_rules: &[&str],
 ) -> Result<()> {
     let path = dir.join(file_name);
     let mut root = load_hooks_root(&path)?;
 
-    let Some(root_obj) = root.as_object_mut() else {
-        bail!(
-            "{} is not a JSON object — refusing to modify it",
-            path.display()
-        );
-    };
+    let root_obj = root_object_mut(&mut root, &path)?;
     merge_managed_hooks(root_obj, endpoint, events, &path)?;
+    for rule in allow_rules {
+        ensure_permission_allow(root_obj, rule, &path)?;
+    }
     write_hooks_root(dir, file_name, &root)
 }
 
@@ -370,28 +421,17 @@ fn merge_managed_hooks(
     path: &Path,
 ) -> Result<()> {
     let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks_obj) = hooks.as_object_mut() else {
-        bail!(
-            "\"hooks\" in {} is not an object — refusing to modify it",
-            path.display()
-        );
-    };
+    let hooks_obj = object_mut(hooks, "\"hooks\"", path)?;
 
-    // One event can carry several managed groups (PostToolUse has one per
-    // matcher), so the strip-and-rebuild happens once per event name —
-    // stripping again for the second matcher would delete the group the
-    // first one just added.
+    // One event may carry several managed groups (one per matcher), so the
+    // strip-and-rebuild happens once per event name — stripping again for
+    // a second matcher would delete the group the first one just added.
     let mut stripped: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (event, matcher) in events {
         let groups = hooks_obj
             .entry(event.to_string())
             .or_insert_with(|| json!([]));
-        let Some(groups_arr) = groups.as_array_mut() else {
-            bail!(
-                "hooks.{event} in {} is not an array — refusing to modify it",
-                path.display()
-            );
-        };
+        let groups_arr = array_mut(groups, &format!("hooks.{event}"), path)?;
         if stripped.insert(event) {
             groups_arr.retain(|g| !is_nebula_group(g));
         }
@@ -407,7 +447,7 @@ fn merge_managed_hooks(
 /// nebula or on later prompts is harmless: the rule env-guards itself, and
 /// the daemon accepts at most one auto-title per session.
 pub fn install_cursor_title_rule(cwd: &Path) -> Result<()> {
-    let dir = cwd.join(".cursor").join("rules");
+    let dir = cwd.join(CURSOR_DIR).join("rules");
     write_text_atomic(&dir, "nebula-title.mdc", &cursor_title_rule())
 }
 
@@ -435,6 +475,38 @@ On the first user message of a new conversation:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact one-liners that land in users' config files. Pinned
+    /// verbatim so the shared curl prelude can be factored without a byte
+    /// of the installed command drifting.
+    #[test]
+    fn hook_commands_are_spelled_exactly() {
+        assert_eq!(
+            hook_command("claude", "UserPromptSubmit"),
+            "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then exit 0; fi; \
+             curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H \"Content-Type: application/json\" --data-binary @- \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\" \
+             2>/dev/null || true"
+        );
+        assert_eq!(
+            hook_command("codex", "Stop"),
+            "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then exit 0; fi; \
+             curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H \"Content-Type: application/json\" --data-binary @- \
+             \"$NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID&hookEvent=Stop\" \
+             >/dev/null 2>&1 || true"
+        );
+        assert_eq!(
+            cursor_hook_command("Stop"),
+            "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then \
+             printf '{\"continue\": true}\\n'; exit 0; fi; \
+             curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H \"Content-Type: application/json\" --data-binary @- \
+             \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=Stop\" \
+             >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+        );
+    }
 
     fn read_json(dir: &Path, rel: &str) -> Value {
         let text = std::fs::read_to_string(dir.join(rel)).unwrap();
@@ -465,25 +537,41 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_keeps_both_matchers_across_reinstalls() {
-        // Two managed groups share the PostToolUse event: AskUserQuestion is
-        // the waiting-on-user signal, the other is the cwd probe that
-        // re-homes a session into a worktree it just entered. A reinstall
-        // (every spawn) must leave exactly one of each.
+    fn post_tool_use_is_one_unmatched_group_across_reinstalls() {
+        // PostToolUse carries no matcher: a permission prompt's approval is
+        // only ever visible as the gated tool's completion, whatever the
+        // tool, and the AskUserQuestion answer and the cwd probe ride the
+        // same group. A reinstall (every spawn) must leave exactly one —
+        // and must replace the two matched groups an older nebula wrote.
         let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = |matcher: &str| {
+            let mut g = managed_group("claude", "PostToolUse", Some(matcher));
+            g["_nebulaManaged"] = json!(true);
+            g
+        };
+        std::fs::write(
+            dir.join("settings.local.json"),
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "PostToolUse": [old("AskUserQuestion"), old("Bash|EnterWorktree|ExitWorktree")]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         install_claude_hooks(tmp.path()).unwrap();
         install_claude_hooks(tmp.path()).unwrap();
         let settings = read_settings(tmp.path());
         let groups = settings["hooks"]["PostToolUse"].as_array().unwrap();
-        let matchers: Vec<&str> = groups
-            .iter()
-            .map(|g| g["matcher"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            matchers,
-            vec!["AskUserQuestion", "Bash|EnterWorktree|ExitWorktree"]
-        );
-        assert!(groups.iter().all(|g| g["_nebulaManaged"] == json!(true)));
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert!(groups[0].get("matcher").is_none());
+        assert_eq!(groups[0]["_nebulaManaged"], json!(true));
+        assert!(groups[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hookEvent=PostToolUse"));
     }
 
     #[test]
@@ -582,7 +670,9 @@ mod tests {
         std::env::set_var("CODEX_HOME", "");
         assert_eq!(
             codex_home(),
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+            nebula_core::env::home_dir()
+                .unwrap_or_default()
+                .join(".codex")
         );
         match saved {
             Some(v) => std::env::set_var("CODEX_HOME", v),
@@ -705,7 +795,7 @@ mod tests {
         install_claude_hooks(tmp.path()).unwrap();
         let settings = read_settings(tmp.path());
         for (event, _) in CLAUDE_EVENTS {
-            // One group per (event, matcher) pair — PostToolUse carries two.
+            // One group per (event, matcher) pair.
             let expected = CLAUDE_EVENTS.iter().filter(|(e, _)| e == event).count();
             assert_eq!(
                 settings["hooks"][*event].as_array().unwrap().len(),

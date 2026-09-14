@@ -4,7 +4,7 @@
 //! is highlighted and which panel has focus.
 //!
 //! Flow under test:
-//!   add two projects → Tab-cycle focus → create two worktrees →
+//!   add two projects → Tab-walk focus → create two worktrees →
 //!   j/k selection between worktrees → Enter into the sessions panel →
 //!   create an agent (auto-attach) → per-worktree session isolation →
 //!   j/k toggling between projects updates the worktree panel.
@@ -18,6 +18,23 @@ use std::time::{Duration, Instant};
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
 const WAIT: Duration = Duration::from_secs(20);
+/// How long the daemon gets to answer a one-shot CLI call.
+const CLI_TIMEOUT: Duration = Duration::from_secs(5);
+/// Sleep between polls of the screen or a child.
+const POLL_STEP: Duration = Duration::from_millis(50);
+
+// Raw key bytes as the PTY sees them — the name replaces a trailing comment.
+const ENTER: &[u8] = b"\r";
+const TAB: &[u8] = b"\t";
+const SHIFT_TAB: &[u8] = b"\x1b[Z";
+const CTRL_RIGHT: &[u8] = b"\x1b[1;5C";
+const ESC: &[u8] = &[0x1b];
+const LEFT: &[u8] = b"\x1b[D";
+const DOWN: &[u8] = b"\x1b[B";
+const CTRL_Q: &[u8] = &[0x11];
+const CTRL_R: &[u8] = &[0x12];
+/// Ctrl+] as the legacy byte Terminal.app sends.
+const CTRL_RBRACKET: &[u8] = &[0x1d];
 
 // Distinct footer hints identify the focused panel on screen.
 /// The Workspaces tab bar (shown by default, `Shift+W` hides it).
@@ -70,11 +87,12 @@ impl TuiHarness {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.env("NEBULA_RUNTIME_DIR", &runtime_dir);
-        cmd.env("NEBULA_DATA_DIR", &data_dir);
-        cmd.env("NEBULA_AGENT_CMD", "/bin/sh"); // stand-in for claude
-        cmd.env("NEBULA_WORKTREE_SYNC_MS", "100"); // fast external-change pickup
-        cmd.env("NEBULA_LOG", "debug");
+        cmd.env(nebula_core::env::RUNTIME_DIR, &runtime_dir);
+        cmd.env(nebula_core::env::DATA_DIR, &data_dir);
+        cmd.env(nebula_core::env::AGENT_CMD, "/bin/sh"); // stand-in for claude
+        cmd.env(nebula_core::env::WORKTREE_SYNC_MS, "100"); // fast external-change pickup
+        cmd.env(nebula_core::env::UPDATE_CHECK_SECS, "0"); // the footer must not depend on GitHub
+        cmd.env(nebula_core::env::LOG, "debug");
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
         // Agent/CI shells often export NO_COLOR; crossterm then strips the
@@ -123,18 +141,7 @@ impl TuiHarness {
     fn make_repo(&self, name: &str) -> PathBuf {
         let repo = self._repos.path().join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed in {}", repo.display());
-        };
+        let git = |args: &[&str]| repo_git(&repo, args);
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@nebula.dev"]);
         git(&["config", "user.name", "nebula-test"]);
@@ -186,7 +193,7 @@ impl TuiHarness {
                     self.screen_text()
                 );
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(POLL_STEP);
         }
     }
 
@@ -227,8 +234,8 @@ impl Drop for TuiHarness {
         // Stop the auto-spawned daemon and clean the short-lived dirs.
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .arg("kill")
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", &self.data_dir)
+            .env(nebula_core::env::RUNTIME_DIR, &self.runtime_dir)
+            .env(nebula_core::env::DATA_DIR, &self.data_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -248,7 +255,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
                     if contents.is_empty() {
                         out.push(' ');
                     } else {
-                        out.push_str(&contents);
+                        out.push_str(contents);
                     }
                 }
                 None => out.push(' '),
@@ -277,7 +284,7 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
         if line.contains(needle) {
@@ -299,16 +306,29 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
-        if line.contains(needle) {
+        if let Some(at) = line.find(needle) {
             // Selection paints the row with the raised fill: indexed 237 in
             // the focused panel, 235 in unfocused ones (theme sel_bg /
-            // sel_bg_dim).
-            let filled = (0..cols).any(|col| {
+            // sel_bg_dim). Only the needle's own panel band counts — the
+            // panels share screen lines, and a selected pill in the next
+            // column over used to pass this check for a row it had nothing
+            // to do with.
+            let at = line[..at].chars().count();
+            let chars: Vec<char> = line.chars().collect();
+            let band_start = chars[..at]
+                .iter()
+                .rposition(|&c| c == '│')
+                .map_or(0, |i| i + 1);
+            let band_end = chars[at..]
+                .iter()
+                .position(|&c| c == '│')
+                .map_or(chars.len(), |i| at + i);
+            let filled = (band_start..band_end).any(|col| {
                 matches!(
-                    screen.cell(row, col).map(|c| c.bgcolor()),
+                    screen.cell(row, col as u16).map(|c| c.bgcolor()),
                     Some(vt100::Color::Idx(237)) | Some(vt100::Color::Idx(235))
                 )
             });
@@ -324,7 +344,7 @@ fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
     tui.send(b"n");
     tui.wait_for_text("Add project");
     tui.type_str(&path.to_string_lossy());
-    tui.send(b"\r");
+    tui.send(ENTER);
     // The prompt must close before asserting panel content — otherwise the
     // overlay's own text can satisfy the wait (stale-frame race).
     tui.wait_for_gone("Add project");
@@ -332,7 +352,7 @@ fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
     // A fresh project auto-selects itself and steps into its Worktrees
     // panel; hop back to Projects so callers stay panel-stable.
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"\x1b[D"); // ← (h is the hosts picker)
+    tui.send(LEFT); // (h is the hosts picker)
     tui.wait_for_text(FOOTER_PROJECTS);
 }
 
@@ -353,13 +373,13 @@ fn create_worktree(tui: &mut TuiHarness, branch: &str) {
     tui.send(b"n");
     tui.wait_for_text("New worktree");
     tui.type_str(branch);
-    tui.send(b"\r");
+    tui.send(ENTER);
     tui.wait_for_gone("New worktree");
     tui.wait_for_text(branch);
     // A fresh worktree auto-focuses the sessions panel (so `n` starts an
     // agent); hop back to Worktrees so callers stay panel-stable.
     tui.wait_for_text(FOOTER_SESSIONS);
-    tui.send(b"\x1b[D"); // ← (h is the hosts picker)
+    tui.send(LEFT); // (h is the hosts picker)
     tui.wait_for_text(FOOTER_WORKTREES);
 }
 
@@ -379,16 +399,16 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"n");
     tui.wait_for_text("Add project");
     tui.type_str(&format!("{}/al", alpha.parent().unwrap().display()));
-    tui.send(b"\t");
+    tui.send(TAB);
     tui.wait_for_text("alpha-proj/");
-    tui.send(b"\r");
+    tui.send(ENTER);
     tui.wait_for_gone("Add project");
     tui.wait_for_text("alpha-proj");
     tui.wait_for_text("main ⌂ root"); // main checkout appears as the root row
 
     // Adding landed in the new project's Worktrees panel; step back.
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"\x1b[D"); // ←
+    tui.send(LEFT);
     tui.wait_for_text(FOOTER_PROJECTS);
 
     // The live directory browser: typing "…/T/.tmpX/" lists both repos as
@@ -398,7 +418,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.type_str(&format!("{}/", alpha.parent().unwrap().display()));
     tui.wait_for_text("alpha-proj/");
     tui.wait_for_text("beta-proj/");
-    tui.send(&[0x1b]); // Esc
+    tui.send(ESC);
     tui.wait_for_gone("Add project");
 
     // ---- second project typed the plain way ----
@@ -409,22 +429,36 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"k");
     tui.wait_for_selected("alpha-proj");
 
-    // ---- Tab cycles focus across all five panes and back ----
-    tui.send(b"\t");
+    // ---- Tab walks focus out to the terminal pane and stops there ----
+    tui.send(TAB);
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"\t");
+    tui.send(TAB);
     tui.wait_for_text(FOOTER_SESSIONS);
-    tui.send(b"\t");
+    tui.send(TAB);
     // Terminal pane focused with nothing attached: no panel footer, no lock.
     tui.wait_for_gone(FOOTER_SESSIONS);
-    tui.send(b"\t");
-    // Wrapped around to the first stop: the Workspaces bar, then Projects.
+    // Forward has nowhere left to go, so this Tab is a no-op — proved by
+    // the ⇧Tab after it landing on Sessions, not on a wrapped-round bar.
+    tui.send(TAB);
+    tui.send(SHIFT_TAB);
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- ⇧Tab walks back and stops dead on the workspaces bar ----
+    tui.send(SHIFT_TAB);
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(SHIFT_TAB);
+    tui.wait_for_text(FOOTER_PROJECTS);
+    tui.send(SHIFT_TAB);
     tui.wait_for_text(FOOTER_WORKSPACES);
-    tui.send(b"\t");
+    // The bar is the top of the walk, so this ⇧Tab is a no-op — proved by
+    // the Tab after it stepping down to Projects. Had it wrapped into the
+    // pane, forward would have stayed there and Projects never returned.
+    tui.send(SHIFT_TAB);
+    tui.send(TAB);
     tui.wait_for_text(FOOTER_PROJECTS);
 
     // ---- Enter drills from Projects into Worktrees ----
-    tui.send(b"\r");
+    tui.send(ENTER);
     tui.wait_for_text(FOOTER_WORKTREES);
 
     // ---- create two worktrees on alpha-proj ----
@@ -448,30 +482,36 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.wait_for_selected("feat-a");
 
     // ---- Enter shows the sessions (agents) panel for feat-a ----
-    tui.send(b"\r");
+    tui.send(ENTER);
     tui.wait_for_text(FOOTER_SESSIONS);
 
     // ---- create an agent: kind picker → name prompt, auto-attaches ----
     tui.send(b"n");
     tui.wait_for_text("New session"); // Claude/Codex/Cursor/Terminal picker
-    tui.send(b"\r"); // pick the default (Claude)
+    tui.send(ENTER); // pick the default (Claude)
     tui.wait_for_gone("New session");
     tui.wait_for_text("New agent");
-    tui.send(b"\r"); // empty input falls back to "agent-1"
+    tui.send(ENTER); // empty input falls back to "agent-1"
     tui.wait_for_gone("New agent");
     tui.wait_for_text("agent-1"); // now provably the sessions-panel row
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED); // auto-attach locks input
 
     // ---- Ctrl+q (raw byte 0x11, what every emulator sends) escapes back ----
-    tui.send(&[0x11]);
+    tui.send(CTRL_Q);
     tui.wait_for_text(FOOTER_SESSIONS);
 
-    // ---- Tab merely focuses the live pane (no lock); Enter locks it ----
-    tui.send(b"\t");
+    // ---- Ctrl+→ focuses the live pane without locking; Enter locks it ----
+    tui.send(CTRL_RIGHT);
     tui.wait_for_text(FOOTER_TERMINAL_FOCUSED);
-    tui.send(b"\r");
+    tui.send(ENTER);
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
-    tui.send(&[0x1d]); // Ctrl+] fallback (legacy byte, what Terminal.app sends)
+    tui.send(CTRL_RBRACKET);
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- Tab walks onto the live pane and takes its input in one step ----
+    tui.send(TAB);
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.send(CTRL_RBRACKET);
     tui.wait_for_text(FOOTER_SESSIONS);
 
     // ---- Shift+T: a shell terminal in the worktree dir, auto-attached ----
@@ -479,21 +519,24 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.wait_for_text("TERMINALS");
     tui.wait_for_text("term-1");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
-    tui.send(&[0x11]); // Ctrl+q back to panels
+    tui.send(CTRL_Q); // back to panels
     tui.wait_for_text(FOOTER_SESSIONS);
 
-    // ---- sessions are per-worktree: feat-b has no agent-1 ----
-    tui.send(b"\x1b[D"); // ← back to Worktrees (feat-a still selected)
+    // ---- sessions are per-worktree: main has no agent-1 ----
+    // The root checkout keeps the first row no matter what; feat-a is the
+    // only stamped worktree, so RECENCY ORDER puts it right under it:
+    // [main, feat-a, feat-b]. k from it lands on the root checkout.
+    tui.send(LEFT); // back to Worktrees (feat-a still selected)
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"j"); // feat-b
-    tui.wait_for_selected("feat-b");
+    tui.send(b"k"); // main
+    tui.wait_for_selected("main ⌂ root");
     tui.wait_for_sessions_row_gone("agent-1");
-    tui.send(b"k"); // back to feat-a
+    tui.send(b"j"); // back to feat-a
     tui.wait_for_selected("feat-a");
     tui.wait_for_text("agent-1");
 
     // ---- toggling projects swaps the whole worktree panel ----
-    tui.send(b"\x1b[D"); // ← focus Projects
+    tui.send(LEFT); // focus Projects
     tui.wait_for_text(FOOTER_PROJECTS);
     tui.send(b"j"); // select beta-proj
     tui.wait_for_selected("beta-proj");
@@ -512,17 +555,19 @@ fn tui_projects_worktrees_agents_navigation() {
     // Switching back restores the remembered context: feat-a is the
     // selected worktree again and its agent is back without re-drilling.
     tui.wait_for_text("agent-1");
-    tui.send(b"\r"); // Projects → Worktrees
+    tui.send(ENTER); // Projects → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.wait_for_selected("feat-a");
 
     // ---- clean quit ----
     tui.send(b"q");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    tui.wait_for_text("Quit nebula");
+    tui.send(b"y");
+    let deadline = Instant::now() + CLI_TIMEOUT;
     loop {
         match tui.child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_STEP),
             _ => panic!(
                 "TUI did not exit after q\n--- screen ---\n{}",
                 tui.screen_text()
@@ -546,65 +591,160 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_text("TERMINAL & MOUSE");
     tui.wait_for_text("GENERAL");
 
-    tui.send(&[0x1b]); // Esc closes
+    tui.send(ESC); // closes
     tui.wait_for_gone("NAVIGATE & SEARCH");
 }
 
-/// Links live in the Sessions panel's own LINKS group: `L` adds one from
-/// any panel, `r` edits it, Enter would open it, `d` removes it. The
-/// pull-request row is not exercised here — the test repo has no remote,
-/// so `gh` (installed or not) reports no PR.
+/// `nebula open` typed into a live session's shell — the stand-in agent is
+/// `/bin/sh`, holding the AGENT ENV a real CLI would — raises the FILE
+/// TABS in the TUI attached to that daemon: one tab per file, the first
+/// previewed. Ctrl+Q from the strip closes it and hands the pane back.
 #[test]
-fn tui_link_crud_in_sessions_panel() {
+fn nebula_open_from_inside_a_session_raises_the_file_tabs() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("open-proj");
+    let alpha = repo.join("alpha.md");
+    let beta = repo.join("beta.rs");
+    std::fs::write(&alpha, "# alpha opened from the session\n").unwrap();
+    std::fs::write(&beta, "fn beta() {}\n").unwrap();
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "open-proj");
+    tui.send(ENTER); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(ENTER); // Worktrees → Sessions
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- an agent (the stand-in shell), auto-attached and locked ----
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(ENTER);
+    tui.wait_for_gone("New session");
+    tui.wait_for_text("New agent");
+    tui.send(ENTER);
+    tui.wait_for_gone("New agent");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    // ---- what the model runs, typed at the shell inside the session ----
+    tui.type_str(&format!(
+        "{} open {} {}",
+        env!("CARGO_BIN_EXE_nebula"),
+        alpha.display(),
+        beta.display()
+    ));
+    tui.send(ENTER);
+    tui.wait_for_text("Open files (2)");
+    // The preview is the file itself — text the shell never echoed.
+    tui.wait_for_text("alpha opened from the session");
+    tui.wait_for_text("Enter: edit in");
+
+    // ---- → moves to the next tab and its preview ----
+    tui.send(b"\x1b[C");
+    tui.wait_for_text("fn beta() {}");
+
+    // ---- Ctrl+Q from the strip closes; the locked pane is back ----
+    tui.send(CTRL_Q);
+    tui.wait_for_gone("Open files (2)");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+}
+
+#[test]
+fn tui_hides_projects_and_worktrees_independently() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("roomy-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "roomy-proj");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+
+    tui.send(b"P");
+    tui.wait_for_gone("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_WORKTREES);
+
+    tui.send(b"B");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("SESSIONS");
+    tui.wait_for_text("⇧P: show projects");
+    tui.wait_for_text("⇧B: show worktrees");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tui.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["hide_projects"], true);
+    assert_eq!(config["hide_worktrees"], true);
+
+    tui.send(b"P");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("⇧B: show worktrees");
+
+    tui.send(b"B");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_SESSIONS);
+}
+
+/// Renaming a project is a label change, and an empty name undoes it.
+/// Drives the real binary: the row picks up the new label with the folder
+/// name hanging off a `└` underneath, then clearing the field puts the row
+/// back on the folder's own name with nothing under it.
+#[test]
+fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("acme-repo");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "acme-repo");
+
+    // ---- rename: the label leads, the folder hangs off a `└` ----
+    tui.send(b"r");
+    tui.wait_for_text("Rename project");
+    // The field is prefilled with the current name; clear it first.
+    tui.send(b"\x15"); // ^u
+    tui.type_str("Acme API");
+    tui.send(b"\r");
+    tui.wait_for_gone("Rename project");
+    tui.wait_for_text("Acme API");
+    tui.wait_for_text("└ acme-repo");
+
+    // ---- undo: an empty name puts the row back on the folder name ----
+    tui.send(b"r");
+    tui.wait_for_text("Rename project");
+    tui.send(b"\x15"); // ^u clears the prefill
+    tui.send(b"\r");
+    tui.wait_for_gone("Rename project");
+    // The chosen label is gone and so is the child row — the folder name is
+    // the row again, exactly as a freshly added project renders.
+    tui.wait_for_gone("Acme API");
+    tui.wait_for_gone("└ acme-repo");
+    tui.wait_for_text("acme-repo");
+}
+
+/// Manual LINK creation is intentionally absent: Shift+L is unbound and
+/// the HELP OVERLAY offers no attach-link action.
+#[test]
+fn tui_manual_link_add_is_unavailable() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("link-proj");
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "link-proj");
-    // The root worktree row must exist before a link has an owner.
     tui.wait_for_text("⌂ root");
 
-    // ---- create: Shift+L prompts, the URL lands in a LINKS group ----
     tui.send(b"L");
-    tui.wait_for_text("Add link");
-    tui.type_str("https://example.dev/spec");
-    tui.send(b"\r");
-    tui.wait_for_text("LINKS");
-    // Rows show the URL without the scheme.
-    tui.wait_for_text("example.dev/spec");
-    // The cursor followed the new row into the Sessions panel.
-    tui.wait_for_selected("example.dev/spec");
-
-    // ---- update: r prefills the URL, so typing appends to it ----
-    tui.send(b"r");
-    tui.wait_for_text("Edit link");
-    tui.type_str("/v2");
-    tui.send(b"\r");
-    tui.wait_for_text("example.dev/spec/v2");
-
-    // ---- a second link: both list under the one header ----
-    tui.send(b"L");
-    tui.wait_for_text("Add link");
-    // Typed without a scheme — the daemon normalizes it to https://.
-    // Short on purpose: the Sessions panel truncates long rows.
-    tui.type_str("docs.dev/design");
-    tui.send(b"\r");
-    tui.wait_for_text("docs.dev/design");
-
-    // ---- delete: d confirms, y removes the row ----
-    tui.send(b"d");
-    tui.wait_for_text("Delete link");
-    tui.send(b"y");
-    tui.wait_for_sessions_row_gone("docs.dev/design");
-    // The other link is untouched.
-    tui.wait_for_text("example.dev/spec/v2");
+    tui.send(b"?");
+    // If Shift+L still opened a prompt, this `?` would type into it instead
+    // of opening HELP OVERLAY, so this heading proves the key was a no-op.
+    tui.wait_for_text("NAVIGATE & SEARCH");
+    tui.wait_for_gone("attach a link");
 }
 
-/// The pull request nebula finds on the branch leads the LINKS group. A
+/// The pull request nebula finds on the branch leads the PULL REQUESTS group. A
 /// stub `gh` on PATH stands in for GitHub: the real one is asked for exactly
 /// this JSON (`gh pr view --json number,url,title,state,isDraft`).
 #[test]
-fn tui_pull_request_row_leads_the_links_group() {
+fn tui_pull_request_row_leads_the_pull_requests_group() {
     let stub_bin = tempfile::tempdir().unwrap();
     let gh = stub_bin.path().join("gh");
     std::fs::write(
@@ -626,24 +766,16 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("⌂ root");
 
     // The lookup rides the git poll, so the row shows up on its own.
-    tui.wait_for_text("LINKS");
+    tui.wait_for_text("PULL REQUESTS");
     tui.wait_for_text("#7 Attach links");
 
     // It is not a stored row: d says so instead of opening a confirm.
-    tui.send(b"\r"); // Projects → Worktrees
+    tui.send(ENTER); // Projects → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"\r"); // Worktrees → Sessions
+    tui.send(ENTER); // Worktrees → Sessions
     tui.wait_for_selected("#7 Attach links");
     tui.send(b"d");
     tui.wait_for_text("can't be deleted");
-
-    // A link the user adds lands under it.
-    tui.send(b"L");
-    tui.wait_for_text("Add link");
-    tui.type_str("example.dev/spec");
-    tui.send(b"\r");
-    tui.wait_for_text("example.dev/spec");
-    tui.wait_for_text("#7 Attach links");
 }
 
 #[test]
@@ -673,21 +805,21 @@ fn tui_git_diff_modal() {
 
     // ---- Ctrl+r marks .keep reviewed: it sinks below hello.txt and the
     // selection auto-advances to the next file, loading its diff ----
-    tui.send(&[0x12]);
+    tui.send(CTRL_R);
     tui.wait_for_text("· 1✓"); // files-panel title counts the mark
     tui.wait_for_selected("hello.txt");
     tui.wait_for_text("+hello world");
 
     // ---- Down reaches the reviewed zone; Ctrl+r unmarks .keep, which
     // pops back to the top of the list and stays selected ----
-    tui.send(b"\x1b[B"); // Down
+    tui.send(DOWN);
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
-    tui.send(&[0x12]);
+    tui.send(CTRL_R);
     tui.wait_for_gone("· 1✓");
 
     // ---- arrow to the untracked file ----
-    tui.send(b"\x1b[B"); // Down
+    tui.send(DOWN);
     tui.wait_for_selected("hello.txt");
     tui.wait_for_text("+hello world");
 
@@ -696,7 +828,7 @@ fn tui_git_diff_modal() {
     tui.wait_for_text("Files (1/2)");
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
-    tui.send(&[0x1b]); // first Esc clears the filter, not the modal
+    tui.send(ESC); // first clears the filter, not the modal
     tui.wait_for_text("Files (2)");
 
     // ---- the modal blocks other interaction ----
@@ -704,9 +836,9 @@ fn tui_git_diff_modal() {
     // feeds the filter instead (verified after close — stale-frame convention).
     tui.send(b"n");
     tui.wait_for_text("no matches");
-    tui.send(&[0x1b]); // Esc clears the filter…
+    tui.send(ESC); // clears the filter…
     tui.wait_for_text("Files (2)"); // (also keeps the two Escs from coalescing)
-    tui.send(&[0x1b]); // …and the second closes the modal
+    tui.send(ESC); // …and the second closes the modal
     tui.wait_for_gone("Files (2)");
     tui.wait_for_text(FOOTER_PROJECTS);
     assert!(

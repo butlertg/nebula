@@ -1,19 +1,26 @@
-//! The pull request open on a worktree's branch, discovered with the
-//! GitHub CLI (`gh pr view`). The PR itself is never persisted — the row it
-//! feeds sits above the worktree's saved links and refreshes on its own, so
-//! a PR opened outside nebula shows up without anyone typing its URL. The
-//! one thing that outlives the process is how far the user has read into
-//! the conversation, which the daemon keeps (`pr_seen`) so the row can say
-//! how many comments landed while they were away.
+//! The pull request on a worktree's branch, discovered with the GitHub CLI
+//! (`gh pr view`). The row it feeds sits above the worktree's saved links
+//! and refreshes on its own, so a PR opened outside nebula shows up without
+//! anyone typing its URL, and one that has since been merged or closed
+//! stays on the row, badged, for as long as the checkout does: the worktree
+//! outlives its pull request, and the PR is what you check before archiving
+//! or deleting it. Nothing here is the source of truth — GitHub is — but
+//! every answer is remembered on disk (`pr_cache`) so the next launch paints
+//! the rows from what the last one knew while the lookups catch up. How far
+//! the user has read into the conversation is the daemon's (`pr_seen`), so
+//! the row can say how many comments landed while they were away.
 //!
 //! The same `gh` also answers the wider question this module's other half
 //! asks — every pull request still open on the *project's* repo, for the
 //! group at the bottom of the worktrees panel (see [`list`]).
 //!
 //! `gh` may be missing, unauthenticated, or pointed at a repo with no
-//! remote; every one of those is an ordinary "no PR" answer, not an error
-//! worth a flash. Lookups are async because they hit the network.
+//! remote; every one of those is an ordinary "couldn't ask", not an error
+//! worth a flash — and, since the last answer is cached, not a reason to
+//! blank a row either (see [`Lookup`]). Lookups are async because they hit
+//! the network.
 
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How long a lookup may run before we give up on it. `gh` retries and can
@@ -21,13 +28,147 @@ use std::path::Path;
 /// that never ends.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The pull request `gh` reports for a checkout's branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `gh`'s state strings. Only [`STATE_OPEN`] still accepts work: it is the
+/// one state the PROJECT OPEN PRS GROUP lists, and the one the preview and
+/// the detail-driven retirement key on. The other two are what a branch's
+/// PR ROW wears once the work is done.
+pub const STATE_OPEN: &str = "OPEN";
+pub const STATE_MERGED: &str = "MERGED";
+pub const STATE_CLOSED: &str = "CLOSED";
+
+/// Whether a `gh` state string is [`STATE_OPEN`]; drafts are open too, so
+/// this alone never says anything about `isDraft`.
+fn state_is_open(state: &str) -> bool {
+    state == STATE_OPEN
+}
+
+/// Where a pull request stands, as a row paints it: the four looks a PR ROW
+/// can take, folded from `gh`'s state string and its draft flag. `Merged`
+/// and `Closed` win over the flag — a pull request closed while still a
+/// draft is closed, which is the more useful thing to say — and anything
+/// `gh` might add to its vocabulary later reads as open, the same trust
+/// [`state_at`] extends to a missing field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl Standing {
+    pub fn of(state: &str, is_draft: bool) -> Self {
+        match state {
+            STATE_MERGED => Standing::Merged,
+            STATE_CLOSED => Standing::Closed,
+            _ if is_draft => Standing::Draft,
+            _ => Standing::Open,
+        }
+    }
+
+    /// Short word for a row's trailing badge — the same slot the agent rows
+    /// use for their CLI kind.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Standing::Open => "pr",
+            Standing::Draft => "draft",
+            Standing::Merged => "merged",
+            Standing::Closed => "closed",
+        }
+    }
+}
+
+/// Run `gh` with `args` (in `dir` when given) under `timeout`, yielding
+/// stdout on success. Every failure — no `gh`, bad exit, timeout — is
+/// `None`, since each is an ordinary "couldn't ask" to every caller.
+async fn gh(dir: Option<&Path>, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    run_gh(dir, args, timeout).await.ok()
+}
+
+/// [`gh`] with the failure kept: `Err` carries what `gh` printed to stderr
+/// on a bad exit, and nothing at all when it could not be run or timed
+/// out. Only [`lookup`] reads it — `gh pr view` says "no pull request" and
+/// "no network" with the same exit code and only the message apart.
+async fn run_gh(
+    dir: Option<&Path>,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(args).stdin(std::process::Stdio::null());
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return Err(String::new()),
+    };
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `v[key]` as a string, `""` when absent or not a string.
+fn str_at(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `v[key]` as a number, 0 when absent or not one.
+fn u64_at(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+/// `v[key]` as a flag, false when absent or not one.
+fn bool_at(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+/// `v[key]` as an array, empty when absent or not one.
+fn arr_at<'a>(v: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    v.get(key)
+        .and_then(|c| c.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// `v["state"]`, assumed open when `gh` left it out — a PR it lists is
+/// open until it says otherwise.
+fn state_at(v: &serde_json::Value) -> String {
+    v.get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or(STATE_OPEN)
+        .to_string()
+}
+
+/// `v["url"]`, but only when it is something a browser can open. Only
+/// http(s) reaches `open(1)`; gh has no business returning anything else,
+/// but the row leads straight to a browser so it's checked anyway.
+fn web_url(v: &serde_json::Value) -> Option<String> {
+    let url = v.get("url")?.as_str()?.to_string();
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
+/// The pull request on a checkout's branch, whatever state it is in.
+///
+/// `gh pr view` on a branch answers with that branch's most recent pull
+/// request — preferring an open one, and a merged or closed one for as long
+/// as the branch exists once nothing on it accepts work any more — and the
+/// row keeps every answer. A checkout whose PR has shipped is exactly the
+/// one about to be archived or deleted, and the PR is what gets checked
+/// first, so the row stays put and its badge says `merged` or `closed`
+/// instead. The PROJECT OPEN PRS GROUP is where closed pull requests fall
+/// out; this row is per checkout, and the checkout is still here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
-    /// `gh`'s state string: OPEN, MERGED or CLOSED.
+    /// `gh`'s state string — [`STATE_OPEN`], [`STATE_MERGED`] or
+    /// [`STATE_CLOSED`].
     pub state: String,
     pub is_draft: bool,
     /// When somebody *other than you* commented or submitted a review, as
@@ -38,22 +179,20 @@ pub struct PullRequest {
 }
 
 impl PullRequest {
-    /// Short state word for the row's trailing badge — the same slot the
-    /// agent rows use for their CLI kind.
-    pub fn badge(&self) -> &'static str {
-        match self.state.as_str() {
-            "OPEN" if self.is_draft => "draft",
-            "OPEN" => "pr",
-            "MERGED" => "merged",
-            "CLOSED" => "closed",
-            _ => "pr",
-        }
+    /// Whether this pull request still accepts work. A draft counts.
+    pub fn is_open(&self) -> bool {
+        state_is_open(&self.state)
     }
 
-    /// Whether the PR is still open (draft included) — the badge is quiet
-    /// for these and loud for the ones that no longer accept work.
-    pub fn is_open(&self) -> bool {
-        self.state == "OPEN"
+    /// The look the row takes: open, draft, merged or closed.
+    pub fn standing(&self) -> Standing {
+        Standing::of(&self.state, self.is_draft)
+    }
+
+    /// Short word for the row's trailing badge — the same slot the agent
+    /// rows use for their CLI kind: `pr`, `draft`, `merged` or `closed`.
+    pub fn badge(&self) -> &'static str {
+        self.standing().badge()
     }
 
     /// The mark to store when the user opens this PR: everything nebula
@@ -68,33 +207,65 @@ impl PullRequest {
     /// never opened from nebula — leaves the whole conversation unread,
     /// which is the honest answer: the user hasn't looked at any of it.
     pub fn unseen(&self, marker: Option<&str>) -> usize {
-        match marker {
-            Some(mark) => self.activity.iter().filter(|at| at.as_str() > mark).count(),
-            None => self.activity.len(),
-        }
+        marker.map_or(self.activity.len(), |mark| {
+            self.activity.iter().filter(|at| at.as_str() > mark).count()
+        })
     }
 }
 
-/// Ask `gh` for the pull request on `dir`'s current branch. `None` covers
-/// every ordinary miss: no PR, no `gh`, no remote, not logged in.
-pub async fn lookup(dir: &Path) -> Option<PullRequest> {
-    let run = tokio::process::Command::new("gh")
-        .args([
+/// What a branch lookup came back with. The two misses are kept apart
+/// because the row they feed is remembered across launches (`pr_cache`):
+/// a branch GitHub says has no pull request clears its row, while a call
+/// that never reached GitHub leaves whatever the row last showed — the
+/// last known state of a pull request is worth more than a blank, and an
+/// offline launch must not wipe out every badge within a sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    Found(PullRequest),
+    /// `gh` answered: the branch has no pull request at all.
+    Absent,
+    /// `gh` couldn't answer — missing, not logged in, no remote, no
+    /// network, a detached checkout, a timeout.
+    Unavailable,
+}
+
+/// The one message `gh pr view` prints for a branch with no pull request
+/// (`no pull requests found for branch "x"`). Everything else it can fail
+/// with is a reason it couldn't ask, not an answer.
+const NO_PR_MARKER: &str = "no pull requests found";
+
+/// Sort a failed `gh pr view` into [`Lookup::Absent`] or
+/// [`Lookup::Unavailable`] by what it printed.
+pub(crate) fn classify_miss(stderr: &str) -> Lookup {
+    if stderr.contains(NO_PR_MARKER) {
+        Lookup::Absent
+    } else {
+        Lookup::Unavailable
+    }
+}
+
+/// Ask `gh` for the pull request on `dir`'s current branch.
+pub async fn lookup(dir: &Path) -> Lookup {
+    let out = run_gh(
+        Some(dir),
+        &[
             "pr",
             "view",
             "--json",
             "number,url,title,state,isDraft,comments,reviews",
-        ])
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let out = tokio::time::timeout(TIMEOUT, run).await.ok()?.ok()?;
-    if !out.status.success() {
-        return None;
+        ],
+        TIMEOUT,
+    )
+    .await;
+    match out {
+        // Only asked once `gh` has proved it works, so a machine without
+        // it never pays for the extra process.
+        Ok(out) => match parse(&out, viewer_login().await) {
+            Some(pr) => Lookup::Found(pr),
+            None => Lookup::Absent,
+        },
+        Err(stderr) => classify_miss(&stderr),
     }
-    // Only asked once `gh` has proved it works, so a machine without it
-    // never pays for the extra process.
-    parse(&String::from_utf8_lossy(&out.stdout), viewer_login().await)
 }
 
 /// Your own GitHub login, resolved once per process. Needed only to keep
@@ -106,15 +277,8 @@ static VIEWER: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::co
 async fn viewer_login() -> Option<&'static str> {
     VIEWER
         .get_or_init(|| async {
-            let run = tokio::process::Command::new("gh")
-                .args(["api", "user", "--jq", ".login"])
-                .stdin(std::process::Stdio::null())
-                .output();
-            let out = tokio::time::timeout(TIMEOUT, run).await.ok()?.ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let out = gh(None, &["api", "user", "--jq", ".login"], TIMEOUT).await?;
+            let login = out.trim().to_string();
             (!login.is_empty()).then_some(login)
         })
         .await
@@ -125,28 +289,21 @@ async fn viewer_login() -> Option<&'static str> {
 /// so the shape it expects is testable without a GitHub account. `viewer`
 /// is your login when it's known; without it your own reviews count as
 /// activity, which is a wrong badge rather than a broken one.
+///
+/// A merged or closed pull request parses like an open one, state and all.
+/// `gh` prefers an open PR when the branch has several, so a closed answer
+/// only arrives once nothing on the branch accepts work any more — and
+/// that is the pull request the checkout's row should keep showing, not
+/// hide, until the checkout itself goes.
 fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let url = v.get("url")?.as_str()?.to_string();
-    // Only http(s) reaches `open(1)`; gh has no business returning anything
-    // else, but the row leads straight to a browser so it's checked anyway.
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return None;
-    }
+    let url = web_url(&v)?;
     Some(PullRequest {
         number: v.get("number")?.as_u64()?,
         url,
-        title: v
-            .get("title")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        state: v
-            .get("state")
-            .and_then(|s| s.as_str())
-            .unwrap_or("OPEN")
-            .to_string(),
-        is_draft: v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false),
+        title: str_at(&v, "title"),
+        state: state_at(&v),
+        is_draft: bool_at(&v, "isDraft"),
         activity: activity(&v, viewer),
     })
 }
@@ -155,14 +312,8 @@ fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
 /// and review submissions alike, since either is a reason to go look —
 /// sorted oldest first so the last one is the high-water mark.
 fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
-    let list = |key: &str| {
-        v.get(key)
-            .and_then(|c| c.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    };
     let mut stamps: Vec<String> = Vec::new();
-    for c in list("comments") {
+    for c in arr_at(v, "comments") {
         if c.get("viewerDidAuthor").and_then(|b| b.as_bool()) == Some(true) {
             continue;
         }
@@ -170,7 +321,7 @@ fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
             stamps.push(at.to_string());
         }
     }
-    for r in list("reviews") {
+    for r in arr_at(v, "reviews") {
         // No `submittedAt` means a pending review — your own draft, which
         // nobody else can see yet.
         let Some(at) = r.get("submittedAt").and_then(|t| t.as_str()) else {
@@ -204,12 +355,16 @@ fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
 pub const LIST_LIMIT: usize = 100;
 
 /// One row of a project's open-pull-request list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenPr {
     pub number: u64,
     pub title: String,
     pub url: String,
     pub is_draft: bool,
+    /// The branch the pull request comes from (`gh`'s `headRefName`) — the
+    /// one a PR SESSION's worktree is checked out on, so the row carries it
+    /// even though nothing on screen shows it.
+    pub head: String,
 }
 
 impl OpenPr {
@@ -222,13 +377,36 @@ impl OpenPr {
         }
     }
 
-    /// Trailing badge — every row here is open by construction, so the only
-    /// thing left to say is whether it's still a draft.
+    /// Open or draft — every row here is open by construction (`list` asks
+    /// for nothing else), so the only thing left to say is whether it's
+    /// still a draft.
+    pub fn standing(&self) -> Standing {
+        Standing::of(STATE_OPEN, self.is_draft)
+    }
+
+    /// Trailing badge: `pr` or `draft`.
     pub fn badge(&self) -> &'static str {
-        if self.is_draft {
-            "draft"
-        } else {
-            "pr"
+        self.standing().badge()
+    }
+}
+
+/// What a PR SESSION launch carries from a PROJECT OPEN PRS GROUP row all
+/// the way to `ClientRequest::CreatePrAgent`: which pull request the work is
+/// scoped to, and the head branch the DAEMON checks its worktree out on.
+/// The two travel together — a URL without its branch cannot be launched —
+/// so they ride the pickers, the MODEL / EFFORT submenus and the name prompt
+/// as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrLaunch {
+    pub url: String,
+    pub head: String,
+}
+
+impl PrLaunch {
+    pub fn of(pr: &OpenPr) -> Self {
+        Self {
+            url: pr.url.clone(),
+            head: pr.head.clone(),
         }
     }
 }
@@ -245,32 +423,32 @@ impl OpenPr {
 ///   one most likely to have a nebula worktree still attached to it — the
 ///   list would be worth least if it hid exactly the work in progress. They
 ///   arrive with `isDraft` set and wear a `draft` badge; nothing here or
-///   downstream filters them out.
+///   downstream filters them out. Where they land does change: the group
+///   sinks them below every finished pull request ([`drafts_last`]), so
+///   the rows asking for a reviewer come first.
 /// * **Closed ones fall out of it.** This is the whole mechanism for
 ///   pruning: a pull request that was merged or closed since the last call
 ///   simply stops coming back, so re-asking on a beat *is* the periodic
 ///   "should this row still be here?" check. Nothing has to track closures
 ///   separately.
 pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
-    let run = tokio::process::Command::new("gh")
-        .args([
+    let limit = LIST_LIMIT.to_string();
+    let out = gh(
+        Some(dir),
+        &[
             "pr",
             "list",
             "--state",
             "open",
             "--limit",
-            &LIST_LIMIT.to_string(),
+            &limit,
             "--json",
-            "number,url,title,isDraft",
-        ])
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let out = tokio::time::timeout(TIMEOUT, run).await.ok()?.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_list(&String::from_utf8_lossy(&out.stdout))
+            "number,url,title,isDraft,headRefName",
+        ],
+        TIMEOUT,
+    )
+    .await?;
+    parse_list(&out)
 }
 
 /// Parse `gh pr list --json …` output — a bare array. Kept separate from
@@ -283,23 +461,27 @@ fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
     Some(
         rows.iter()
             .filter_map(|v| {
-                let url = v.get("url")?.as_str()?.to_string();
-                if !(url.starts_with("https://") || url.starts_with("http://")) {
-                    return None;
-                }
+                let url = web_url(v)?;
                 Some(OpenPr {
                     number: v.get("number")?.as_u64()?,
-                    title: v
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    title: str_at(v, "title"),
                     url,
-                    is_draft: v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false),
+                    is_draft: bool_at(v, "isDraft"),
+                    head: str_at(v, "headRefName"),
                 })
             })
             .collect(),
     )
+}
+
+/// Sink the drafts below everything else, keeping `gh`'s newest-first
+/// order within each half. A draft is open, but it is not asking anyone for
+/// anything yet; the rows that want a reviewer come first, and a draft is
+/// told apart by where it sits as much as by its badge. Stable, so the
+/// cursor's PR — followed by URL across every refresh — never swaps places
+/// with a neighbour it did not change relative to.
+pub fn drafts_last(list: &mut [OpenPr]) {
+    list.sort_by_key(|pr| pr.is_draft);
 }
 
 /// How long a `gh pr diff` may run. Diffs are bigger than metadata and
@@ -310,10 +492,10 @@ const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The readable contents of one pull request: what it says it does, and
 /// what people said back. Fetched on demand — only for the row the cursor
-/// actually rests on — and cached for the session, because this is a second
-/// API call on top of the list and the body of a merged-or-not pull request
-/// does not change while you read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// actually rests on — and cached for the session and across launches,
+/// because this is a second API call on top of the list and the body of a
+/// merged-or-not pull request does not change while you read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrDetail {
     pub number: u64,
     pub url: String,
@@ -344,12 +526,12 @@ impl PrDetail {
     /// pull request directly, and a `MERGED` or `CLOSED` answer retires the
     /// row without waiting for the next list.
     pub fn is_open(&self) -> bool {
-        self.state == "OPEN"
+        state_is_open(&self.state)
     }
 }
 
 /// One thing somebody said on a pull request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrComment {
     pub author: String,
     /// RFC 3339, as GitHub gives it.
@@ -376,51 +558,38 @@ impl PrComment {
 /// picks the PR, so this works from any checkout of the repo — the row the
 /// cursor is on need not be checked out anywhere.
 pub async fn detail(dir: &Path, number: u64) -> Option<PrDetail> {
-    let run = tokio::process::Command::new("gh")
-        .args([
+    let number = number.to_string();
+    let out = gh(
+        Some(dir),
+        &[
             "pr",
             "view",
-            &number.to_string(),
+            &number,
             "--json",
             "number,url,title,state,isDraft,author,baseRefName,headRefName,\
              additions,deletions,changedFiles,body,comments,reviews",
-        ])
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let out = tokio::time::timeout(TIMEOUT, run).await.ok()?.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_detail(&String::from_utf8_lossy(&out.stdout))
+        ],
+        TIMEOUT,
+    )
+    .await?;
+    parse_detail(&out)
 }
 
 fn parse_detail(json: &str) -> Option<PrDetail> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let str_at = |key: &str| {
-        v.get(key)
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-    let num_at = |key: &str| v.get(key).and_then(|x| x.as_u64()).unwrap_or(0);
     Some(PrDetail {
         number: v.get("number")?.as_u64()?,
         url: v.get("url")?.as_str()?.to_string(),
-        title: str_at("title"),
-        state: v
-            .get("state")
-            .and_then(|s| s.as_str())
-            .unwrap_or("OPEN")
-            .to_string(),
-        is_draft: v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false),
+        title: str_at(&v, "title"),
+        state: state_at(&v),
+        is_draft: bool_at(&v, "isDraft"),
         author: login(v.get("author")),
-        base: str_at("baseRefName"),
-        head: str_at("headRefName"),
-        additions: num_at("additions"),
-        deletions: num_at("deletions"),
-        changed_files: num_at("changedFiles"),
-        body: str_at("body"),
+        base: str_at(&v, "baseRefName"),
+        head: str_at(&v, "headRefName"),
+        additions: u64_at(&v, "additions"),
+        deletions: u64_at(&v, "deletions"),
+        changed_files: u64_at(&v, "changedFiles"),
+        body: str_at(&v, "body"),
         comments: conversation(&v),
     })
 }
@@ -439,46 +608,24 @@ fn login(author: Option<&serde_json::Value>) -> String {
 /// empty body renders as the badge alone. Unsubmitted reviews — your own
 /// pending draft — are left out; nobody else can see them.
 fn conversation(v: &serde_json::Value) -> Vec<PrComment> {
-    let list = |key: &str| {
-        v.get(key)
-            .and_then(|c| c.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    };
     let mut out: Vec<PrComment> = Vec::new();
-    for c in list("comments") {
+    for c in arr_at(v, "comments") {
         out.push(PrComment {
             author: login(c.get("author")),
-            at: c
-                .get("createdAt")
-                .and_then(|t| t.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            at: str_at(c, "createdAt"),
             review_state: String::new(),
-            body: c
-                .get("body")
-                .and_then(|b| b.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            body: str_at(c, "body"),
         });
     }
-    for r in list("reviews") {
+    for r in arr_at(v, "reviews") {
         let Some(at) = r.get("submittedAt").and_then(|t| t.as_str()) else {
             continue;
         };
         out.push(PrComment {
             author: login(r.get("author")),
             at: at.to_string(),
-            review_state: r
-                .get("state")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            body: r
-                .get("body")
-                .and_then(|b| b.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            review_state: str_at(r, "state"),
+            body: str_at(r, "body"),
         });
     }
     // RFC 3339 UTC stamps sort lexicographically into chronological order —
@@ -490,16 +637,12 @@ fn conversation(v: &serde_json::Value) -> Vec<PrComment> {
 /// The whole unified diff of a pull request, in one call. `None` when `gh`
 /// couldn't answer.
 pub async fn diff(dir: &Path, number: u64) -> Option<String> {
-    let run = tokio::process::Command::new("gh")
-        .args(["pr", "diff", &number.to_string()])
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let out = tokio::time::timeout(DIFF_TIMEOUT, run).await.ok()?.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    gh(
+        Some(dir),
+        &["pr", "diff", &number.to_string()],
+        DIFF_TIMEOUT,
+    )
+    .await
 }
 
 /// Cut a unified diff into one chunk per file, in the order git emitted
@@ -569,7 +712,7 @@ mod tests {
             number: 1,
             url: "https://github.com/o/r/pull/1".into(),
             title: "t".into(),
-            state: "OPEN".into(),
+            state: STATE_OPEN.into(),
             is_draft: false,
             activity: stamps.iter().map(|s| s.to_string()).collect(),
         }
@@ -589,30 +732,59 @@ mod tests {
         assert!(pr.is_open());
     }
 
+    /// `gh pr view` keeps answering with a branch's pull request after it
+    /// is merged or closed, and the row keeps it: the checkout is still
+    /// here, and its pull request is what gets checked before the checkout
+    /// is archived or deleted. The badge says what became of it; a draft is
+    /// open and reads as one, unless it was closed as a draft, in which case
+    /// closed is the more useful word.
     #[test]
-    fn badges_name_the_state() {
-        let base = PullRequest {
-            number: 1,
-            url: "https://x.dev/pull/1".into(),
-            title: "t".into(),
-            state: "OPEN".into(),
-            is_draft: true,
-            activity: vec![],
+    fn a_merged_or_closed_branch_pull_request_keeps_its_row_badged() {
+        let payload = |state: &str, draft: bool| {
+            format!(
+                r#"{{"number":1,"url":"https://x.dev/pull/1","title":"t","state":"{state}","isDraft":{draft}}}"#
+            )
         };
-        assert_eq!(base.badge(), "draft");
-        assert!(base.is_open(), "a draft is still open");
-        let merged = PullRequest {
-            state: "MERGED".into(),
-            is_draft: false,
-            ..base.clone()
-        };
+        let merged = parse(&payload("MERGED", false), None).expect("a merged PR is still a row");
         assert_eq!(merged.badge(), "merged");
+        assert_eq!(merged.standing(), Standing::Merged);
         assert!(!merged.is_open());
-        let closed = PullRequest {
-            state: "CLOSED".into(),
-            ..merged
-        };
+        let closed = parse(&payload("CLOSED", false), None).expect("a closed PR is still a row");
         assert_eq!(closed.badge(), "closed");
+        assert!(!closed.is_open());
+        let closed_draft = parse(&payload("CLOSED", true), None).expect("closed");
+        assert_eq!(
+            closed_draft.standing(),
+            Standing::Closed,
+            "closed beats draft"
+        );
+        let draft = parse(&payload("OPEN", true), None).expect("a draft is still open");
+        assert_eq!(draft.badge(), "draft");
+        assert!(draft.is_open());
+        let open = parse(&payload("OPEN", false), None).expect("open");
+        assert_eq!(open.badge(), "pr");
+        // An older `gh` that leaves `state` out is trusted to have listed
+        // something open.
+        let bare = parse(r#"{"number":1,"url":"https://x.dev/pull/1"}"#, None)
+            .expect("no state field means open");
+        assert_eq!(bare.standing(), Standing::Open);
+    }
+
+    /// Drafts sink below the finished pull requests and keep `gh`'s
+    /// newest-first order on both sides of that line.
+    #[test]
+    fn drafts_sink_below_the_open_rows_in_their_own_order() {
+        let row = |number: u64, is_draft: bool| OpenPr {
+            number,
+            title: String::new(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft,
+            head: String::new(),
+        };
+        let mut list = vec![row(42, true), row(40, false), row(31, true), row(30, false)];
+        drafts_last(&mut list);
+        let numbers: Vec<u64> = list.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, [40, 30, 42, 31]);
     }
 
     #[test]
@@ -695,7 +867,7 @@ mod tests {
     fn parses_a_gh_pr_list_payload() {
         let prs = parse_list(
             r#"[
-              {"number":42,"title":"Attach links","url":"https://github.com/o/r/pull/42","isDraft":false},
+              {"number":42,"title":"Attach links","url":"https://github.com/o/r/pull/42","isDraft":false,"headRefName":"attach-links"},
               {"number":7,"title":"WIP","url":"https://github.com/o/r/pull/7","isDraft":true}
             ]"#,
         )
@@ -704,6 +876,14 @@ mod tests {
         assert_eq!(prs[0].label(), "#42 Attach links");
         assert_eq!(prs[0].badge(), "pr");
         assert_eq!(prs[1].badge(), "draft");
+        assert_eq!(
+            prs[0].head, "attach-links",
+            "the branch a PR SESSION runs on"
+        );
+        assert!(
+            prs[1].head.is_empty(),
+            "a row `gh` gave no branch for still lists; only its PR SESSION is refused"
+        );
     }
 
     /// An empty repo answers with an empty array — a real answer, not a
@@ -857,5 +1037,33 @@ rename to new.rs
     fn a_deleted_comment_does_not_invent_unread_ones() {
         let pr = with_activity(&["2024-04-25T19:55:42Z"]);
         assert_eq!(pr.unseen(Some("2024-04-27T09:00:00Z")), 0);
+    }
+
+    /// `gh pr view` exits 1 both for a branch with no pull request and for
+    /// a network it couldn't reach; only the message tells them apart. The
+    /// first clears the row, the second keeps whatever it last showed —
+    /// including the row a previous launch cached.
+    #[test]
+    fn a_failed_view_is_absent_only_when_gh_says_no_pull_request() {
+        assert_eq!(
+            classify_miss("no pull requests found for branch \"main\"\n"),
+            Lookup::Absent
+        );
+        assert_eq!(
+            classify_miss(
+                "Post \"https://api.github.com/graphql\": dial tcp: connect: connection refused\n"
+            ),
+            Lookup::Unavailable
+        );
+        assert_eq!(
+            classify_miss("could not determine current branch: not on any branch\n"),
+            Lookup::Unavailable,
+            "a detached checkout mid-rebase keeps its row"
+        );
+        assert_eq!(
+            classify_miss(""),
+            Lookup::Unavailable,
+            "no gh at all, or a timeout"
+        );
     }
 }

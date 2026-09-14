@@ -12,65 +12,164 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Fallback for `recent_window` when the value is missing or malformed.
-pub const DEFAULT_RECENT_WINDOW_MS: i64 = 30 * 60 * 1000;
-
-/// Values the settings overlay cycles through for `recent_window`.
-pub const RECENT_WINDOWS: &[&str] = &["off", "5m", "10m", "30m", "1h", "24h"];
-
 /// Values the settings overlay cycles through for `session_idle_timeout`
 /// (daemon-owned: how long unwatched idle sessions live before their PTY
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
+/// How many RECENT PROMPTS the SESSIONS PANEL draws under a session while
+/// the feature is on: the Experimental tab's choices. A hand edit may go
+/// as high as the daemon keeps (`RECENT_PROMPTS_KEPT`).
+pub const RECENT_PROMPT_COUNTS: &[&str] = &["1", "2", "3", "4", "5"];
+pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 
 /// Editor commands the settings overlay cycles through. Every entry
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
-/// Model/effort choices for the new-session submenus, the Automation
-/// pane's model and effort fields, and the settings overlay. "default"
-/// everywhere means "don't pass the flag — let the CLI pick" and is what
-/// the daemon sees as None.
-///
-/// The model lists here are only the built-in starting point. The
-/// `claude_models` / `codex_models` settings replace them wholesale, which
-/// is how a model a CLI gained after this build reaches the pickers
-/// without a new release — see [`Config::model_choices`]. Efforts are not
-/// configurable: both CLIs take a closed set that doesn't grow with the
-/// model vocabulary.
-pub const DEFAULT_CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
-pub const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
-pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
-pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+/// Values the settings overlay cycles through for `done_sound` (what rings
+/// when a turn reaches FINISHED) and `feedback_sound` (what rings when one
+/// stops at NEEDS FEEDBACK). `off` is silence, `bell` the terminal BEL
+/// (the one sound that reaches the local terminal over `nebula ssh` — but
+/// silent in Ghostty out of the box, whose `bell-features` default to
+/// `no-audio`), the rest are macOS system sounds in `/System/Library/Sounds`,
+/// played with `afplay`; see [`Config::done_sound`] for where a name falls
+/// back to the bell. Hand-edited configs can name any sound in that folder.
+pub const SOUNDS: &[&str] = &[
+    "off",
+    "bell",
+    "Glass",
+    "Ping",
+    "Pop",
+    "Hero",
+    "Purr",
+    "Tink",
+    "Submarine",
+    "Funk",
+    "Blow",
+    "Bottle",
+    "Frog",
+    "Morse",
+    "Sosumi",
+    "Basso",
+];
 
-/// The built-in model list for a kind; empty = that CLI has no model knob.
-pub fn default_models(kind: AgentKind) -> &'static [&'static str] {
+/// Where the macOS system sounds live; `<name>.aiff` inside it.
+const MACOS_SOUNDS_DIR: &str = "/System/Library/Sounds";
+
+/// The model/effort sentinel meaning "don't pass the flag — let the CLI
+/// pick"; it heads every choice list and is what the daemon sees as None.
+pub const DEFAULT_CHOICE: &str = "default";
+
+/// What the overlay shows for an empty `worktree_base_branch`: the daemon
+/// picks origin's default branch itself. Display only — the file holds
+/// `""`, never this word.
+pub const AUTO_CHOICE: &str = "auto";
+
+/// Model/effort choices for the new-session submenus and the settings
+/// overlay. [`DEFAULT_CHOICE`] everywhere means "don't pass the flag — let
+/// the CLI pick" and is what the daemon sees as None. `CLAUDE_MODELS` is
+/// the built-in alias list; what the pickers show is
+/// `claude_catalogue::models()`, which swaps it for `claude_models` in
+/// CONFIG.JSON or Claude Code's own `availableModels` allowlist.
+pub const CLAUDE_MODELS: &[&str] = &[DEFAULT_CHOICE, "fable", "opus", "sonnet", "haiku"];
+pub const CLAUDE_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "low", "medium", "high", "xhigh", "max"];
+pub const CODEX_MODELS: &[&str] = &[DEFAULT_CHOICE, "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
+/// Pi's `--model` takes a fuzzy pattern across every provider it has
+/// credentials for (`opus` finds `anthropic/claude-opus-…`), so the list is
+/// families, not ids; a hand-edited `provider/id` passes through verbatim.
+pub const PI_MODELS: &[&str] = &[DEFAULT_CHOICE, "opus", "sonnet", "haiku", "gpt-5.5"];
+/// Pi's `--thinking` levels, in the CLI's own order.
+pub const PI_EFFORTS: &[&str] = &[
+    DEFAULT_CHOICE,
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+];
+
+/// The `quick_prompt_kind` choices — every AGENT KIND, by the name the
+/// config file stores. Spelled out rather than derived because
+/// [`cycle_choice`] works over `&'static [&'static str]`;
+/// `quick_prompt_kinds_are_every_agent_kind` keeps it honest.
+pub const AGENT_KIND_NAMES: &[&str] = &["claude", "codex", "cursor", "pi"];
+
+/// Model choices for a session kind. Claude's come from
+/// `claude_catalogue.rs`: CONFIG.JSON's `claude_models`, else Claude Code's
+/// `availableModels`, else [`CLAUDE_MODELS`]. Codex's come from
+/// `codex_catalogue.rs`: CONFIG.JSON's `codex_models`, else [`CODEX_MODELS`].
+/// Cursor's come from the CURSOR
+/// CATALOGUE (`cursor_catalogue.rs`): a seed plus a cached
+/// `cursor-agent --list-models`.
+pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Claude => DEFAULT_CLAUDE_MODELS,
-        AgentKind::Codex => DEFAULT_CODEX_MODELS,
-        AgentKind::Cursor => &[],
+        AgentKind::Claude => crate::claude_catalogue::models(),
+        AgentKind::Codex => crate::codex_catalogue::models(),
+        AgentKind::Cursor => crate::cursor_catalogue::models(),
+        AgentKind::Pi => PI_MODELS,
     }
 }
 
-/// The built-in effort list for a kind; empty = that CLI has no effort
-/// knob. Private because nothing overrides it — [`Config::effort_choices`]
-/// is the way in, so the two vocabularies read the same at the call sites.
-fn default_efforts(kind: AgentKind) -> &'static [&'static str] {
+/// Whether a kind offers a MODEL choice at all — the `▸` marker's gate in
+/// [`crate::app::MenuAction::submenu`], which asks once per row per frame.
+/// Answering from the catalogues is cheap (a lock read over a `&'static`
+/// list); it must never grow into a config-file read.
+pub fn supports_model_choice(kind: AgentKind) -> bool {
+    !model_choices(kind).is_empty()
+}
+
+/// Effort choices for a session kind given its chosen model (None or
+/// "default" = the CLI's pick). Claude and Codex take any effort with any
+/// model; Cursor's list follows the family (`-fast` variants ride in the
+/// effort, `high-fast`), leads with "default" only when the bare family id
+/// exists, and is empty — no Effort row, no effort submenu — when the model
+/// is unset or the family has no effort variants (`auto`).
+pub fn effort_choices(kind: AgentKind, model: Option<&str>) -> &'static [&'static str] {
     match kind {
         AgentKind::Claude => CLAUDE_EFFORTS,
         AgentKind::Codex => CODEX_EFFORTS,
-        AgentKind::Cursor => &[],
+        AgentKind::Cursor => crate::cursor_catalogue::efforts(model),
+        AgentKind::Pi => PI_EFFORTS,
     }
 }
 
-/// Whether a kind has model and effort submenus at all. `cursor-agent`
-/// takes neither flag, so no config can give it one. Answering from the
-/// kind alone is deliberate: [`crate::app::MenuAction::submenu`] asks this
-/// once per row per frame to decide the `▸` marker, and it must not touch
-/// the config file to do it.
-pub fn supports_model_choice(kind: AgentKind) -> bool {
-    !default_models(kind).is_empty()
+/// Whether `value` is one of `choices`, case-insensitively and trimmed —
+/// how a form decides a saved or cycled choice still has a row.
+pub(crate) fn fits(value: &str, choices: &[&str]) -> bool {
+    choices.iter().any(|c| c.eq_ignore_ascii_case(value.trim()))
+}
+
+/// The effort to launch `kind` with, given its model and the picked effort.
+/// Claude, Codex and Pi pass through. For Cursor: no family → None; an effort
+/// the family ships → itself; anything else ("default", unset, a suffix the
+/// family lacks) → None when the bare family id exists, otherwise the
+/// family's fallback (`high` > `medium` > first) — most families have no
+/// bare id, and `--model claude-fable-5` alone is refused at spawn.
+pub fn fit_effort(kind: AgentKind, model: Option<&str>, effort: Option<String>) -> Option<String> {
+    match kind {
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => effort,
+        AgentKind::Cursor => {
+            let family = model
+                .map(str::trim)
+                .filter(|m| !m.eq_ignore_ascii_case(DEFAULT_CHOICE))?;
+            let choices = crate::cursor_catalogue::efforts(Some(family));
+            if choices.is_empty() {
+                return None;
+            }
+            let picked = effort
+                .map(|e| e.trim().to_ascii_lowercase())
+                .filter(|e| e != DEFAULT_CHOICE);
+            match picked {
+                Some(e) if fits(&e, choices) => Some(e),
+                _ if choices[0] == DEFAULT_CHOICE => None,
+                _ => crate::cursor_catalogue::fallback_effort(family).map(String::from),
+            }
+        }
+    }
 }
 
 /// One setting row in the overlay; rows live inside a [`SettingsTab`].
@@ -79,6 +178,10 @@ pub struct SettingSpec {
     pub kind: SettingKind,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Section header the row sits under, as `keymap::ActionSpec::group`
+    /// is for the Hotkeys tab. Empty means the tab lists the row bare;
+    /// a tab whose rows all say so stays a flat list.
+    pub group: &'static str,
 }
 
 /// What a tab shows. Ordinary tabs are a list of value settings; the
@@ -103,18 +206,48 @@ pub struct SettingsTab {
 pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
+    WorktreeBaseBranch,
     Editor,
+    CloseFinderOnOpen,
     SkipSessionNaming,
-    RecentWindow,
+    ConfirmOnArchive,
     SessionIdleTimeout,
+    PrewarmAgents,
+    PrewarmSessions,
+    DoneSound,
+    FeedbackSound,
     Theme,
     Animations,
-    FocusTint,
     ShowWorkspaces,
+    HideProjects,
+    HideWorktrees,
+    QuickPromptKind,
+    QuickPromptFocus,
+    HideRootWorktree,
+    RecentPrompts,
+    RecentPromptsCount,
+    ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
+    CodexEnabled,
     CodexModel,
     CodexEffort,
+    CursorEnabled,
+    CursorModel,
+    CursorEffort,
+    PiEnabled,
+    PiModel,
+    PiEffort,
+}
+
+impl SettingKind {
+    /// A row whose value is typed, not toggled or cycled: Enter on it opens
+    /// a one-line prompt pre-filled with the current value, and ←/→ have
+    /// nothing to step through. [`Config::cycle`] leaves such a row alone;
+    /// [`Config::set_text`] is what writes it.
+    pub fn is_text(self) -> bool {
+        matches!(self, SettingKind::WorktreeBaseBranch)
+    }
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -128,16 +261,31 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PaletteEnterAttaches,
                 label: "Search Enter attaches",
                 hint: "Enter in / search opens the session in the terminal",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::GitInitOnCreate,
                 label: "git init new projects",
                 hint: "When adding a missing directory, run git init in it",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::WorktreeBaseBranch,
+                label: "Worktree base branch",
+                hint: "Branch new worktrees start from; Enter types one (empty = origin's default)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::Editor,
                 label: "File editor",
                 hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::CloseFinderOnOpen,
+                label: "Finder closes on open",
+                hint: "Opening a file closes f/F, so quitting the editor is one Esc",
+                group: "",
             },
         ]),
     },
@@ -148,16 +296,43 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SkipSessionNaming,
                 label: "Skip session naming",
                 hint: "New agents skip the name prompt and take the auto-title the agent sets",
+                group: "",
             },
             SettingSpec {
-                kind: SettingKind::RecentWindow,
-                label: "Recent window",
-                hint: "How long unpinned sessions stay in the RECENT group",
+                kind: SettingKind::ConfirmOnArchive,
+                label: "Confirm on archive",
+                hint: "a asks before archiving the selected session (off archives at once; u undoes)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
-                hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
+                hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrewarmAgents,
+                label: "Warm spare agent",
+                hint: "Boot a spare CLI in the selected worktree for instant creates (a peer in /list-agents)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrewarmSessions,
+                label: "Prewarm dead sessions",
+                hint: "Boot a worktree's dead sessions while the cursor rests on it, so attaching is instant",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::DoneSound,
+                label: "Done sound",
+                hint: "Ding when a turn finishes: off, the terminal bell, or a macOS system sound",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::FeedbackSound,
+                label: "Feedback sound",
+                hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
+                group: "",
             },
         ]),
     },
@@ -168,46 +343,149 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::Theme,
                 label: "Color theme",
                 hint: "Accent colors used across the panels and overlays",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::Animations,
                 label: "Animations",
                 hint: "Status text sweep and splash motion (off = fewer repaints)",
-            },
-            SettingSpec {
-                kind: SettingKind::FocusTint,
-                label: "Focused panel tint",
-                hint: "Faint accent-colored background on the focused panel",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::ShowWorkspaces,
                 label: "Workspaces bar",
                 hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideProjects,
+                label: "Projects panel",
+                hint: "Show or hide the Projects panel (Shift+P toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideWorktrees,
+                label: "Worktrees panel",
+                hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                group: "",
             },
         ]),
     },
+    // Grouped per harness: the two cross-kind quick prompt rows first,
+    // then one section per agent kind holding its enabled toggle and
+    // its model / effort defaults, in that order.
     SettingsTab {
         title: "Agents",
         body: TabBody::Values(&[
             SettingSpec {
+                kind: SettingKind::QuickPromptKind,
+                label: "Agent",
+                hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
+                group: "Quick prompt",
+            },
+            SettingSpec {
+                kind: SettingKind::QuickPromptFocus,
+                label: "Focus",
+                hint: "Enter the new session's terminal on launch (off = just select its row)",
+                group: "Quick prompt",
+            },
+            SettingSpec {
+                kind: SettingKind::ClaudeEnabled,
+                label: "Enabled",
+                hint: "Offer Claude in the New session picker (off hides it; existing sessions keep running)",
+                group: "Claude",
+            },
+            SettingSpec {
                 kind: SettingKind::ClaudeModel,
-                label: "Claude model",
-                hint: "Default model for new Claude sessions (default = CLI's pick)",
+                label: "Model",
+                hint: "Default model; rows follow Claude's availableModels or config.json claude_models",
+                group: "Claude",
             },
             SettingSpec {
                 kind: SettingKind::ClaudeEffort,
-                label: "Claude effort",
+                label: "Effort",
                 hint: "Default reasoning effort for new Claude sessions",
+                group: "Claude",
+            },
+            SettingSpec {
+                kind: SettingKind::CodexEnabled,
+                label: "Enabled",
+                hint: "Offer Codex in the New session picker (off hides it; existing sessions keep running)",
+                group: "Codex",
             },
             SettingSpec {
                 kind: SettingKind::CodexModel,
-                label: "Codex model",
+                label: "Model",
                 hint: "Default model for new Codex sessions (default = CLI's pick)",
+                group: "Codex",
             },
             SettingSpec {
                 kind: SettingKind::CodexEffort,
-                label: "Codex effort",
+                label: "Effort",
                 hint: "Default reasoning effort for new Codex sessions",
+                group: "Codex",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorEnabled,
+                label: "Enabled",
+                hint: "Offer Cursor in the New session picker (off hides it; existing sessions keep running)",
+                group: "Cursor",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorModel,
+                label: "Model",
+                hint: "Default model family for new Cursor sessions (default = CLI's pick)",
+                group: "Cursor",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorEffort,
+                label: "Effort",
+                hint: "Effort (and -fast) variant of the chosen Cursor model; n/a while it is default or auto",
+                group: "Cursor",
+            },
+            SettingSpec {
+                kind: SettingKind::PiEnabled,
+                label: "Enabled",
+                hint: "Offer Pi in the New session picker (off hides it; existing sessions keep running)",
+                group: "Pi",
+            },
+            SettingSpec {
+                kind: SettingKind::PiModel,
+                label: "Model",
+                hint: "Default --model pattern for new Pi sessions (default = CLI's pick)",
+                group: "Pi",
+            },
+            SettingSpec {
+                kind: SettingKind::PiEffort,
+                label: "Effort",
+                hint: "Default --thinking level for new Pi sessions",
+                group: "Pi",
+            },
+        ]),
+    },
+    // Behaviors that change how the tree is worked, off by default until
+    // they have earned a tab of their own. Before Hotkeys, which stays
+    // last for the reason above.
+    SettingsTab {
+        title: "Experimental",
+        body: TabBody::Values(&[
+            SettingSpec {
+                kind: SettingKind::HideRootWorktree,
+                label: "Hide root worktree",
+                hint: "Drop the ⌂ root row so nothing launched from Worktrees lands in the shared checkout",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPrompts,
+                label: "Recent prompts",
+                hint: "List a session's last prompts under its row, newest at the bottom, each with how long ago",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPromptsCount,
+                label: "Recent prompts shown",
+                hint: "How many of a session's recent prompts the Sessions panel lists",
+                group: "",
             },
         ]),
     },
@@ -265,6 +543,14 @@ pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
     })
 }
 
+/// The row declared for `kind`, wherever it sits — for anything that
+/// wants its label or hint by name (the typed-row prompt's title).
+pub fn spec_for(kind: SettingKind) -> Option<&'static SettingSpec> {
+    all_settings()
+        .map(|(_, _, spec)| spec)
+        .find(|spec| spec.kind == kind)
+}
+
 /// Every value setting, tab by tab, for coverage checks.
 pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpec)> {
     SETTINGS_TABS.iter().enumerate().flat_map(|(t, tab)| {
@@ -309,26 +595,39 @@ impl SettingsRow {
 
 pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => (0..settings.len()).map(SettingsRow::Setting).collect(),
-        Some(TabBody::Hotkeys) => {
-            // The action table is already grouped; emit a header whenever
-            // the group name changes.
-            let mut rows = Vec::new();
-            let mut group: Option<&'static str> = None;
-            for (i, spec) in crate::keymap::ACTIONS.iter().enumerate() {
-                if group != Some(spec.group) {
-                    if group.is_some() {
-                        rows.push(SettingsRow::Blank);
-                    }
-                    rows.push(SettingsRow::Header(spec.group));
-                    group = Some(spec.group);
-                }
-                rows.push(SettingsRow::Hotkey(i));
-            }
-            rows
+        Some(TabBody::Values(settings)) => {
+            grouped(settings.iter().map(|s| s.group), SettingsRow::Setting)
         }
+        Some(TabBody::Hotkeys) => grouped(
+            crate::keymap::ACTIONS.iter().map(|s| s.group),
+            SettingsRow::Hotkey,
+        ),
         None => Vec::new(),
     }
+}
+
+/// Lays a table that is already in group order out under its section
+/// headers: a header whenever the group name changes, a blank line
+/// before every header but the first, and no header at all for a row
+/// whose group is empty — so a tab with no groups is the bare list it
+/// always was.
+fn grouped(
+    groups: impl Iterator<Item = &'static str>,
+    row: fn(usize) -> SettingsRow,
+) -> Vec<SettingsRow> {
+    let mut rows = Vec::new();
+    let mut current: Option<&'static str> = None;
+    for (i, group) in groups.enumerate() {
+        if !group.is_empty() && current != Some(group) {
+            if !rows.is_empty() {
+                rows.push(SettingsRow::Blank);
+            }
+            rows.push(SettingsRow::Header(group));
+            current = Some(group);
+        }
+        rows.push(row(i));
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,6 +642,16 @@ pub struct Config {
     /// Owned by the daemon; the TUI writes it so the settings overlay can
     /// toggle every key in the shared file.
     pub git_init_on_create: bool,
+    /// The branch every new WORKTREE nobody named a base for starts from
+    /// (`n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
+    /// PROMPT's auto-created one). Empty — the default, shown as `auto` —
+    /// is origin's own default branch, `origin/HEAD` freshly fetched; a
+    /// name (`master`, `develop`) is origin's fetched copy of that branch
+    /// when origin has one, else the checkout's local branch of that name,
+    /// else the default again. Owned by the daemon, which does the
+    /// resolving (`git::add_worktree_off_configured`); the TUI writes it so
+    /// the settings overlay can edit every key in the shared file.
+    pub worktree_base_branch: String,
     /// Editor command the file finder (`f`), tree browser (`b`),
     /// find-in-files (`F`), and ⌥click file links launch, invoked as
     /// `<editor> +<line> <file>`. Any command passes through verbatim, so
@@ -350,21 +659,56 @@ pub struct Config {
     /// `NEBULA_EDITOR` env var overrides it for the process; see
     /// [`Config::editor_command`].
     pub editor: String,
+    /// Opening a file from the file finder (`f`) or find-in-files (`F`)
+    /// closes that overlay as the editor modal opens, so quitting the
+    /// editor lands back on the panels instead of on the finder the user
+    /// then has to Esc a second time. When false the finder stays open
+    /// underneath and quitting the editor returns to the results. Does not
+    /// touch the tree browser (`b`), whose editor is embedded in its own
+    /// preview pane, or ⌥click, which has no overlay to close.
+    pub close_finder_on_open: bool,
     /// Create new agent sessions straight from the kind picker, with no
     /// name prompt: the session takes the generated default name and is
     /// opted into agent-driven auto-titling, exactly as accepting an empty
     /// prompt does. Off by default — naming a session is the deliberate
     /// choice, and skipping it is opting out of that.
     pub skip_session_naming: bool,
-    /// How long a session stays in the RECENT group after its status last
-    /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
-    /// "off" disables the group. Malformed values fall back to 30m.
-    pub recent_window: String,
+    /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
+    /// and the row menu's Archive alike. Off by default: archive is cheap
+    /// to undo with `u`, so it is the one verb on the SESSIONS PANEL that
+    /// skips the dialog `d` goes behind. On, for anyone whose typing keeps
+    /// landing on the panel and archiving the session under the cursor.
+    pub confirm_on_archive: bool,
     /// How long an idle session in an unviewed worktree lives before the
     /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// PREWARM POOL: keep one booted agent CLI standing by in the selected
+    /// worktree, so creating a session there adopts it instead of waiting
+    /// on a cold start. Owned by the daemon (which spawns, adopts and reaps
+    /// the spare); the TUI writes it so the settings overlay can toggle it.
+    /// A spare is a real CLI process — Claude's own `/list-agents` lists
+    /// it beside the sessions you made, named after the directory — and
+    /// switching this off drains the pool on the daemon's next sweep.
+    pub prewarm_agents: bool,
+    /// SESSION PREWARM: boot a worktree's dead sessions while the selection
+    /// rests on it, so attaching lands on a booted screen. Daemon-owned and
+    /// TUI-written, same as above.
+    pub prewarm_sessions: bool,
+    /// What rings when a turn reaches FINISHED: "off", "bell" (terminal
+    /// BEL) or the name of a macOS system sound (`Glass` by default,
+    /// `Ping`, …; see [`SOUNDS`]). Resolved by [`Config::done_sound`],
+    /// which falls back to the bell wherever `afplay` can't reach the
+    /// user's speakers.
+    pub done_sound: String,
+    /// What rings when a turn stops at NEEDS FEEDBACK — a permission
+    /// prompt or a question the agent is parked on. Same values and
+    /// resolution as `done_sound`; `Sosumi` by default so red and green
+    /// sound different from the next room. The one knob for both the
+    /// FEEDBACK SOUND and the desktop notification an unfocused terminal
+    /// window gets: "off" silences the pair.
+    pub feedback_sound: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -372,42 +716,88 @@ pub struct Config {
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
     pub animations: bool,
-    /// Faint accent-tinted background fill on the focused panel. Off by
-    /// default — it's a taste call, not everyone wants the extra color.
-    pub focus_tint: bool,
-    /// Whether the Workspaces column is drawn at the left edge. This is
-    /// the column's only home: `Shift+W` writes it here as it toggles, so
-    /// a hidden column stays hidden across restarts — and a crash or a
+    /// Whether the Workspaces bar is drawn across the top. This is the
+    /// bar's only home: `Shift+W` writes it here as it toggles, so a hidden
+    /// bar stays hidden across restarts, and a crash or a
     /// closed browser tab can't lose the choice the way the daemon's
     /// save-on-quit UI blob would.
     pub show_workspaces: bool,
-    /// Default model/effort for new Claude / Codex sessions. "default"
-    /// means "don't pass the flag" (the CLI picks); any other value is
-    /// passed through verbatim, so hand-edited configs can name models the
-    /// pickers don't list.
+    /// Hide the Projects panel and give its width to the terminal pane.
+    /// False by default so configs written before this key keep the current
+    /// three-panel layout.
+    pub hide_projects: bool,
+    /// Hide the Worktrees panel and give its width to the terminal pane.
+    /// Independent from `hide_projects`; Sessions always remains visible.
+    pub hide_worktrees: bool,
+    /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
+    /// PANEL, so nothing launched there lands in the shared checkout. (A
+    /// `p` on that panel cuts a fresh worktree with this on or off — that
+    /// is the panel's doing, not this switch's.) Off by default: the root
+    /// row is where most people start.
+    pub hide_root_worktree: bool,
+    /// Experimental: list each session's RECENT PROMPTS — the last few
+    /// things typed into it, as the daemon captured them off the
+    /// `UserPromptSubmit` hook — under its row in the SESSIONS PANEL,
+    /// newest at the bottom, each with an ago label. Off by default: the
+    /// rows are three lines taller with it on.
+    pub recent_prompts: bool,
+    /// How many of those prompts to list while `recent_prompts` is on.
+    /// The overlay cycles [`RECENT_PROMPT_COUNTS`]; a hand edit is clamped
+    /// to what the daemon keeps. Read through
+    /// [`Config::recent_prompts_shown`].
+    pub recent_prompts_count: usize,
+    /// Default model/effort for new Claude / Codex / Cursor sessions.
+    /// "default" means "don't pass the flag" (the CLI picks); any other
+    /// value is passed through verbatim, so hand-edited configs can name
+    /// models the pickers don't list. Cursor's pair is a family plus the
+    /// effort suffix the daemon joins onto it (see `cursor_catalogue.rs`).
     pub claude_model: String,
+    /// The Claude model rows the pickers, the AGENTS TAB and the PRESET
+    /// EDITOR offer, verbatim, in place of the built-in aliases — for an
+    /// organization allowlist or a provider (Bedrock, Vertex, a gateway)
+    /// whose ids the aliases don't reach: `["claude-sonnet-5",
+    /// "us.anthropic.claude-opus-5-v1:0"]`. Empty (the default) means the
+    /// list follows Claude Code's own `availableModels` when one is on
+    /// disk, else the aliases; see `claude_catalogue.rs`. Hand-edited only.
+    pub claude_models: Vec<String>,
     pub claude_effort: String,
     pub codex_model: String,
-    pub codex_effort: String,
-    /// The model lists the pickers offer, replacing the built-in
-    /// [`DEFAULT_CLAUDE_MODELS`] / [`DEFAULT_CODEX_MODELS`]. Entries reach
-    /// the CLI verbatim (`--model <entry>`), so naming one here is how a
-    /// model released after this build shows up in the `n` submenu, the
-    /// Automation pane and the settings overlay.
-    ///
-    /// "default" is always offered first whether or not it is listed —
-    /// it is the sentinel for "pass no flag", and a list without it would
-    /// strand anyone who had set one. Blank and duplicate entries drop
-    /// out, and a list that empties to nothing falls back to the built-in
-    /// one rather than to no choices at all. See
-    /// [`Config::model_choices`].
-    ///
-    /// Only written to the file when it differs from the built-in list,
-    /// the same rule `keybindings` follows: an install that never
-    /// customised it keeps inheriting new built-in models on upgrade
-    /// instead of pinning whatever shipped today.
-    pub claude_models: Vec<String>,
+    /// The Codex model rows every picker offers, verbatim, in place of the
+    /// built-in slugs: `["gpt-5.6-terra", "gpt-6-astra"]`. Codex's own list
+    /// is the API's to decide (it caches one in
+    /// `~/.codex/models_cache.json`), so a slug released after this build
+    /// is one line away rather than a nebula upgrade. Empty (the default)
+    /// means the built-ins; see `codex_catalogue.rs`. Hand-edited only.
     pub codex_models: Vec<String>,
+    pub codex_effort: String,
+    pub cursor_model: String,
+    pub cursor_effort: String,
+    /// Pi's pair: a `--model` pattern and a `--thinking` level.
+    pub pi_model: String,
+    pub pi_effort: String,
+    /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
+    /// harness out of the picker and the PR SESSION picker (and, for
+    /// Claude, out of the standing PREWARM POOL slot); sessions that already
+    /// exist keep attaching, resuming and restarting as before. All on by
+    /// default, so a config predating the keys hides nothing.
+    pub claude_enabled: bool,
+    pub codex_enabled: bool,
+    pub cursor_enabled: bool,
+    pub pi_enabled: bool,
+    /// Which AGENT KIND the QUICK PROMPT hotkey launches. Its model and
+    /// effort come from that kind's own defaults above, so the setting is
+    /// one name, not a third model/effort pair. Read through
+    /// [`Config::quick_prompt_kind`], which steps around a harness that has
+    /// since been switched off.
+    pub quick_prompt_kind: String,
+    /// Whether a QUICK PROMPT launch takes FOCUS into the TERMINAL PANE and
+    /// locks it. Off by default: the new SESSION's row is selected (so the
+    /// pane previews it and it is marked seen) but FOCUS stays on the panel
+    /// the prompt was fired from, so firing one off does not interrupt what
+    /// you were doing. Only the QUICK PROMPT reads this — every other launch
+    /// (the NEW SESSION PICKER, an AGENT PRESET, a PR SESSION, a Cloud task)
+    /// still enters the pane.
+    pub quick_prompt_focus: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -421,20 +811,40 @@ impl Default for Config {
         Self {
             palette_enter_attaches: true,
             git_init_on_create: true,
+            worktree_base_branch: String::new(),
             editor: "vim".into(),
+            close_finder_on_open: true,
             skip_session_naming: false,
-            recent_window: "30m".into(),
+            confirm_on_archive: false,
             session_idle_timeout: "5m".into(),
+            prewarm_agents: true,
+            prewarm_sessions: true,
+            done_sound: "Glass".into(),
+            feedback_sound: "Sosumi".into(),
             theme: "default".into(),
             animations: true,
-            focus_tint: false,
             show_workspaces: true,
-            claude_model: "default".into(),
-            claude_effort: "default".into(),
-            codex_model: "default".into(),
-            codex_effort: "default".into(),
-            claude_models: owned(DEFAULT_CLAUDE_MODELS),
-            codex_models: owned(DEFAULT_CODEX_MODELS),
+            hide_projects: false,
+            hide_worktrees: false,
+            hide_root_worktree: false,
+            recent_prompts: false,
+            recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
+            claude_model: DEFAULT_CHOICE.into(),
+            claude_models: Vec::new(),
+            claude_effort: DEFAULT_CHOICE.into(),
+            codex_model: DEFAULT_CHOICE.into(),
+            codex_models: Vec::new(),
+            codex_effort: DEFAULT_CHOICE.into(),
+            cursor_model: DEFAULT_CHOICE.into(),
+            cursor_effort: DEFAULT_CHOICE.into(),
+            pi_model: DEFAULT_CHOICE.into(),
+            pi_effort: DEFAULT_CHOICE.into(),
+            claude_enabled: true,
+            codex_enabled: true,
+            cursor_enabled: true,
+            pi_enabled: true,
+            quick_prompt_kind: AgentKind::Claude.as_str().into(),
+            quick_prompt_focus: false,
             keybindings: BTreeMap::new(),
         }
     }
@@ -442,7 +852,15 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        load_from(&settings_path())
+        let cfg = load_from(&settings_path());
+        // The Claude model rows follow `claude_models` live, as every
+        // other hand edit does. Not under test: the list is process-global
+        // and a test that never pinned the path would install the dev's.
+        #[cfg(not(test))]
+        crate::claude_catalogue::sync_config(&cfg.claude_models);
+        #[cfg(not(test))]
+        crate::codex_catalogue::sync_config(&cfg.codex_models);
+        cfg
     }
 
     /// Patch this config's known keys into the JSON file, preserving any
@@ -476,9 +894,9 @@ impl Config {
 
     /// Put every setting back to its default and return the result. The
     /// file is rewritten from scratch rather than patched like
-    /// [`Config::save`], so keys the overlay doesn't own — the daemon's
-    /// `prewarm_*`, anything hand-added — go too: a reset reads as if the
-    /// file had never been edited.
+    /// [`Config::save`], so keys the overlay doesn't own — anything
+    /// hand-added — go too: a reset reads as if the file had never been
+    /// edited.
     pub fn reset_to_defaults() -> std::io::Result<Self> {
         #[cfg(test)]
         assert!(
@@ -508,44 +926,105 @@ impl Config {
             "git_init_on_create".into(),
             serde_json::json!(self.git_init_on_create),
         );
+        obj.insert(
+            "worktree_base_branch".into(),
+            serde_json::json!(self.worktree_base_branch),
+        );
         obj.insert("editor".into(), serde_json::json!(self.editor));
+        obj.insert(
+            "close_finder_on_open".into(),
+            serde_json::json!(self.close_finder_on_open),
+        );
         obj.insert(
             "skip_session_naming".into(),
             serde_json::json!(self.skip_session_naming),
         );
         obj.insert(
-            "recent_window".into(),
-            serde_json::json!(self.recent_window),
+            "confirm_on_archive".into(),
+            serde_json::json!(self.confirm_on_archive),
         );
         obj.insert(
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
         );
+        obj.insert(
+            "prewarm_agents".into(),
+            serde_json::json!(self.prewarm_agents),
+        );
+        obj.insert(
+            "prewarm_sessions".into(),
+            serde_json::json!(self.prewarm_sessions),
+        );
+        obj.insert("done_sound".into(), serde_json::json!(self.done_sound));
+        obj.insert(
+            "feedback_sound".into(),
+            serde_json::json!(self.feedback_sound),
+        );
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
-        obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
         obj.insert(
             "show_workspaces".into(),
             serde_json::json!(self.show_workspaces),
         );
+        obj.insert(
+            "hide_projects".into(),
+            serde_json::json!(self.hide_projects),
+        );
+        obj.insert(
+            "hide_worktrees".into(),
+            serde_json::json!(self.hide_worktrees),
+        );
+        obj.insert(
+            "hide_root_worktree".into(),
+            serde_json::json!(self.hide_root_worktree),
+        );
+        obj.insert(
+            "recent_prompts".into(),
+            serde_json::json!(self.recent_prompts),
+        );
+        obj.insert(
+            "recent_prompts_count".into(),
+            serde_json::json!(self.recent_prompts_count),
+        );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
+        obj.insert(
+            "claude_models".into(),
+            serde_json::json!(self.claude_models),
+        );
         obj.insert(
             "claude_effort".into(),
             serde_json::json!(self.claude_effort),
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
+        obj.insert("codex_models".into(), serde_json::json!(self.codex_models));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
-        put_list(
-            obj,
-            "claude_models",
-            &self.claude_models,
-            DEFAULT_CLAUDE_MODELS,
+        obj.insert("cursor_model".into(), serde_json::json!(self.cursor_model));
+        obj.insert(
+            "cursor_effort".into(),
+            serde_json::json!(self.cursor_effort),
         );
-        put_list(
-            obj,
-            "codex_models",
-            &self.codex_models,
-            DEFAULT_CODEX_MODELS,
+        obj.insert("pi_model".into(), serde_json::json!(self.pi_model));
+        obj.insert("pi_effort".into(), serde_json::json!(self.pi_effort));
+        obj.insert(
+            "claude_enabled".into(),
+            serde_json::json!(self.claude_enabled),
+        );
+        obj.insert(
+            "codex_enabled".into(),
+            serde_json::json!(self.codex_enabled),
+        );
+        obj.insert(
+            "cursor_enabled".into(),
+            serde_json::json!(self.cursor_enabled),
+        );
+        obj.insert("pi_enabled".into(), serde_json::json!(self.pi_enabled));
+        obj.insert(
+            "quick_prompt_kind".into(),
+            serde_json::json!(self.quick_prompt_kind),
+        );
+        obj.insert(
+            "quick_prompt_focus".into(),
+            serde_json::json!(self.quick_prompt_focus),
         );
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
@@ -559,11 +1038,6 @@ impl Config {
         Ok(())
     }
 
-    /// `recent_window` parsed to ms; 0 disables the RECENT group.
-    pub fn recent_window_ms(&self) -> i64 {
-        parse_window_ms(&self.recent_window).unwrap_or(DEFAULT_RECENT_WINDOW_MS)
-    }
-
     /// `theme` resolved to the palette the UI draws with.
     pub fn theme(&self) -> crate::theme::Theme {
         crate::theme::Theme::by_name(&self.theme)
@@ -572,7 +1046,10 @@ impl Config {
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
     /// otherwise the `editor` setting, otherwise vim.
     pub fn editor_command(&self) -> String {
-        resolve_editor(std::env::var("NEBULA_EDITOR").ok().as_deref(), &self.editor)
+        resolve_editor(
+            nebula_core::env::non_empty(nebula_core::env::EDITOR).as_deref(),
+            &self.editor,
+        )
     }
 
     /// The configured default model for new sessions of `kind`, as the
@@ -581,41 +1058,68 @@ impl Config {
         let value = match kind {
             AgentKind::Claude => &self.claude_model,
             AgentKind::Codex => &self.codex_model,
-            AgentKind::Cursor => return None,
+            AgentKind::Cursor => &self.cursor_model,
+            AgentKind::Pi => &self.pi_model,
         };
         non_default(value)
     }
 
     /// The configured default effort for new sessions of `kind`;
-    /// None = "default" = don't pass the flag.
+    /// None = "default" = don't pass the flag. For Cursor an effort the
+    /// configured family does not ship is None too ([`fit_effort`]).
     pub fn default_effort(&self, kind: AgentKind) -> Option<String> {
         let value = match kind {
             AgentKind::Claude => &self.claude_effort,
             AgentKind::Codex => &self.codex_effort,
-            AgentKind::Cursor => return None,
+            AgentKind::Cursor => &self.cursor_effort,
+            AgentKind::Pi => &self.pi_effort,
         };
-        non_default(value)
+        fit_effort(kind, Some(&self.cursor_model), non_default(value))
     }
 
-    /// The model list the pickers offer for `kind`: `claude_models` /
-    /// `codex_models` when the config names them, the built-in list
-    /// otherwise. Always starts with "default" and is never empty for a
-    /// kind that has a model knob, so callers can rely on index 0 meaning
-    /// "pass no flag". Empty for Cursor, which has no `--model`.
-    pub fn model_choices(&self, kind: AgentKind) -> Vec<String> {
-        let configured = match kind {
-            AgentKind::Claude => &self.claude_models,
-            AgentKind::Codex => &self.codex_models,
-            AgentKind::Cursor => return Vec::new(),
-        };
-        normalize_choices(configured, default_models(kind))
+    /// Whether the NEW SESSION PICKER offers `kind` at all.
+    pub fn kind_enabled(&self, kind: AgentKind) -> bool {
+        match kind {
+            AgentKind::Claude => self.claude_enabled,
+            AgentKind::Codex => self.codex_enabled,
+            AgentKind::Cursor => self.cursor_enabled,
+            AgentKind::Pi => self.pi_enabled,
+        }
     }
 
-    /// The effort list for `kind`. Not configurable — see the note on
-    /// [`CLAUDE_EFFORTS`] — but shaped like [`Config::model_choices`] so
-    /// the pickers can treat the two vocabularies identically.
-    pub fn effort_choices(&self, kind: AgentKind) -> Vec<String> {
-        owned(default_efforts(kind))
+    /// The AGENT KINDS the picker lists, in `AgentKind::ALL` order. Empty
+    /// only from a hand-edited config: the overlay refuses to switch off
+    /// the last one.
+    pub fn enabled_kinds(&self) -> Vec<AgentKind> {
+        AgentKind::ALL
+            .into_iter()
+            .filter(|kind| self.kind_enabled(*kind))
+            .collect()
+    }
+
+    /// The AGENT KIND the QUICK PROMPT launches: the `quick_prompt_kind`
+    /// setting, stepped on to the first enabled kind when that harness has
+    /// been switched off on the AGENTS TAB since it was chosen (an
+    /// unreadable name, or a hand-edited config with every harness off,
+    /// reads as Claude — the same default the picker starts from).
+    pub fn quick_prompt_kind(&self) -> AgentKind {
+        let configured = AgentKind::parse(&self.quick_prompt_kind).unwrap_or_default();
+        if self.kind_enabled(configured) {
+            return configured;
+        }
+        self.enabled_kinds().first().copied().unwrap_or(configured)
+    }
+
+    /// How many RECENT PROMPTS the SESSIONS PANEL lists under a session:
+    /// zero while the feature is off, else the count clamped to what the
+    /// daemon keeps (a hand-edited `0` or `50` reads as `1` or the cap,
+    /// never as nothing while the switch says on).
+    pub fn recent_prompts_shown(&self) -> usize {
+        if !self.recent_prompts {
+            return 0;
+        }
+        self.recent_prompts_count
+            .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
     }
 
     /// Hotkeys as the event loop dispatches them: defaults with this
@@ -628,18 +1132,50 @@ impl Config {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
+            SettingKind::WorktreeBaseBranch => match self.worktree_base_branch.trim() {
+                "" => AUTO_CHOICE.into(),
+                name => name.to_string(),
+            },
             SettingKind::Editor => self.editor.clone(),
+            SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
-            SettingKind::RecentWindow => self.recent_window.clone(),
+            SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
+            SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
+            SettingKind::DoneSound => self.done_sound.clone(),
+            SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
-            SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
+            SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
+            SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
+            SettingKind::RecentPromptsCount => self
+                .recent_prompts_count
+                .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
+                .to_string(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
             SettingKind::CodexEffort => self.codex_effort.clone(),
+            SettingKind::CursorModel => self.cursor_model.clone(),
+            SettingKind::CursorEffort => {
+                if effort_choices(AgentKind::Cursor, Some(&self.cursor_model)).is_empty() {
+                    "n/a".into()
+                } else {
+                    self.cursor_effort.clone()
+                }
+            }
+            SettingKind::PiModel => self.pi_model.clone(),
+            SettingKind::PiEffort => self.pi_effort.clone(),
+            SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
+            SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
+            SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
+            SettingKind::PiEnabled => on_off(self.pi_enabled).into(),
+            SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
+            SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
         }
     }
 
@@ -658,18 +1194,35 @@ impl Config {
             SettingKind::GitInitOnCreate => {
                 self.git_init_on_create = !self.git_init_on_create;
             }
+            // Typed, not cycled: see `SettingKind::is_text` / `set_text`.
+            SettingKind::WorktreeBaseBranch => {}
             SettingKind::Editor => {
                 self.editor = cycle_choice(&self.editor, EDITORS, step).into();
+            }
+            SettingKind::CloseFinderOnOpen => {
+                self.close_finder_on_open = !self.close_finder_on_open;
             }
             SettingKind::SkipSessionNaming => {
                 self.skip_session_naming = !self.skip_session_naming;
             }
-            SettingKind::RecentWindow => {
-                self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
+            SettingKind::ConfirmOnArchive => {
+                self.confirm_on_archive = !self.confirm_on_archive;
             }
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::PrewarmAgents => {
+                self.prewarm_agents = !self.prewarm_agents;
+            }
+            SettingKind::PrewarmSessions => {
+                self.prewarm_sessions = !self.prewarm_sessions;
+            }
+            SettingKind::DoneSound => {
+                self.done_sound = cycle_choice(&self.done_sound, SOUNDS, step).into();
+            }
+            SettingKind::FeedbackSound => {
+                self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
@@ -677,31 +1230,170 @@ impl Config {
             SettingKind::Animations => {
                 self.animations = !self.animations;
             }
-            SettingKind::FocusTint => {
-                self.focus_tint = !self.focus_tint;
-            }
             SettingKind::ShowWorkspaces => {
                 self.show_workspaces = !self.show_workspaces;
             }
-            // Cycle the list the pickers show, not the built-in one, so a
-            // customised list is what the overlay walks.
+            SettingKind::HideProjects => {
+                self.hide_projects = !self.hide_projects;
+            }
+            SettingKind::HideWorktrees => {
+                self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideRootWorktree => {
+                self.hide_root_worktree = !self.hide_root_worktree;
+            }
+            SettingKind::RecentPrompts => {
+                self.recent_prompts = !self.recent_prompts;
+            }
+            SettingKind::RecentPromptsCount => {
+                // A hand-edited count off the list steps onto it.
+                let current = self.recent_prompts_count.to_string();
+                self.recent_prompts_count = cycle_choice(&current, RECENT_PROMPT_COUNTS, step)
+                    .parse()
+                    .unwrap_or(DEFAULT_RECENT_PROMPTS_COUNT);
+            }
             SettingKind::ClaudeModel => {
-                let choices = self.model_choices(AgentKind::Claude);
-                self.claude_model = cycle_choice(&self.claude_model, &choices, step).to_string();
+                self.claude_model =
+                    cycle_choice(&self.claude_model, model_choices(AgentKind::Claude), step).into();
             }
             SettingKind::ClaudeEffort => {
-                let choices = self.effort_choices(AgentKind::Claude);
-                self.claude_effort = cycle_choice(&self.claude_effort, &choices, step).to_string();
+                self.claude_effort = cycle_choice(&self.claude_effort, CLAUDE_EFFORTS, step).into();
             }
             SettingKind::CodexModel => {
-                let choices = self.model_choices(AgentKind::Codex);
-                self.codex_model = cycle_choice(&self.codex_model, &choices, step).to_string();
+                self.codex_model =
+                    cycle_choice(&self.codex_model, model_choices(AgentKind::Codex), step).into();
             }
             SettingKind::CodexEffort => {
-                let choices = self.effort_choices(AgentKind::Codex);
-                self.codex_effort = cycle_choice(&self.codex_effort, &choices, step).to_string();
+                self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
+            }
+            SettingKind::ClaudeEnabled => {
+                self.claude_enabled = !self.claude_enabled;
+            }
+            SettingKind::CodexEnabled => {
+                self.codex_enabled = !self.codex_enabled;
+            }
+            SettingKind::CursorEnabled => {
+                self.cursor_enabled = !self.cursor_enabled;
+            }
+            SettingKind::PiEnabled => {
+                self.pi_enabled = !self.pi_enabled;
+            }
+            SettingKind::PiModel => {
+                self.pi_model = cycle_choice(&self.pi_model, PI_MODELS, step).into();
+            }
+            SettingKind::PiEffort => {
+                self.pi_effort = cycle_choice(&self.pi_effort, PI_EFFORTS, step).into();
+            }
+            SettingKind::CursorModel => {
+                self.cursor_model =
+                    cycle_choice(&self.cursor_model, crate::cursor_catalogue::models(), step)
+                        .into();
+                // The effort list follows the family: an effort the new
+                // family lacks becomes its fallback (or default), never an
+                // id the CLI would refuse.
+                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
+                if !fits(&self.cursor_effort, choices) {
+                    self.cursor_effort =
+                        fit_effort(AgentKind::Cursor, Some(&self.cursor_model), None)
+                            .unwrap_or_else(|| DEFAULT_CHOICE.into());
+                }
+            }
+            SettingKind::QuickPromptKind => {
+                self.quick_prompt_kind =
+                    cycle_choice(&self.quick_prompt_kind, AGENT_KIND_NAMES, step).into();
+            }
+            SettingKind::QuickPromptFocus => {
+                self.quick_prompt_focus = !self.quick_prompt_focus;
+            }
+            SettingKind::CursorEffort => {
+                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
+                if !choices.is_empty() {
+                    self.cursor_effort = cycle_choice(&self.cursor_effort, choices, step).into();
+                }
             }
         }
+    }
+
+    /// The stored text of a typed row ([`SettingKind::is_text`]) as the
+    /// prompt should pre-fill it — `""` for an unset row, never the `auto`
+    /// the overlay shows in its place. Empty for a row that is not typed.
+    pub fn text_value(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::WorktreeBaseBranch => self.worktree_base_branch.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write a typed value into a text row ([`SettingKind::is_text`]),
+    /// trimmed. Empty puts the row back on its default (`auto`). False for
+    /// a row that is not typed — nothing changes.
+    pub fn set_text(&mut self, kind: SettingKind, value: &str) -> bool {
+        match kind {
+            SettingKind::WorktreeBaseBranch => {
+                self.worktree_base_branch = value.trim().to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the TUI plays for a status edge — the `done_sound` or
+/// `feedback_sound` SETTING resolved against where the TUI is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sound {
+    /// The terminal BEL (`\x07`), written through the attached terminal,
+    /// which decides whether that is a sound, a flash, or a dock bounce.
+    Bell,
+    /// A sound file to hand to `afplay`.
+    File(PathBuf),
+}
+
+impl Config {
+    /// The sound to play for a finish, or `None` for silence. A named
+    /// system sound only resolves to its file on macOS, on a local
+    /// terminal, and when the file exists — over ssh `afplay` would ring
+    /// the *remote* box, so the bell stands in there, as it does off
+    /// macOS and for a name the sound folder doesn't hold.
+    pub fn done_sound(&self) -> Option<Sound> {
+        resolve_sound(
+            &self.done_sound,
+            nebula_core::host::is_remote_session(),
+            cfg!(target_os = "macos"),
+        )
+    }
+
+    /// The sound to play when a turn stops to ask the user, or `None` for
+    /// silence — which also stands down the desktop notification, since
+    /// `feedback_sound` is the one switch for both. Same fallbacks as
+    /// [`Config::done_sound`].
+    pub fn feedback_sound(&self) -> Option<Sound> {
+        resolve_sound(
+            &self.feedback_sound,
+            nebula_core::host::is_remote_session(),
+            cfg!(target_os = "macos"),
+        )
+    }
+}
+
+fn resolve_sound(configured: &str, remote: bool, macos: bool) -> Option<Sound> {
+    let name = configured.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("bell") || remote || !macos {
+        return Some(Sound::Bell);
+    }
+    // A sound name is a bare file stem; anything else (a path, a dot) is
+    // not one, and the bell covers the typo.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Some(Sound::Bell);
+    }
+    let path = Path::new(MACOS_SOUNDS_DIR).join(format!("{name}.aiff"));
+    if path.is_file() {
+        Some(Sound::File(path))
+    } else {
+        Some(Sound::Bell)
     }
 }
 
@@ -716,10 +1408,10 @@ fn resolve_editor(env: Option<&str>, configured: &str) -> String {
     "vim".into()
 }
 
-/// "default" (or blank) → None; anything else passes through.
-fn non_default(value: &str) -> Option<String> {
+/// [`DEFAULT_CHOICE`] (or blank) → None; anything else passes through.
+pub(crate) fn non_default(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty() && !value.eq_ignore_ascii_case("default")).then(|| value.to_string())
+    (!value.is_empty() && !value.eq_ignore_ascii_case(DEFAULT_CHOICE)).then(|| value.to_string())
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -730,71 +1422,21 @@ fn on_off(v: bool) -> &'static str {
     }
 }
 
-/// `&'static [&'static str]` for the fixed lists, `&[String]` for the
-/// configurable ones — generic so both read the same at the call sites.
-/// An unrecognised `current` reads as index 0, which for every list here
-/// is "default".
-fn cycle_choice<'a, S: AsRef<str>>(current: &str, choices: &'a [S], delta: i32) -> &'a str {
-    if choices.is_empty() {
-        return "";
+fn shown_hidden(hidden: bool) -> &'static str {
+    if hidden {
+        "hidden"
+    } else {
+        "shown"
     }
+}
+
+pub(crate) fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -> &'a str {
     let n = choices.len() as i32;
     let pos = choices
         .iter()
-        .position(|c| c.as_ref().eq_ignore_ascii_case(current.trim()))
+        .position(|c| c.eq_ignore_ascii_case(current.trim()))
         .unwrap_or(0) as i32;
-    choices[(pos + delta).rem_euclid(n) as usize].as_ref()
-}
-
-fn owned(choices: &[&str]) -> Vec<String> {
-    choices.iter().map(|c| (*c).to_string()).collect()
-}
-
-/// A configured choice list folded into what the pickers can use: entries
-/// trimmed, blanks dropped, duplicates collapsed case-insensitively, and
-/// "default" pulled to the front because it is the sentinel every caller
-/// indexes for "pass no flag". A list that survives none of that falls
-/// back to `fallback`, so a typo'd or emptied setting degrades to the
-/// built-in models rather than to an empty menu.
-fn normalize_choices(configured: &[String], fallback: &[&str]) -> Vec<String> {
-    fn push(out: &mut Vec<String>, entry: &str) {
-        let entry = entry.trim();
-        if entry.is_empty() || entry.eq_ignore_ascii_case("default") {
-            return;
-        }
-        if !out.iter().any(|c| c.eq_ignore_ascii_case(entry)) {
-            out.push(entry.to_string());
-        }
-    }
-    let mut out: Vec<String> = Vec::with_capacity(configured.len() + 1);
-    for entry in configured {
-        push(&mut out, entry);
-    }
-    if out.is_empty() {
-        for entry in fallback {
-            push(&mut out, entry);
-        }
-    }
-    out.insert(0, "default".to_string());
-    out
-}
-
-/// Write a choice list only when it differs from the built-in one, and
-/// drop the key when it matches. Same rule as `keybindings`: a config that
-/// never customised the list keeps inheriting new built-in models on
-/// upgrade instead of freezing today's set into the file.
-fn put_list(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    current: &[String],
-    default: &[&str],
-) {
-    let same = current.len() == default.len() && current.iter().zip(default).all(|(a, b)| a == b);
-    if same {
-        obj.remove(key);
-    } else {
-        obj.insert(key.to_string(), serde_json::json!(current));
-    }
+    choices[(pos + delta).rem_euclid(n) as usize]
 }
 
 fn load_from(path: &Path) -> Config {
@@ -817,19 +1459,6 @@ fn settings_path() -> PathBuf {
     nebula_core::paths::config_path()
 }
 
-fn parse_window_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("off") || s == "0" {
-        return Some(0);
-    }
-    let (digits, unit_ms) = match s.strip_suffix(['m', 'M']) {
-        Some(d) => (d, 60_000),
-        None => (s.strip_suffix(['h', 'H'])?, 3_600_000),
-    };
-    let n: i64 = digits.trim().parse().ok()?;
-    (n >= 0).then(|| n.saturating_mul(unit_ms))
-}
-
 #[cfg(test)]
 thread_local! {
     static CONFIG_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
@@ -850,6 +1479,58 @@ pub fn with_config_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::keymap::Keymap;
+
+    #[test]
+    fn defaults_close_the_finder_on_open() {
+        assert!(Config::default().close_finder_on_open);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.close_finder_on_open);
+        let cfg: Config = serde_json::from_str(r#"{"close_finder_on_open": false}"#).unwrap();
+        assert!(!cfg.close_finder_on_open);
+        // The overlay toggle round-trips through the saved file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::CloseFinderOnOpen).unwrap();
+        cfg.cycle(t, r, 1);
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).close_finder_on_open);
+    }
+
+    /// The two prewarm keys are daemon-owned but overlay-toggled, like
+    /// `git_init_on_create`: on by default, a missing key reads as on, and
+    /// the Sessions-tab rows round-trip through the saved file.
+    #[test]
+    fn prewarm_toggles_default_on_and_round_trip() {
+        let cfg = Config::default();
+        assert!(cfg.prewarm_agents && cfg.prewarm_sessions);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.prewarm_agents && cfg.prewarm_sessions);
+        let cfg: Config =
+            serde_json::from_str(r#"{"prewarm_agents": false, "prewarm_sessions": false}"#)
+                .unwrap();
+        assert!(!cfg.prewarm_agents && !cfg.prewarm_sessions);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::PrewarmAgents).unwrap();
+        assert_eq!(SETTINGS_TABS[t].title, "Sessions");
+        cfg.cycle(t, r, 0);
+        let (t, r) = locate(SettingKind::PrewarmSessions).unwrap();
+        assert_eq!(SETTINGS_TABS[t].title, "Sessions");
+        cfg.cycle(t, r, 0);
+        assert_eq!(cfg.value_label(SettingKind::PrewarmAgents), "off");
+        assert_eq!(cfg.value_label(SettingKind::PrewarmSessions), "off");
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Written under the daemon's own key names, since it is the reader.
+        assert_eq!(saved["prewarm_agents"], false);
+        assert_eq!(saved["prewarm_sessions"], false);
+        let loaded = load_from(&path);
+        assert!(!loaded.prewarm_agents && !loaded.prewarm_sessions);
+    }
 
     #[test]
     fn defaults_enter_attaches() {
@@ -875,12 +1556,12 @@ mod tests {
             // A key the overlay doesn't own survives an ordinary save…
             let mut root: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            root["prewarm_agents"] = serde_json::json!(false);
+            root["hand_added_key"] = serde_json::json!(false);
             std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
             Config::load().save().unwrap();
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(
-                raw.contains("prewarm_agents"),
+                raw.contains("hand_added_key"),
                 "save() patches, keeping foreign keys:\n{raw}"
             );
 
@@ -890,7 +1571,7 @@ mod tests {
             assert!(reset.keybindings.is_empty());
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(
-                !raw.contains("prewarm_agents"),
+                !raw.contains("hand_added_key"),
                 "foreign key survived:\n{raw}"
             );
             let loaded = Config::load();
@@ -930,30 +1611,195 @@ mod tests {
     }
 
     #[test]
-    fn recent_window_parses_minutes_hours_and_off() {
-        let ms = |v: &str| {
-            let cfg: Config =
-                serde_json::from_str(&format!(r#"{{"recent_window": "{v}"}}"#)).unwrap();
-            cfg.recent_window_ms()
-        };
-        assert_eq!(ms("5m"), 5 * 60_000);
-        assert_eq!(ms("10m"), 10 * 60_000);
-        assert_eq!(ms("30m"), 30 * 60_000);
-        assert_eq!(ms("1h"), 3_600_000);
-        assert_eq!(ms("24h"), 24 * 3_600_000);
-        assert_eq!(ms("off"), 0);
-        assert_eq!(ms("0"), 0);
-        // Malformed values fall back to the default.
-        assert_eq!(ms("soon"), DEFAULT_RECENT_WINDOW_MS);
-        assert_eq!(ms("-5m"), DEFAULT_RECENT_WINDOW_MS);
+    fn confirm_on_archive_defaults_off_toggles_and_persists() {
+        assert!(
+            !Config::default().confirm_on_archive,
+            "archive skips the confirm by default; the dialog is opt-in"
+        );
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.confirm_on_archive);
+
+        let mut cfg = Config::default();
+        let (tab, row) = locate(SettingKind::ConfirmOnArchive).unwrap();
         assert_eq!(
-            Config::default().recent_window_ms(),
-            DEFAULT_RECENT_WINDOW_MS
+            SETTINGS_TABS[tab].title, "Sessions",
+            "lives on the Sessions tab"
+        );
+        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "off");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.confirm_on_archive);
+        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).confirm_on_archive);
+    }
+
+    #[test]
+    fn worktree_base_branch_is_a_typed_row_that_defaults_to_auto() {
+        assert_eq!(Config::default().worktree_base_branch, "");
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.worktree_base_branch, "");
+        assert_eq!(
+            cfg.value_label(SettingKind::WorktreeBaseBranch),
+            AUTO_CHOICE
+        );
+        assert!(SettingKind::WorktreeBaseBranch.is_text());
+
+        let (tab, row) = locate(SettingKind::WorktreeBaseBranch).unwrap();
+        assert_eq!(
+            SETTINGS_TABS[tab].title, "General",
+            "sits beside git init new projects"
+        );
+        // Enter / ←/→ on a typed row change nothing; the prompt does.
+        let mut cfg = Config::default();
+        for delta in [0, 1, -1] {
+            cfg.cycle(tab, row, delta);
+            assert_eq!(cfg.worktree_base_branch, "");
+        }
+
+        assert_eq!(cfg.text_value(SettingKind::WorktreeBaseBranch), "");
+        assert!(cfg.set_text(SettingKind::WorktreeBaseBranch, "  master "));
+        assert_eq!(cfg.worktree_base_branch, "master", "trimmed");
+        assert_eq!(cfg.value_label(SettingKind::WorktreeBaseBranch), "master");
+        assert_eq!(cfg.text_value(SettingKind::WorktreeBaseBranch), "master");
+        assert_eq!(
+            spec_for(SettingKind::WorktreeBaseBranch).map(|s| s.label),
+            Some("Worktree base branch")
+        );
+        assert!(
+            !cfg.set_text(SettingKind::Editor, "nvim"),
+            "a cycled row is not a typed one"
+        );
+        assert_eq!(cfg.editor, "vim");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["worktree_base_branch"], "master");
+        assert_eq!(load_from(&path).worktree_base_branch, "master");
+
+        // Empty is the way back to auto, and is stored as "", not "auto".
+        assert!(cfg.set_text(SettingKind::WorktreeBaseBranch, "   "));
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["worktree_base_branch"], "");
+        assert_eq!(
+            load_from(&path).value_label(SettingKind::WorktreeBaseBranch),
+            AUTO_CHOICE
         );
     }
 
     #[test]
-    fn cycle_toggles_bools_and_walks_recent_window() {
+    fn done_sound_defaults_to_bell_cycles_persists_and_resolves() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.done_sound, "Glass");
+        // A config predating the key dings too.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.done_sound, "Glass");
+
+        let (tab, row) = locate(SettingKind::DoneSound).unwrap();
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "bell");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "off");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "Basso", "the list wraps");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.done_sound, "off");
+        cfg.cycle(tab, row, 1);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.done_sound, "Glass");
+        assert_eq!(cfg.value_label(SettingKind::DoneSound), "Glass");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).done_sound, "Glass");
+
+        // Silence, the bell, and every reason a name falls back to it.
+        assert_eq!(resolve_sound("off", false, true), None);
+        assert_eq!(resolve_sound("OFF", false, true), None);
+        assert_eq!(resolve_sound("", false, true), None);
+        assert_eq!(resolve_sound("bell", false, true), Some(Sound::Bell));
+        assert_eq!(
+            resolve_sound("Glass", true, true),
+            Some(Sound::Bell),
+            "over ssh afplay would ring the remote box"
+        );
+        assert_eq!(
+            resolve_sound("Glass", false, false),
+            Some(Sound::Bell),
+            "no system sounds off macOS"
+        );
+        assert_eq!(resolve_sound("NoSuchSound", false, true), Some(Sound::Bell));
+        assert_eq!(
+            resolve_sound("../etc/passwd", false, true),
+            Some(Sound::Bell)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_sound("Glass", false, true),
+            Some(Sound::File(Path::new(MACOS_SOUNDS_DIR).join("Glass.aiff")))
+        );
+    }
+
+    #[test]
+    fn feedback_sound_defaults_to_sosumi_cycles_persists_and_resolves() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.feedback_sound, "Sosumi");
+        assert_ne!(
+            cfg.feedback_sound, cfg.done_sound,
+            "red and green must sound different"
+        );
+        // A config predating the key rings too.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.feedback_sound, "Sosumi");
+        // …and one that only ever set the done sound keeps it.
+        let old: Config = serde_json::from_str(r#"{"done_sound": "Ping"}"#).unwrap();
+        assert_eq!(old.done_sound, "Ping");
+        assert_eq!(old.feedback_sound, "Sosumi");
+
+        // Its row sits right after the done sound on the Sessions tab.
+        let (tab, row) = locate(SettingKind::FeedbackSound).unwrap();
+        assert_eq!(locate(SettingKind::DoneSound).unwrap(), (tab, row - 1));
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.feedback_sound, "Basso");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.feedback_sound, "off", "the list wraps");
+        cfg.cycle(tab, row, -1);
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.feedback_sound, "Sosumi");
+        assert_eq!(cfg.value_label(SettingKind::FeedbackSound), "Sosumi");
+        assert_eq!(cfg.done_sound, "Glass", "the done sound is its own row");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.feedback_sound = "off".into();
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.feedback_sound, "off");
+        assert_eq!(loaded.feedback_sound(), None, "off is silence for both");
+        assert_eq!(loaded.done_sound, "Glass");
+
+        // The same resolution as the done sound: the bell over ssh and off
+        // macOS, silence for off.
+        assert_eq!(resolve_sound("Sosumi", true, true), Some(Sound::Bell));
+        assert_eq!(resolve_sound("Sosumi", false, false), Some(Sound::Bell));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_sound("Sosumi", false, true),
+            Some(Sound::File(Path::new(MACOS_SOUNDS_DIR).join("Sosumi.aiff")))
+        );
+    }
+
+    #[test]
+    fn cycle_toggles_bools_and_walks_session_idle_timeout() {
         let mut cfg = Config::default();
         let (t, r) = locate(SettingKind::PaletteEnterAttaches).unwrap();
         assert!(cfg.palette_enter_attaches);
@@ -962,14 +1808,14 @@ mod tests {
         cfg.cycle(t, r, 1);
         assert!(cfg.palette_enter_attaches);
 
-        assert_eq!(cfg.recent_window, "30m");
-        let (t, r) = locate(SettingKind::RecentWindow).unwrap();
+        assert_eq!(cfg.session_idle_timeout, "5m");
+        let (t, r) = locate(SettingKind::SessionIdleTimeout).unwrap();
         cfg.cycle(t, r, 0);
-        assert_eq!(cfg.recent_window, "1h");
+        assert_eq!(cfg.session_idle_timeout, "15m");
         cfg.cycle(t, r, -1);
-        assert_eq!(cfg.recent_window, "30m");
+        assert_eq!(cfg.session_idle_timeout, "5m");
         cfg.cycle(t, r, -1);
-        assert_eq!(cfg.recent_window, "10m");
+        assert_eq!(cfg.session_idle_timeout, "1m");
     }
 
     #[test]
@@ -1074,20 +1920,252 @@ mod tests {
     }
 
     #[test]
-    fn focus_tint_default_off_toggle_and_persist() {
+    fn project_and_worktree_panels_default_shown_toggle_and_persist() {
         let mut cfg = Config::default();
-        assert!(!cfg.focus_tint);
-        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.focus_tint);
+        assert!(!cfg.hide_projects);
+        assert!(!cfg.hide_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::HideProjects), "shown");
+        assert_eq!(cfg.value_label(SettingKind::HideWorktrees), "shown");
+
+        let (projects_tab, projects_row) = locate(SettingKind::HideProjects).unwrap();
+        cfg.cycle(projects_tab, projects_row, 0);
+        let (worktrees_tab, worktrees_row) = locate(SettingKind::HideWorktrees).unwrap();
+        cfg.cycle(worktrees_tab, worktrees_row, 0);
+        assert!(cfg.hide_projects);
+        assert!(cfg.hide_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::HideProjects), "hidden");
+        assert_eq!(cfg.value_label(SettingKind::HideWorktrees), "hidden");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).focus_tint);
-        // A config predating the key keeps the tint off.
+        let loaded = load_from(&path);
+        assert!(loaded.hide_projects);
+        assert!(loaded.hide_worktrees);
+
+        // A CONFIG.JSON predating these keys keeps both panels shown.
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.hide_projects);
+        assert!(!legacy.hide_worktrees);
+    }
+
+    /// The FOCUS TINT is always on since 2026-08-29: a `focus_tint` key
+    /// left behind in an older config.json is ignored, never an error.
+    #[test]
+    fn stale_focus_tint_key_is_ignored() {
+        let cfg: Config = serde_json::from_str(r#"{"focus_tint": true}"#).unwrap();
+        assert!(cfg.animations);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.get("focus_tint").is_none());
+    }
+
+    /// The QUICK PROMPT's focus toggle: off unless the user turns it on,
+    /// and persisted under its own key (a missed `obj.insert` would let the
+    /// row toggle on screen and read back off on the next launch).
+    #[test]
+    fn quick_prompt_focus_toggles_off_by_default_and_persists() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.quick_prompt_focus,
+            "a quick prompt stays out of the way"
+        );
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptFocus), "off");
+
+        let (tab, row) = locate(SettingKind::QuickPromptFocus).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.quick_prompt_focus);
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptFocus), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).quick_prompt_focus);
+
+        // A config predating the key reads as off.
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.focus_tint);
+        assert!(!cfg.quick_prompt_focus);
+    }
+
+    /// The Experimental tab's first row: off by default, a plain toggle,
+    /// persisted under its own key, and unknown to a config written
+    /// before it (which reads as off).
+    #[test]
+    fn hide_root_worktree_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.hide_root_worktree,
+            "the root row is where most people start"
+        );
+        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "off");
+
+        let (tab, row) = locate(SettingKind::HideRootWorktree).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_root_worktree);
+        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).hide_root_worktree);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.hide_root_worktree);
+    }
+
+    /// RECENT PROMPTS: an Experimental switch that is off by default and
+    /// a count beside it, read together through `recent_prompts_shown`
+    /// — zero while off, the count while on, a hand edit clamped to what
+    /// the daemon keeps — and both persisted under their own keys.
+    #[test]
+    fn recent_prompts_are_off_by_default_and_the_count_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.recent_prompts, "rows stay short until asked");
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
+        assert_eq!(cfg.recent_prompts_shown(), 0, "off means none drawn");
+        assert_eq!(cfg.value_label(SettingKind::RecentPrompts), "off");
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "3");
+
+        let (tab, row) = locate(SettingKind::RecentPrompts).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        let (count_tab, count_row) = locate(SettingKind::RecentPromptsCount).unwrap();
+        assert_eq!(count_tab, tab);
+        assert_eq!(count_row, row + 1, "the count sits under its switch");
+
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_shown(), 3);
+
+        // The count walks the list both ways and wraps.
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 4);
+        cfg.cycle(count_tab, count_row, 1);
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 1, "wraps past 5");
+        cfg.cycle(count_tab, count_row, -1);
+        assert_eq!(cfg.recent_prompts_count, 5);
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "5");
+        let most: usize = RECENT_PROMPT_COUNTS.last().unwrap().parse().unwrap();
+        assert!(
+            most <= nebula_core::RECENT_PROMPTS_KEPT,
+            "the overlay never asks for more than the daemon keeps"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.recent_prompts);
+        assert_eq!(loaded.recent_prompts_count, 5);
+        assert_eq!(loaded.recent_prompts_shown(), 5);
+
+        // A hand edit past the list is clamped, not refused; a count that
+        // is off the list steps back onto it when cycled.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 50}"#)
+                .unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), nebula_core::RECENT_PROMPTS_KEPT);
+        assert_eq!(
+            cfg.value_label(SettingKind::RecentPromptsCount),
+            nebula_core::RECENT_PROMPTS_KEPT.to_string()
+        );
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(
+            cfg.recent_prompts_count, 2,
+            "off-list steps from the first choice"
+        );
+        let cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 0}"#).unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), 1);
+
+        // A config predating the keys reads as off, with the default count.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
+    }
+
+    /// The QUICK PROMPT's harness: one name, cycled over every AGENT KIND,
+    /// read back through the fallback that steps around a harness switched
+    /// off since it was chosen.
+    #[test]
+    fn quick_prompt_kind_cycles_every_harness_and_persists() {
+        let names: Vec<&str> = AgentKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(AGENT_KIND_NAMES, names.as_slice(), "one choice per kind");
+
+        let mut cfg = Config::default();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        let (tab, row) = locate(SettingKind::QuickPromptKind).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptKind), "codex");
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Codex);
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.cycle(tab, row, 2);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).quick_prompt_kind(), AgentKind::Cursor);
+
+        // A config predating the key, and a name nothing parses, both read
+        // as Claude rather than refusing to launch.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        let cfg: Config = serde_json::from_str(r#"{"quick_prompt_kind":"gemini"}"#).unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+
+        // The chosen harness switched off on the AGENTS TAB steps on to the
+        // first one still enabled.
+        let cfg: Config = serde_json::from_str(
+            r#"{"quick_prompt_kind":"codex","codex_enabled":false,"claude_enabled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Cursor);
+    }
+
+    #[test]
+    fn harness_toggles_default_on_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.claude_enabled && cfg.codex_enabled && cfg.cursor_enabled);
+        assert_eq!(cfg.enabled_kinds(), AgentKind::ALL.to_vec());
+
+        let (tab, row) = locate(SettingKind::CodexEnabled).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.codex_enabled);
+        assert!(!cfg.kind_enabled(AgentKind::Codex));
+        assert_eq!(
+            cfg.enabled_kinds(),
+            vec![AgentKind::Claude, AgentKind::Cursor, AgentKind::Pi],
+            "the disabled kind drops out, order kept"
+        );
+        // ←/→ toggle a bool just like Enter does.
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.codex_enabled);
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.codex_enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.claude_enabled);
+        assert!(!loaded.codex_enabled);
+        assert!(loaded.cursor_enabled);
+        // A config predating the keys offers every harness.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.enabled_kinds().len(), AgentKind::ALL.len());
+
+        // Every kind off is representable (a hand edit), and reads as empty.
+        let cfg: Config = serde_json::from_str(
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(cfg.enabled_kinds().is_empty());
     }
 
     #[test]
@@ -1111,9 +2189,58 @@ mod tests {
             cfg.default_effort(AgentKind::Codex).as_deref(),
             Some("high")
         );
-        // Cursor has no model/effort knobs regardless of settings.
+        // Pi passes both through like Claude: a pattern and a thinking level.
+        assert_eq!(cfg.default_model(AgentKind::Pi), None);
+        assert_eq!(cfg.default_effort(AgentKind::Pi), None);
+        cfg.pi_model = "sonnet".into();
+        cfg.pi_effort = "xhigh".into();
+        assert_eq!(cfg.default_model(AgentKind::Pi).as_deref(), Some("sonnet"));
+        assert_eq!(cfg.default_effort(AgentKind::Pi).as_deref(), Some("xhigh"));
+        let (tab, row) = locate(SettingKind::PiEffort).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.value_label(SettingKind::PiEffort), "max");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.value_label(SettingKind::PiEffort),
+            DEFAULT_CHOICE,
+            "wraps"
+        );
+        // Cursor: the family is the model; the effort only counts when
+        // that family ships it.
         assert_eq!(cfg.default_model(AgentKind::Cursor), None);
         assert_eq!(cfg.default_effort(AgentKind::Cursor), None);
+        cfg.cursor_effort = "high".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "no family, no suffix to join"
+        );
+        cfg.cursor_model = "claude-opus-5".into();
+        assert_eq!(
+            cfg.default_model(AgentKind::Cursor).as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high")
+        );
+        cfg.cursor_effort = "max".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high"),
+            "Opus 5 has no max variant and no bare id: its fallback launches"
+        );
+        cfg.cursor_model = "gpt-5.3-codex".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "a family with a bare id: default really is no suffix"
+        );
+        cfg.cursor_effort = "high-fast".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high-fast")
+        );
 
         // The settings rows walk the same choice lists the submenus show.
         let (tab, row) = locate(SettingKind::ClaudeModel).unwrap();
@@ -1131,133 +2258,136 @@ mod tests {
     }
 
     #[test]
+    fn cursor_settings_rows_follow_the_family() {
+        let mut cfg = Config::default();
+        let (tab, model_row) = locate(SettingKind::CursorModel).unwrap();
+        let (_, effort_row) = locate(SettingKind::CursorEffort).unwrap();
+        // No family: the effort row is n/a and does not cycle.
+        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "default");
+        // default → auto (still no efforts) → claude-fable-5, which has no
+        // bare id, so the effort lands on its fallback at once.
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "auto");
+        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-fable-5");
+        assert_eq!(cfg.cursor_effort, "high");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "xhigh");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "max");
+        // fable-5-thinking has max; Opus 5 doesn't → back to its fallback.
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-fable-5-thinking");
+        assert_eq!(cfg.cursor_effort, "max", "a shared effort survives");
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-opus-5");
+        assert_eq!(cfg.cursor_effort, "high");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "high-fast", "-fast rides in the effort");
+        // A family with a bare id offers default again, and ← wraps onto
+        // its last fast variant.
+        cfg.cursor_model = "gpt-5.3-codex".into();
+        cfg.cursor_effort = "default".into();
+        cfg.cycle(tab, effort_row, -1);
+        assert_eq!(cfg.cursor_effort, "xhigh-fast");
+    }
+
+    #[test]
+    fn fit_effort_resolves_cursor_pairs() {
+        let fit = |m: Option<&str>, e: Option<&str>| {
+            fit_effort(AgentKind::Cursor, m, e.map(String::from))
+        };
+        assert_eq!(fit(None, Some("high")), None, "no family, nothing to join");
+        assert_eq!(fit(Some("default"), Some("high")), None);
+        assert_eq!(
+            fit(Some("auto"), Some("high")),
+            None,
+            "auto has no variants"
+        );
+        assert_eq!(fit(Some("nope"), Some("high")), None);
+        assert_eq!(fit(Some("gpt-5.3-codex"), None), None, "bare id exists");
+        assert_eq!(fit(Some("gpt-5.3-codex"), Some("bogus")), None);
+        assert_eq!(
+            fit(Some("gpt-5.3-codex"), Some("fast")).as_deref(),
+            Some("fast")
+        );
+        assert_eq!(fit(Some("claude-fable-5"), None).as_deref(), Some("high"));
+        assert_eq!(
+            fit(Some("claude-fable-5"), Some("default")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            fit(Some("claude-fable-5"), Some("MAX ")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            fit(Some("gpt-5.5"), Some("xhigh")).as_deref(),
+            Some("high"),
+            "spelled extra-high there"
+        );
+        assert_eq!(
+            fit(Some("gpt-5.5"), Some("extra-high-fast")).as_deref(),
+            Some("extra-high-fast")
+        );
+        assert_eq!(
+            fit_effort(AgentKind::Codex, None, Some("high".into())).as_deref(),
+            Some("high"),
+            "claude/codex pass through"
+        );
+    }
+
+    /// `claude_models` is hand-edited only: empty by default, written back
+    /// as `[]` so the key is discoverable, and read back verbatim — a
+    /// Bedrock id or an org's full model name survives the round trip.
+    #[test]
+    fn claude_models_key_round_trips_and_defaults_empty() {
+        assert!(Config::default().claude_models.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Config::default().save_to(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["claude_models"], serde_json::json!([]));
+
+        std::fs::write(
+            &path,
+            r#"{"claude_models": ["claude-sonnet-5", "us.anthropic.claude-opus-5-v1:0"]}"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert_eq!(
+            cfg.claude_models,
+            vec![
+                "claude-sonnet-5".to_string(),
+                "us.anthropic.claude-opus-5-v1:0".to_string()
+            ]
+        );
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).claude_models, cfg.claude_models);
+    }
+
+    #[test]
     fn save_persists_model_effort_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let mut cfg = Config::default();
-        cfg.claude_model = "sonnet".into();
-        cfg.codex_effort = "xhigh".into();
+        let cfg = Config {
+            claude_model: "sonnet".into(),
+            codex_effort: "xhigh".into(),
+            cursor_model: "gpt-5.6-sol".into(),
+            cursor_effort: "none".into(),
+            ..Config::default()
+        };
         cfg.save_to(&path).unwrap();
         let reread = load_from(&path);
         assert_eq!(reread.claude_model, "sonnet");
         assert_eq!(reread.claude_effort, "default");
         assert_eq!(reread.codex_model, "default");
         assert_eq!(reread.codex_effort, "xhigh");
-    }
-
-    #[test]
-    fn configured_model_list_replaces_the_builtin_one() {
-        // The whole point: a model this build never heard of reaches the
-        // pickers from the config file alone.
-        let cfg: Config =
-            serde_json::from_str(r#"{"codex_models": ["gpt-6-astra", "gpt-5.6-sol"]}"#).unwrap();
-        assert_eq!(
-            cfg.model_choices(AgentKind::Codex),
-            vec!["default", "gpt-6-astra", "gpt-5.6-sol"],
-            "configured list wins, with the no-flag sentinel pulled to the front"
-        );
-        // Claude was not named, so it keeps the built-in list.
-        assert_eq!(
-            cfg.model_choices(AgentKind::Claude),
-            owned(DEFAULT_CLAUDE_MODELS)
-        );
-        // And a configured model that is in the list resolves as ever.
-        let mut cfg = cfg;
-        cfg.codex_model = "gpt-6-astra".into();
-        assert_eq!(
-            cfg.default_model(AgentKind::Codex).as_deref(),
-            Some("gpt-6-astra")
-        );
-    }
-
-    #[test]
-    fn model_list_normalizes_blanks_duplicates_and_the_default_row() {
-        let cfg: Config = serde_json::from_str(
-            r#"{"claude_models": ["  opus  ", "", "OPUS", "default", "haiku"]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.model_choices(AgentKind::Claude),
-            vec!["default", "opus", "haiku"],
-            "trimmed, de-duplicated case-insensitively, and 'default' listed once at the front"
-        );
-    }
-
-    #[test]
-    fn an_emptied_model_list_falls_back_instead_of_stranding_the_pickers() {
-        // An empty list — or one that normalizes away to nothing — must not
-        // leave the submenu with only "default" and no way back.
-        for raw in [r#"{"codex_models": []}"#, r#"{"codex_models": ["", "  "]}"#] {
-            let cfg: Config = serde_json::from_str(raw).unwrap();
-            assert_eq!(
-                cfg.model_choices(AgentKind::Codex),
-                owned(DEFAULT_CODEX_MODELS),
-                "{raw} should fall back to the built-in list"
-            );
-        }
-    }
-
-    #[test]
-    fn cursor_has_no_model_menu_whatever_the_config_says() {
-        let cfg: Config = serde_json::from_str(r#"{"codex_models": ["gpt-6-astra"]}"#).unwrap();
-        assert!(cfg.model_choices(AgentKind::Cursor).is_empty());
-        assert!(cfg.effort_choices(AgentKind::Cursor).is_empty());
-        assert!(!supports_model_choice(AgentKind::Cursor));
-        assert!(supports_model_choice(AgentKind::Claude));
-        assert!(supports_model_choice(AgentKind::Codex));
-    }
-
-    #[test]
-    fn the_settings_row_cycles_the_configured_list_not_the_builtin() {
-        let mut cfg: Config = serde_json::from_str(r#"{"codex_models": ["gpt-6-astra"]}"#).unwrap();
-        let (tab, row) = locate(SettingKind::CodexModel).unwrap();
-        cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.codex_model, "gpt-6-astra");
-        cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.codex_model, "default", "two entries, so it wraps");
-        // A model dropped from the list is no longer reachable by cycling,
-        // which is what "replaces" has to mean for the overlay too.
-        cfg.codex_model = "gpt-5.5".into();
-        cfg.cycle(tab, row, 1);
-        assert_eq!(
-            cfg.codex_model, "gpt-6-astra",
-            "an off-list value reads as index 0 and steps forward from there"
-        );
-    }
-
-    #[test]
-    fn the_model_list_is_written_only_once_it_differs_from_the_builtin() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-
-        // Untouched: the key stays out of the file, so a later release
-        // adding a built-in model reaches this install.
-        let mut cfg = Config::default();
-        cfg.save_to(&path).unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("claude_models").is_none());
-        assert!(saved.get("codex_models").is_none());
-
-        // Customised: written out, and it survives the round trip.
-        cfg.codex_models = vec!["default".into(), "gpt-6-astra".into()];
-        cfg.save_to(&path).unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["codex_models"][1], "gpt-6-astra");
-        assert_eq!(
-            load_from(&path).model_choices(AgentKind::Codex),
-            vec!["default", "gpt-6-astra"]
-        );
-
-        // Back to the built-in list: the key is dropped again rather than
-        // left behind pinning today's models forever.
-        let mut cfg = load_from(&path);
-        cfg.codex_models = owned(DEFAULT_CODEX_MODELS);
-        cfg.save_to(&path).unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(saved.get("codex_models").is_none());
+        assert_eq!(reread.cursor_model, "gpt-5.6-sol");
+        assert_eq!(reread.cursor_effort, "none");
     }
 
     #[test]
@@ -1269,7 +2399,7 @@ mod tests {
             r#"{
   "git_init_on_create": false,
   "future_daemon_flag": true,
-  "recent_window": "5m"
+  "session_idle_timeout": "15m"
 }
 "#,
         )
@@ -1277,17 +2407,17 @@ mod tests {
 
         let mut cfg = load_from(&path);
         assert!(!cfg.git_init_on_create);
-        assert_eq!(cfg.recent_window, "5m");
+        assert_eq!(cfg.session_idle_timeout, "15m");
         cfg.palette_enter_attaches = false;
         cfg.git_init_on_create = true;
-        cfg.recent_window = "1h".into();
+        cfg.session_idle_timeout = "1h".into();
         cfg.save_to(&path).unwrap();
 
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["palette_enter_attaches"], false);
         assert_eq!(saved["git_init_on_create"], true);
-        assert_eq!(saved["recent_window"], "1h");
+        assert_eq!(saved["session_idle_timeout"], "1h");
         assert_eq!(saved["future_daemon_flag"], true);
     }
 
@@ -1314,17 +2444,75 @@ mod tests {
             );
         }
 
-        // Value tabs are a bare list; only Hotkeys carries headers.
+        // A value tab carries headers exactly when its rows name groups;
+        // Hotkeys always does.
         for (t, tab) in SETTINGS_TABS.iter().enumerate() {
             let headers = settings_rows(t)
                 .into_iter()
                 .filter(|row| matches!(row, SettingsRow::Header(_)))
                 .count();
             match tab.body {
-                TabBody::Values(_) => assert_eq!(headers, 0, "{}", tab.title),
+                TabBody::Values(settings) => {
+                    let grouped = settings.iter().any(|s| !s.group.is_empty());
+                    assert_eq!(headers > 0, grouped, "{}", tab.title);
+                }
                 TabBody::Hotkeys => assert!(headers > 0, "hotkeys tab groups its rows"),
             }
         }
+    }
+
+    #[test]
+    fn agents_tab_groups_its_rows_per_harness() {
+        let (tab, _) = locate(SettingKind::ClaudeEnabled).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Agents");
+
+        // Read the rows back the way the screen shows them: a header,
+        // then the labels under it, with a blank between sections.
+        let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+        for row in settings_rows(tab) {
+            match row {
+                SettingsRow::Header(title) => sections.push((title, Vec::new())),
+                SettingsRow::Setting(i) => sections
+                    .last_mut()
+                    .expect("every Agents row sits under a header")
+                    .1
+                    .push(setting_at(tab, i).unwrap().label),
+                SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
+                SettingsRow::Hotkey(_) => unreachable!(),
+            }
+        }
+        assert_eq!(
+            sections,
+            vec![
+                ("Quick prompt", vec!["Agent", "Focus"]),
+                ("Claude", vec!["Enabled", "Model", "Effort"]),
+                ("Codex", vec!["Enabled", "Model", "Effort"]),
+                ("Cursor", vec!["Enabled", "Model", "Effort"]),
+                ("Pi", vec!["Enabled", "Model", "Effort"]),
+            ]
+        );
+
+        // The header a row sits under names the kind whose setting it is,
+        // so the shortened labels can never drift onto the wrong harness.
+        for (_, _, spec) in all_settings().filter(|(t, _, _)| *t == tab) {
+            let kind = format!("{:?}", spec.kind);
+            let harness = match spec.group {
+                "Quick prompt" => "QuickPrompt",
+                other => other,
+            };
+            assert!(
+                kind.starts_with(harness),
+                "{kind} sits under {}",
+                spec.group
+            );
+        }
+
+        // One blank line separates the sections and nothing else does.
+        let blanks = settings_rows(tab)
+            .into_iter()
+            .filter(|row| *row == SettingsRow::Blank)
+            .count();
+        assert_eq!(blanks, sections.len() - 1);
     }
 
     #[test]
@@ -1378,6 +2566,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["palette_enter_attaches"], true);
         assert_eq!(saved["git_init_on_create"], true);
-        assert_eq!(saved["recent_window"], "30m");
+        assert_eq!(saved["session_idle_timeout"], "5m");
     }
 }
