@@ -40,6 +40,7 @@ impl TestEnv {
         cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
+            .env("NEBULA_KEEP_AWAKE", "off") // no real power assertion from a test
             .env("SHELL", "/bin/sh")
             .env("NEBULA_AGENT_CMD", agent_cmd)
             .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
@@ -59,6 +60,7 @@ impl TestEnv {
             .args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
+            .env("NEBULA_KEEP_AWAKE", "off") // no real power assertion from a test
             .env("SHELL", shell)
             .env_remove("NEBULA_AGENT_CMD")
             .stdout(std::process::Stdio::null())
@@ -913,6 +915,87 @@ async fn hook_post_from_agent_pty_drives_status() {
         .await
         .unwrap();
     wait_for_exit(&mut daemon2);
+}
+
+/// The keep-awake assertion follows an interactive agent's turns, end to
+/// end: a turn starting takes a real `caffeinate` tied to the daemon's pid,
+/// and the turn ending lets it go. This is the case of an agent left
+/// working when its user walks away, which no task run covers. macOS only,
+/// since nothing else takes an assertion.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_agent_turn_holds_the_host_awake_until_it_ends() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_KEEP_AWAKE", "runs")]);
+    let pattern = format!("^caffeinate -s -i -m -w {}$", daemon.id());
+    let asserting = || {
+        std::process::Command::new("pgrep")
+            .args(["-f", &pattern])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let wait_for = |want: bool| async move {
+        for _ in 0..100 {
+            if asserting() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    };
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "awake", 2).await;
+    assert!(!asserting(), "a fresh agent is not work in flight");
+
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let curl = |event: &str| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{{\"session_id\":\"sess-1\"}}' \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent={event}\"\n"
+        )
+    };
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("UserPromptSubmit").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(wait_for(true).await, "a turn in flight holds the host awake");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("Stop").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(wait_for(false).await, "the turn ending releases it");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
 }
 
 /// cwd-based re-homing end to end: an agent created in the main checkout
@@ -1780,6 +1863,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
             .args(["upgrade", "--force"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("NEBULA_KEEP_AWAKE", "off") // no real power assertion from a test
             .env("NEBULA_INSTALL_URL", format!("file://{}", script.display()))
             .output()
             .unwrap()
@@ -3562,6 +3646,7 @@ async fn cli_add_project() {
             .current_dir(cwd)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("NEBULA_KEEP_AWAKE", "off") // no real power assertion from a test
             .output()
             .unwrap()
     };

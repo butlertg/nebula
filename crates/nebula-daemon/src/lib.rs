@@ -3,6 +3,7 @@ pub mod git;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
+pub mod power;
 pub mod pty;
 pub mod registry;
 pub mod report;

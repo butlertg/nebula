@@ -3,6 +3,7 @@
 
 use crate::git;
 use crate::hooks::{self, HookEnv};
+use crate::power;
 use crate::pty::dialog::{self, StartupDialog};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec};
 use crate::report::{self, ReportInput};
@@ -87,8 +88,14 @@ struct LoopState {
     in_flight: bool,
     /// Epoch ms of the last thing this run did — a prompt delivered or a
     /// turn ended. The watchdog measures from here, so a long but healthy
-    /// turn is never mistaken for a wedged one.
+    /// turn is never mistaken for a wedged one. A host suspend pushes this
+    /// forward by the time slept (see `forgive_sleep`): the agent was frozen
+    /// for that stretch, so none of it is the run's to account for.
     last_progress_at: i64,
+    /// How long the host spent asleep during this run, in ms. Only for the
+    /// outcome line — an overnight run that reads "ran 3 of 3" after the lid
+    /// was shut at midnight should say so.
+    slept_ms: i64,
 }
 
 /// The transient, per-launch half of a spawn — everything that is not a
@@ -213,6 +220,15 @@ pub struct Daemon {
     /// lost. Keyed by the run's agent, since that is what the turn-end hook
     /// names.
     task_loops: Mutex<HashMap<AgentId, LoopState>>,
+    /// Noticing that the host was suspended. Fed one observation per
+    /// scheduler tick; what it reports is credited back to every run in
+    /// flight, since a laptop asleep for eight hours did not spend those
+    /// hours wedged.
+    sleep_watch: Mutex<power::SleepWatch>,
+    /// The assertion that stops the host idle-sleeping while automation is
+    /// armed. Taken and dropped by `refresh_keep_awake`, which is the only
+    /// thing that touches it.
+    keep_awake: Mutex<power::KeepAwake>,
 }
 
 impl Daemon {
@@ -233,6 +249,8 @@ impl Daemon {
             last_cwd: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
             task_loops: Mutex::new(HashMap::new()),
+            sleep_watch: Mutex::new(power::SleepWatch::new()),
+            keep_awake: Mutex::new(power::KeepAwake::new()),
         })
     }
 
@@ -326,6 +344,9 @@ impl Daemon {
                         changed_at,
                         unseen,
                     });
+                    // A turn starting is a reason to stay awake from now,
+                    // not from the next tick; a turn ending may be the last.
+                    self.refresh_keep_awake();
                 }
                 Effect::SaveSessionId(sid) => {
                     if let Err(e) = self.store.set_agent_session_id(agent_id, Some(&sid)) {
@@ -2162,6 +2183,17 @@ impl Daemon {
     /// Called from its own interval loop in `lib.rs`.
     pub async fn tick_scheduler(self: &Arc<Self>) {
         let now = epoch_ms();
+        // First, before the watchdog gets a look: did the host sleep since
+        // the last tick? Eight hours of suspend is eight hours no run spent
+        // wedged, and the sweep below would read it as one.
+        let slept = self
+            .sleep_watch
+            .lock()
+            .unwrap()
+            .observe(Instant::now(), now);
+        if slept > 0 {
+            self.forgive_sleep(slept);
+        }
         // Before launching anything new, retire anything that has quietly
         // died. A run only advances on a turn-end signal, so a wedged CLI is
         // invisible until something goes looking — this is that something.
@@ -2169,6 +2201,10 @@ impl Daemon {
         let Ok(tasks) = self.store.load_tasks() else {
             return;
         };
+        // Armed automation is a reason for the host to stay awake — done
+        // here, with the task list already in hand, and again at both ends
+        // of a run so the assertion is never a tick behind.
+        self.apply_keep_awake(&tasks);
         for task in tasks {
             // All three conditions, not just the stamp: a manual task has no
             // schedule to be due for however its stamp reads, and a disabled
@@ -2208,6 +2244,94 @@ impl Daemon {
                 tracing::warn!(task = %task.id, error = %e, "scheduled task failed to start");
             }
         }
+    }
+
+    /// Credit every run in flight with the time the host spent suspended.
+    ///
+    /// A suspended agent is not a stalled one: its process was frozen for
+    /// the whole stretch and resumes mid-turn when the host comes back, so
+    /// charging the gap to the watchdog would end a healthy overnight run
+    /// the moment the lid opens — with "no turn ended in 30m" on a run that
+    /// was never given 30 minutes to end one. The slept time is added to the
+    /// run's progress stamp (which is what the watchdog measures from) and
+    /// remembered for the outcome line.
+    fn forgive_sleep(&self, slept_ms: i64) {
+        let mut loops = self.task_loops.lock().unwrap();
+        for state in loops.values_mut() {
+            state.last_progress_at = state.last_progress_at.saturating_add(slept_ms);
+            state.slept_ms = state.slept_ms.saturating_add(slept_ms);
+        }
+        tracing::info!(
+            slept_ms,
+            runs = loops.len(),
+            "host was suspended; its watchdogs were credited the time"
+        );
+    }
+
+    /// Hold or drop the host's stay-awake assertion to match the configured
+    /// policy and what is armed right now. Idempotent and cheap.
+    fn apply_keep_awake(&self, tasks: &[Task]) {
+        // `NEBULA_KEEP_AWAKE` takes the same words as the config setting and
+        // wins over it — the tests set it to `off` so a unit test never
+        // spawns a real assertion, and it is the switch to reach for when
+        // running a daemon by hand on a machine that should still sleep.
+        let policy = std::env::var("NEBULA_KEEP_AWAKE")
+            .ok()
+            .and_then(|v| power::KeepAwakePolicy::parse(&v))
+            .unwrap_or_else(|| crate::config::Config::load().keep_awake());
+        let runs = self.task_loops.lock().unwrap().len();
+        let working = self.working_agents();
+        let scheduled = tasks
+            .iter()
+            .filter(|t| t.enabled && t.cron.is_some() && t.next_run_at != 0)
+            .count();
+        let want = if policy.wants_awake(runs + working > 0, scheduled > 0) {
+            Some(if runs > 0 {
+                format!("{runs} task run(s) in flight")
+            } else if working > 0 {
+                format!("{working} agent(s) mid-turn")
+            } else {
+                format!("{scheduled} task(s) scheduled")
+            })
+        } else {
+            None
+        };
+        self.keep_awake.lock().unwrap().set(want);
+    }
+
+    /// How many live agent sessions are in the middle of a turn. An agent
+    /// left working when its user walks away is work in flight exactly as a
+    /// task run is. One that waits on the user (`NeedsFeedback`) is not: it
+    /// cannot move until someone answers, so it does not hold the host up.
+    /// A row whose PTY is gone is not counted, however stale its status.
+    fn working_agents(&self) -> usize {
+        let live: Vec<AgentId> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|sref| match sref {
+                SessionRef::Agent(id) => Some(id.clone()),
+                SessionRef::Terminal(_) => None,
+            })
+            .collect();
+        live.iter()
+            .filter(|id| {
+                matches!(
+                    self.store.get_agent(id),
+                    Ok(Some(agent)) if agent.status == AgentStatus::Running
+                )
+            })
+            .count()
+    }
+
+    /// The same, for the callers that do not already hold the task list —
+    /// the two ends of a run, and an agent starting or ending a turn, where
+    /// waiting up to a scheduler tick for the assertion to catch up is
+    /// exactly the wrong time to sleep.
+    fn refresh_keep_awake(&self) {
+        let tasks = self.store.load_tasks().unwrap_or_default();
+        self.apply_keep_awake(&tasks);
     }
 
     /// Does this task already have a run going? The loop table is the only
@@ -2448,8 +2572,12 @@ impl Daemon {
                 total: task.iterations,
                 in_flight: true,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
+        // Under the "runs" policy this is the moment the host has to stay
+        // awake from, and it is up to a tick away from the next sweep.
+        self.refresh_keep_awake();
         run.iterations_done = 1;
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -2674,6 +2802,15 @@ impl Daemon {
     ) {
         let Some(state) = self.task_loops.lock().unwrap().remove(agent) else {
             return;
+        };
+        // That was the last thing holding the host up, quite possibly.
+        self.refresh_keep_awake();
+        // A run that says "ran 3 of 3" should also say the host was shut for
+        // six of the hours it took — otherwise the timestamps in the report
+        // read as a run that took all night to do very little.
+        let summary = match sleep_note(state.slept_ms) {
+            Some(note) => format!("{summary} · {note}"),
+            None => summary,
         };
         let _ = self
             .store
@@ -3646,6 +3783,18 @@ fn task_slug(task: &Task) -> String {
 }
 
 /// "30m" / "2h" — a watchdog window, for an outcome line the user reads.
+/// How a suspend reads in a run's outcome line, or None when the host
+/// barely napped. Sub-minute gaps are noise the run never noticed.
+fn sleep_note(slept_ms: i64) -> Option<String> {
+    if slept_ms < 60_000 {
+        return None;
+    }
+    Some(format!(
+        "host asleep {}",
+        mins_label((slept_ms / 1_000) as u32)
+    ))
+}
+
 fn mins_label(secs: u32) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
@@ -4188,6 +4337,10 @@ mod tests {
     }
 
     fn test_daemon() -> Arc<Daemon> {
+        // No real power assertions from a unit test, whatever this machine's
+        // config says: `tick_scheduler` would otherwise leave a `caffeinate`
+        // per test daemon behind.
+        std::env::set_var("NEBULA_KEEP_AWAKE", "off");
         let store = Arc::new(Store::open_in_memory().unwrap());
         Daemon::new(
             store,
@@ -4468,6 +4621,7 @@ mod tests {
                 total: 2,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -4521,6 +4675,7 @@ mod tests {
                 total: 5,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -4562,6 +4717,7 @@ mod tests {
                 total: 5,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -4602,6 +4758,7 @@ mod tests {
                 total: 5,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
         daemon.continue_task_loop(
@@ -4638,6 +4795,7 @@ mod tests {
                     total: 5,
                     in_flight: false,
                     last_progress_at: since,
+                    slept_ms: 0,
                 },
             );
         };
@@ -4759,6 +4917,7 @@ mod tests {
                 total: 1,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -4921,6 +5080,7 @@ mod tests {
                     total: 3,
                     in_flight: false,
                     last_progress_at: since,
+                    slept_ms: 0,
                 },
             );
         };
@@ -5026,10 +5186,158 @@ mod tests {
                 in_flight: false,
                 // A week without a turn.
                 last_progress_at: epoch_ms() - 7 * 24 * 3_600 * 1_000,
+                slept_ms: 0,
             },
         );
         daemon.sweep_stalled_runs();
         assert_eq!(daemon.task_loop_progress(&agent), Some((1, 5)));
+    }
+
+    /// The overnight case this whole thing exists for: the lid shuts at
+    /// midnight with a run mid-turn, and at 08:00 the watchdog sees eight
+    /// hours of silence. Those hours belong to the host, not to the run —
+    /// the agent's process was frozen for all of them — so the suspend is
+    /// credited to the progress stamp and the run lives to finish its turn.
+    #[tokio::test]
+    async fn a_suspended_host_is_not_a_stalled_run() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp/p", true);
+        seed_agent(&daemon, "a1", "w", None);
+        let spec = TaskSpec {
+            iterations: 3,
+            stall_timeout_secs: 1_800,
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(task_id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let agent = AgentId("a1".into());
+        let night = 8 * 3_600 * 1_000;
+        daemon.task_loops.lock().unwrap().insert(
+            agent.clone(),
+            LoopState {
+                run_id: TaskRunId("run-test".into()),
+                task_id: task_id.clone(),
+                delivered: 1,
+                total: 3,
+                in_flight: false,
+                // Last turn ended a minute before the machine went down.
+                last_progress_at: epoch_ms() - night - 60_000,
+                slept_ms: 0,
+            },
+        );
+
+        daemon.forgive_sleep(night);
+        daemon.sweep_stalled_runs();
+        assert_eq!(
+            daemon.task_loop_progress(&agent),
+            Some((1, 3)),
+            "the night was the host's, not the run's"
+        );
+
+        // And the forgiveness is for sleep only: a run that goes quiet for
+        // half an hour while the host is up is still a stall.
+        if let Some(state) = daemon.task_loops.lock().unwrap().get_mut(&agent) {
+            state.last_progress_at = epoch_ms() - 31 * 60 * 1_000;
+        }
+        daemon.sweep_stalled_runs();
+        assert_eq!(
+            daemon.task_loop_progress(&agent),
+            None,
+            "a real stall still ends"
+        );
+        let outcome = only_task(&daemon).last_outcome.unwrap();
+        assert!(outcome.starts_with("stalled:"), "{outcome}");
+        assert!(
+            outcome.contains("host asleep 8h"),
+            "the outcome should own up to the suspend, got {outcome}"
+        );
+    }
+
+    /// An agent left mid-turn is work in flight, as a task run is: it holds
+    /// the host up under the default policy. One waiting on the user, and a
+    /// row whose PTY is gone, do not — neither moves until someone comes back.
+    #[tokio::test]
+    async fn an_agent_mid_turn_counts_as_work_in_flight() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp/p", true);
+        seed_agent(&daemon, "live", "w", None);
+        seed_agent(&daemon, "gone", "w", None);
+        let live = AgentId("live".into());
+        let gone = AgentId("gone".into());
+        for id in [&live, &gone] {
+            daemon
+                .store
+                .set_agent_status(id, AgentStatus::Running)
+                .unwrap();
+        }
+        let session = PtySession::spawn(
+            SessionRef::Agent(live.clone()),
+            SpawnSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), "cat".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+                transcript: None,
+            },
+        )
+        .expect("spawn a pty");
+        daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.sref.clone(), session.clone());
+
+        assert_eq!(daemon.working_agents(), 1, "only the live one counts");
+        daemon
+            .store
+            .set_agent_status(&live, AgentStatus::NeedsFeedback)
+            .unwrap();
+        assert_eq!(
+            daemon.working_agents(),
+            0,
+            "a permission prompt needs a person, not an awake host"
+        );
+        session.kill();
+    }
+
+    /// A window that came around while the host was asleep is not a lost
+    /// one: the due stamp outlives the suspend, so the task fires as soon as
+    /// the machine is back — once, not once per window missed.
+    #[tokio::test]
+    async fn a_window_missed_while_asleep_fires_on_wake_exactly_once() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        // Nightly at 02:00, with the 02:00 stamp eight hours behind us: the
+        // machine slept through it and has just been opened.
+        let spec = TaskSpec {
+            cron: Some("0 2 * * *".into()),
+            ..task_spec("p", "go")
+        };
+        let EntityId::Task(id) = daemon.create_task(spec).unwrap() else {
+            panic!("non-task id");
+        };
+        let missed = epoch_ms() - 8 * 3_600 * 1_000;
+        daemon.store.set_task_next_run(&id, missed).unwrap();
+
+        daemon.tick_scheduler().await;
+
+        let task = only_task(&daemon);
+        assert!(task.last_run_at > 0, "the missed window ran at wake");
+        assert!(
+            task.next_run_at > epoch_ms(),
+            "and re-anchored on the next real 02:00, not on the eight windows behind it"
+        );
+
+        // The second tick must not re-fire it: one catch-up, not a backlog.
+        let ran_at = task.last_run_at;
+        daemon.tick_scheduler().await;
+        assert_eq!(only_task(&daemon).last_run_at, ran_at, "fired once");
     }
 
     /// Two agents in one checkout is worse than a missed window, so the
@@ -5058,6 +5366,7 @@ mod tests {
                 total: 5,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -5169,6 +5478,7 @@ mod tests {
                 total: 5,
                 in_flight: true,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
 
@@ -5214,6 +5524,7 @@ mod tests {
                 total: 5,
                 in_flight: false,
                 last_progress_at: epoch_ms(),
+                slept_ms: 0,
             },
         );
         daemon.delete_task(&task_id).unwrap();

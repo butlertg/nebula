@@ -23,6 +23,10 @@ pub const RECENT_WINDOWS: &[&str] = &["off", "5m", "10m", "30m", "1h", "24h"];
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
 
+/// Values the settings overlay cycles through for `keep_awake`
+/// (daemon-owned: whether the host is held awake for automation).
+pub const KEEP_AWAKE_CHOICES: &[&str] = &["scheduled", "runs", "off"];
+
 /// Editor commands the settings overlay cycles through. Every entry
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
@@ -91,6 +95,7 @@ pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
     Editor,
+    KeepAwake,
     SkipSessionNaming,
     RecentWindow,
     SessionIdleTimeout,
@@ -125,6 +130,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::Editor,
                 label: "File editor",
                 hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
+            },
+            SettingSpec {
+                kind: SettingKind::KeepAwake,
+                label: "Keep host awake",
+                hint: "Stop the Mac idle-sleeping: runs = while an agent or task works, scheduled = also while a task waits",
             },
         ]),
     },
@@ -352,6 +362,12 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// When the daemon holds the host awake so automation can run:
+    /// "scheduled" (work in flight or a task waiting for its window),
+    /// "runs" (only while a task run or an agent turn is in flight), or
+    /// "off". Owned by the daemon (which takes
+    /// the power assertion); the TUI writes it so the overlay can cycle it.
+    pub keep_awake: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -393,6 +409,7 @@ impl Default for Config {
             skip_session_naming: false,
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
+            keep_awake: "scheduled".into(),
             theme: "default".into(),
             animations: true,
             focus_tint: false,
@@ -487,6 +504,7 @@ impl Config {
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
         );
+        obj.insert("keep_awake".into(), serde_json::json!(self.keep_awake));
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
         obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
@@ -565,6 +583,7 @@ impl Config {
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::KeepAwake => self.keep_awake.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
@@ -603,6 +622,9 @@ impl Config {
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::KeepAwake => {
+                self.keep_awake = cycle_choice(&self.keep_awake, KEEP_AWAKE_CHOICES, step).into();
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
@@ -871,6 +893,31 @@ mod tests {
         assert_eq!(resolve_editor(Some("  "), "nvim"), "nvim");
         assert_eq!(resolve_editor(None, " nvim "), "nvim");
         assert_eq!(resolve_editor(None, ""), "vim");
+    }
+
+    /// The daemon reads this key out of the same file, so what the overlay
+    /// writes has to be one of the words it parses — and an install that
+    /// predates the key has to come up holding the host awake, since that
+    /// is the behaviour the setting exists to provide.
+    #[test]
+    fn keep_awake_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.keep_awake, "scheduled");
+        let (tab, row) = locate(SettingKind::KeepAwake).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.keep_awake, "runs");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.keep_awake, "off");
+        cfg.cycle(tab, row, -2);
+        assert_eq!(cfg.keep_awake, "scheduled");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.keep_awake = "runs".into();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).keep_awake, "runs");
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.keep_awake, "scheduled", "a config predating the key");
     }
 
     #[test]

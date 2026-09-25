@@ -27,6 +27,15 @@ pub struct Config {
     /// attach or prewarm (agents resume their conversation). Malformed
     /// values fall back to the 5m default.
     pub session_idle_timeout: String,
+    /// When to stop the host idle-sleeping so automation can actually run:
+    /// "scheduled" (whenever work is in flight *or* an enabled task is
+    /// waiting for its window — the default, so an 02:00 task finds the
+    /// machine awake at 02:00), "runs" (only while work is in flight: a task
+    /// run, or an agent in the middle of a turn), or "off". macOS only, and only as far as a power assertion reaches: the
+    /// machine still sleeps on a closed lid, and on battery it ignores the
+    /// system-sleep assertion. Malformed values fall back to "scheduled",
+    /// and `NEBULA_KEEP_AWAKE` in the daemon's environment overrides this.
+    pub keep_awake: String,
 }
 
 impl Default for Config {
@@ -36,12 +45,16 @@ impl Default for Config {
             prewarm_agents: true,
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            keep_awake: DEFAULT_KEEP_AWAKE.into(),
         }
     }
 }
 
 /// Fallback for `session_idle_timeout` when the value is malformed.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
+
+/// Fallback for `keep_awake` when the value is malformed.
+pub const DEFAULT_KEEP_AWAKE: &str = "scheduled";
 
 impl Config {
     pub fn load() -> Self {
@@ -53,6 +66,13 @@ impl Config {
             tracing::warn!("ignoring malformed {}: {err}", path.display());
             Self::default()
         })
+    }
+
+    /// `keep_awake` parsed; an unrecognised value falls back to the default
+    /// rather than to "off" — a typo must not quietly let the host sleep
+    /// through the night's work.
+    pub fn keep_awake(&self) -> crate::power::KeepAwakePolicy {
+        crate::power::KeepAwakePolicy::parse(&self.keep_awake).unwrap_or_default()
     }
 
     /// `session_idle_timeout` parsed to a duration; None = reaping disabled.
@@ -131,6 +151,25 @@ mod tests {
         assert_eq!(
             Config::default().session_idle_timeout(),
             Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn keep_awake_defaults_to_scheduled_and_falls_back_on_a_typo() {
+        use crate::power::KeepAwakePolicy;
+        let policy = |v: &str| {
+            let cfg: Config = serde_json::from_str(&format!(r#"{{"keep_awake": "{v}"}}"#)).unwrap();
+            cfg.keep_awake()
+        };
+        assert_eq!(Config::default().keep_awake(), KeepAwakePolicy::Scheduled);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.keep_awake(), KeepAwakePolicy::Scheduled);
+        assert_eq!(policy("runs"), KeepAwakePolicy::Runs);
+        assert_eq!(policy("off"), KeepAwakePolicy::Off);
+        assert_eq!(
+            policy("nope"),
+            KeepAwakePolicy::Scheduled,
+            "a typo must not silently disable it"
         );
     }
 
