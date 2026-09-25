@@ -14,6 +14,66 @@ about what is worth recording.
 
 ## Entries
 
+### Automations And Agents That Survive A Sleeping Laptop — 2026-09-11, extended 2026-09-24
+
+**Asked:** "Need to have automations be able to run as long the machine is running, regardless if it is
+asleep". Asked which keep-awake policy to default to, the answer was "whenever a task is scheduled".
+On 2026-09-24: "I still desire to have the Automations be able to run when my mac is asleep overnight.
+The intent is for agents to continue work, as much as possible w/o user input while I am away".
+
+**Did:** New **`crates/nebula-daemon/src/power.rs`** with two halves. `SleepWatch::observe(mono, wall_ms)`
+returns how long the host was suspended by differencing the wall clock against `Instant` (both passed in,
+so a test walks an eight-hour suspend without waiting for one); anything under `SLEEP_FLOOR_MS = 10_000`
+is jitter, not sleep. `KeepAwake` holds at most one `caffeinate -s -i -m -w <daemon pid>` child — no `-d`,
+so the screen still sleeps — and `KeepAwakePolicy::{Off,Runs,Scheduled}` decides when. In `registry.rs`:
+`Daemon.sleep_watch`/`Daemon.keep_awake`; `tick_scheduler` observes the clocks **before**
+`sweep_stalled_runs`; `forgive_sleep` pushes every `LoopState.last_progress_at` forward by the slept time
+and accumulates a new `LoopState.slept_ms`; `apply_keep_awake(&tasks)` (tick) and `refresh_keep_awake()`
+(both ends of a run) take or drop the assertion; `end_task_run` appends `sleep_note` ("· host asleep 8h")
+to the outcome. New config key `keep_awake` ("scheduled" default / "runs" / "off") in both
+`nebula-daemon/src/config.rs` and `nebula-tui/src/config.rs`, with a **Keep host awake** row on the
+General settings tab, and `NEBULA_KEEP_AWAKE` overriding the file. **743 tests green** (13 new), fmt
+clean, clippy at the pre-existing baseline. Verified live against a throwaway daemon
+(`NEBULA_RUNTIME_DIR` + `NEBULA_DATA_DIR`, task row seeded with sqlite3): the assertion appeared one tick
+after the task row with `holding the host awake reason=1 task(s) scheduled`, `pmset -g assertions` showed
+`PreventSystemSleep` + `PreventUserIdleSystemSleep` "asserting on behalf of Process ID <daemon>", it was
+released one tick after `enabled=0`, and a `kill -9` of the daemon left no `caffeinate` behind.
+
+**Gotchas:**
+- **A window missed during sleep already fires on wake — the skip is only in the re-stamp.** `is_due`
+  fires any past-due `next_run_at` however old, and `MISSED_RUN_GRACE_MS` only affects what
+  `next_due_ms` stamps *next*. So the catch-up needed no code, just the test
+  `a_window_missed_while_asleep_fires_on_wake_exactly_once`. What was actually broken was the watchdog.
+- **On macOS `CLOCK_MONOTONIC` keeps counting through a suspend** — Darwin is the odd one out here, and
+  only `CLOCK_UPTIME_RAW` stops. Rust's `Instant` uses `CLOCK_UPTIME_RAW`, which is what makes the
+  detector work at all; measured on this host (16 days up, ~10 of them asleep): `Instant` 537,133s,
+  `CLOCK_MONOTONIC` 1,389,213s, `CLOCK_UPTIME_RAW` 537,133s. Read it with
+  `println!("{:?}", Instant::now())` against `python3 -c "import time; time.clock_gettime(...)"`.
+- **`caffeinate` must be tied to the daemon's pid with `-w`**, or a `kill -9` (or a panic) leaves a
+  machine that will never sleep again and no obvious culprit. `Drop` alone is not enough.
+- **A unit test that reaches `tick_scheduler` spawns a real `caffeinate`** — `Config::load()` reads the
+  developer's actual config file, so the default policy applies inside `cargo test`. `test_daemon()` now
+  sets `NEBULA_KEEP_AWAKE=off` (safe: edition 2021, where `set_var` is not `unsafe`).
+- **macOS ignores the system-sleep assertion on battery, and a closed lid sleeps anyway.** The honest
+  reach is "an awake Mac on power stays awake"; waking a sleeping Mac for a window needs
+  `pmset schedule wake`, which needs root, so it is deliberately not attempted.
+- **2026-09-24: the 09-11 work never ran.** It sat uncommitted in this worktree while the live daemon
+  (`~/.local/bin/nebula daemon`, up 2 days) was an older build, so no `caffeinate -s -i -m -w` child
+  existed. `pmset -g log | grep "Entering Sleep state due to"` showed every nightly sleep was
+  `'Idle Sleep'` on AC — never `'Clamshell Sleep'`, never battery. So the assertion alone covers this
+  host. Check that log first before reaching for root-only `pmset` fixes.
+- **2026-09-24: interactive agents now count as work in flight.** `Daemon::working_agents()` counts live
+  agent PTYs whose row status is `Running`; `NeedsFeedback` does not count (it needs a person). Both
+  `runs` and `scheduled` include them, via `KeepAwakePolicy::wants_awake(working, tasks_scheduled)`.
+  `apply_status_effects` calls `refresh_keep_awake()` on every `SetStatus`, so a turn start takes the
+  assertion at once rather than up to 30s later — this host has `pmset sleep 1`. Proven by the macOS-only
+  e2e `an_agent_turn_holds_the_host_awake_until_it_ends` (pgreps `^caffeinate -s -i -m -w <daemon pid>$`),
+  which fails when `working_agents` returns 0. Every e2e daemon launcher now sets
+  `NEBULA_KEEP_AWAKE=off`; a later `envs` entry overrides it.
+- **A doc comment that wraps mid-sentence breaks a naive `str.replace` patch** — the `session_idle_timeout`
+  comment in `config.rs` splits "Malformed / values", which silently no-ops an anchored edit. Check the
+  file rather than trusting the exit code.
+
 ### Answering Claude's Bypass-Permissions Modal, So Unattended Runs Can Start — 2026-08-31
 
 **Asked:** "What's a good automation task I could set up to test this out?" → "set up the smoke test
